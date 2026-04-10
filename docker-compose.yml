@@ -1,0 +1,31 @@
+services:
+  train:
+    build: .
+    command: python -m src.train --config configs/default.yaml --data data/*.h5
+    volumes:
+      - ./data:/app/data
+      - ./checkpoints:/app/checkpoints
+      - ./logs:/app/logs
+      - ./configs:/app/configs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  evaluate:
+    build: .
+    command: python -m src.evaluate --checkpoint checkpoints/best_model.pt --data data/*.h5 --output results
+    volumes:
+      - ./data:/app/data
+      - ./checkpoints:/app/checkpoints
+      - ./results:/app/results
+      - ./configs:/app/configs
+
+  generate-mock-data:
+    build: .
+    command: python scripts/generate_mock_data.py --output data/mock_data.h5 --n-events 10000
+    volumes:
+      - ./data:/app/data
