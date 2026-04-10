@@ -111,10 +111,13 @@ def evaluate(
     # Compute accuracy
     correct = (all_preds == all_labels).sum().item()
     accuracy = correct / n_events
-    _, top5 = all_logits.topk(5, dim=-1)
+    num_assignments = all_logits.shape[1]
+    topk = min(5, num_assignments)
+    _, top5 = all_logits.topk(topk, dim=-1)
     acc5 = (top5 == all_labels.unsqueeze(-1)).any(dim=-1).float().mean().item()
+    print(f"Num assignments: {num_assignments} ({dc['num_jets']} jets)")
     print(f"Top-1 accuracy: {accuracy:.4f} ({correct}/{n_events})")
-    print(f"Top-5 accuracy: {acc5:.4f}")
+    print(f"Top-{topk} accuracy: {acc5:.4f}")
 
     # Reconstruct invariant masses
     mass1_pred = []  # mass of group1 in predicted assignment
@@ -128,9 +131,9 @@ def evaluate(
         p_idx = all_preds[i].item()
         t_idx = all_labels[i].item()
 
-        raw = raw_four_mom[i]  # (7, 4) un-normalized E, px, py, pz
+        raw = raw_four_mom[i]  # (num_jets, 4) un-normalized E, px, py, pz
 
-        # Predicted assignment
+        # Predicted assignment — unpack (isr_or_None, g1, g2)
         _, g1_pred_idx, g2_pred_idx = assignments[p_idx]
         p_g1 = raw[list(g1_pred_idx)].sum(dim=0)
         p_g2 = raw[list(g2_pred_idx)].sum(dim=0)

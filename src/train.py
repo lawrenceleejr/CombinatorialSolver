@@ -105,6 +105,14 @@ def train(config_path: str | None = None, data_path: str | None = None):
     ce_loss_fn = nn.CrossEntropyLoss()
     mse_loss_fn = nn.MSELoss()
 
+    # Check if adversarial training is useful (need multiple mass points)
+    mass_std = dataset.parent_masses.std().item()
+    use_adversary = mass_std > 0.01  # Disable if all events have same mass
+    if not use_adversary:
+        print("Adversary disabled: single mass point detected")
+    else:
+        print(f"Adversary enabled: mass std = {mass_std:.3f} TeV")
+
     # Logging
     os.makedirs("checkpoints", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
@@ -124,14 +132,18 @@ def train(config_path: str | None = None, data_path: str | None = None):
         cosine_with_warmup(optimizer, epoch, tc["num_epochs"], tc["warmup_epochs"])
         current_lr = optimizer.param_groups[0]["lr"]
 
-        # Ramp up adversarial strength
-        rampup = tc.get("lambda_adv_rampup", 10)
-        if rampup > 0:
-            adv_scale = min(1.0, epoch / rampup)
+        # Ramp up adversarial strength (only if multiple mass points)
+        if use_adversary:
+            rampup = tc.get("lambda_adv_rampup", 10)
+            if rampup > 0:
+                adv_scale = min(1.0, epoch / rampup)
+            else:
+                adv_scale = 1.0
+            lambda_adv = tc["lambda_adv"] * adv_scale
+            model.gradient_reversal.set_lambda(lambda_adv)
         else:
-            adv_scale = 1.0
-        lambda_adv = tc["lambda_adv"] * adv_scale
-        model.gradient_reversal.set_lambda(lambda_adv)
+            lambda_adv = 0.0
+            model.gradient_reversal.set_lambda(0.0)
 
         # Training
         model.train()
@@ -149,12 +161,13 @@ def train(config_path: str | None = None, data_path: str | None = None):
             )
 
         # Log
+        adv_str = f" | Adv R²={val_metrics['adv_r2']:.3f}" if use_adversary else ""
         print(
             f"Epoch {epoch+1:3d}/{tc['num_epochs']} | "
             f"Train loss={train_metrics['loss']:.4f} acc={train_metrics['acc']:.3f} | "
-            f"Val loss={val_metrics['loss']:.4f} acc={val_metrics['acc']:.3f} | "
-            f"Adv R²={val_metrics['adv_r2']:.3f} | "
-            f"LR={current_lr:.2e} | λ_adv={lambda_adv:.1f}"
+            f"Val loss={val_metrics['loss']:.4f} acc={val_metrics['acc']:.3f}"
+            f"{adv_str} | "
+            f"LR={current_lr:.2e}"
         )
 
         with open(log_path, "a", newline="") as f:

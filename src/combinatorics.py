@@ -1,8 +1,9 @@
 """
 Enumerate all possible jet-to-parent assignments and provide truth matching.
 
-With 7 jets, we choose 1 as ISR and partition the remaining 6 into two
-symmetric groups of 3. Total: C(7,1) * C(6,3)/2 = 70 assignments.
+Supports two modes:
+  - 6 jets (no ISR): C(6,3)/2 = 10 assignments — partition into two groups of 3
+  - 7 jets (with ISR): C(7,1) * C(6,3)/2 = 70 assignments — pick ISR + partition
 """
 
 from itertools import combinations
@@ -10,22 +11,38 @@ from itertools import combinations
 import torch
 
 
-def enumerate_assignments(num_jets: int = 7) -> list[tuple[int, tuple[int, ...], tuple[int, ...]]]:
+def enumerate_assignments(num_jets: int = 7) -> list[tuple[int | None, tuple[int, ...], tuple[int, ...]]]:
     """Enumerate all (isr_idx, group1, group2) assignments.
 
     The two groups are unordered (symmetric parents), so we canonicalize
     by placing the group with the smaller first index first.
 
+    For 6 jets: isr_idx is None, returns 10 assignments.
+    For 7 jets: isr_idx is 0-6, returns 70 assignments.
+
     Returns:
-        List of 70 tuples: (isr_index, group1_indices, group2_indices)
+        List of tuples: (isr_index_or_None, group1_indices, group2_indices)
     """
     assignments = []
+
+    if num_jets == 6:
+        # No ISR — just partition 6 jets into two groups of 3
+        all_jets = list(range(6))
+        seen = set()
+        for group1 in combinations(all_jets, 3):
+            group2 = tuple(j for j in all_jets if j not in group1)
+            canon = (min(group1, group2), max(group1, group2))
+            if canon not in seen:
+                seen.add(canon)
+                assignments.append((None, canon[0], canon[1]))
+        return assignments
+
+    # 7+ jets: choose ISR then partition remaining 6
     for isr in range(num_jets):
         remaining = [j for j in range(num_jets) if j != isr]
         seen = set()
         for group1 in combinations(remaining, 3):
             group2 = tuple(j for j in remaining if j not in group1)
-            # Canonical form: group with smaller first element comes first
             canon = (min(group1, group2), max(group1, group2))
             if canon not in seen:
                 seen.add(canon)
@@ -37,122 +54,52 @@ def build_assignment_tensors(num_jets: int = 7) -> dict[str, torch.Tensor]:
     """Build index tensors for efficient batched gathering.
 
     Returns dict with:
-        - isr_indices: (70,) int tensor of ISR jet index per assignment
-        - group1_indices: (70, 3) int tensor of group1 jet indices
-        - group2_indices: (70, 3) int tensor of group2 jet indices
+        - isr_indices: (N,) int tensor of ISR jet index (-1 if no ISR)
+        - group1_indices: (N, 3) int tensor of group1 jet indices
+        - group2_indices: (N, 3) int tensor of group2 jet indices
+        - num_assignments: int
     """
     assignments = enumerate_assignments(num_jets)
-    isr = torch.tensor([a[0] for a in assignments], dtype=torch.long)
+    isr = torch.tensor(
+        [a[0] if a[0] is not None else -1 for a in assignments],
+        dtype=torch.long,
+    )
     g1 = torch.tensor([list(a[1]) for a in assignments], dtype=torch.long)
     g2 = torch.tensor([list(a[2]) for a in assignments], dtype=torch.long)
-    return {"isr_indices": isr, "group1_indices": g1, "group2_indices": g2}
+    return {
+        "isr_indices": isr,
+        "group1_indices": g1,
+        "group2_indices": g2,
+        "num_assignments": len(assignments),
+    }
 
 
-def match_truth_to_assignment(
-    is_signal: torch.Tensor,
-    parent_ids: torch.Tensor,
-    num_jets: int = 7,
-) -> torch.Tensor:
-    """Find the assignment index matching the truth labels for a batch.
+def match_truth_groups(
+    truth_g1: list[int],
+    truth_g2: list[int],
+    num_jets: int,
+    truth_isr: int | None = None,
+) -> int:
+    """Find the assignment index matching truth group indices.
 
     Args:
-        is_signal: (batch, num_jets) bool/float — 1 if jet is from signal
-        parent_ids: (batch, num_jets) int/float — parent PDG ID per jet
+        truth_g1: List of 3 jet indices for group 1.
+        truth_g2: List of 3 jet indices for group 2.
+        num_jets: Total number of jets (6 or 7).
+        truth_isr: ISR jet index (None for 6-jet events).
 
     Returns:
-        (batch,) int tensor — index into the 70 assignments, or -1 if no match
+        Assignment index, or -1 if no match.
     """
     assignments = enumerate_assignments(num_jets)
-    batch_size = is_signal.shape[0]
-    result = torch.full((batch_size,), -1, dtype=torch.long)
-
-    for b in range(batch_size):
-        sig = is_signal[b]
-        pids = parent_ids[b]
-
-        # Identify ISR jets (is_signal == 0)
-        isr_mask = sig == 0
-        signal_mask = sig == 1
-
-        # Find unique parent IDs among signal jets
-        signal_pids = pids[signal_mask.bool() if not signal_mask.dtype == torch.bool else signal_mask]
-        unique_parents = signal_pids.unique()
-        unique_parents = unique_parents[unique_parents != 0]  # filter padding
-
-        if signal_mask.sum() < 6 or len(unique_parents) < 2:
-            # Best-effort: try to find the best matching assignment
-            result[b] = _best_effort_match(sig, pids, assignments, num_jets)
-            continue
-
-        # Build truth groups: jets belonging to each parent
-        parent_to_jets = {}
-        for j in range(num_jets):
-            if sig[j] == 1:
-                pid = int(pids[j].item())
-                if pid not in parent_to_jets:
-                    parent_to_jets[pid] = []
-                parent_to_jets[pid].append(j)
-
-        groups = list(parent_to_jets.values())
-        if len(groups) != 2 or any(len(g) != 3 for g in groups):
-            result[b] = _best_effort_match(sig, pids, assignments, num_jets)
-            continue
-
-        truth_g1 = tuple(sorted(groups[0]))
-        truth_g2 = tuple(sorted(groups[1]))
-        # Canonical: smaller first element first
-        truth_canon = (min(truth_g1, truth_g2), max(truth_g1, truth_g2))
-
-        # Find ISR jet
-        isr_jets = [j for j in range(num_jets) if sig[j] == 0]
-        if len(isr_jets) != 1:
-            result[b] = _best_effort_match(sig, pids, assignments, num_jets)
-            continue
-
-        truth_isr = isr_jets[0]
-
-        # Match against enumerated assignments
-        for idx, (a_isr, a_g1, a_g2) in enumerate(assignments):
-            if a_isr == truth_isr and (a_g1, a_g2) == truth_canon:
-                result[b] = idx
-                break
-
-    return result
-
-
-def _best_effort_match(
-    sig: torch.Tensor,
-    pids: torch.Tensor,
-    assignments: list,
-    num_jets: int,
-) -> int:
-    """Best-effort matching when truth is imperfect.
-
-    Scores each assignment by how well it agrees with available truth info:
-    - ISR jet should have is_signal=0 (or lowest signal confidence)
-    - Jets in the same group should share parent_id where known
-    """
-    best_score = -1
-    best_idx = 0
+    g1 = tuple(sorted(truth_g1))
+    g2 = tuple(sorted(truth_g2))
+    # Canonical: smaller first element first
+    canon = (min(g1, g2), max(g1, g2))
 
     for idx, (a_isr, a_g1, a_g2) in enumerate(assignments):
-        score = 0
+        isr_match = (truth_isr is None and a_isr is None) or (a_isr == truth_isr)
+        if isr_match and (a_g1, a_g2) == canon:
+            return idx
 
-        # Reward: ISR jet is not signal
-        if sig[a_isr] == 0:
-            score += 10
-
-        # Reward: jets within each group share the same parent_id
-        g1_pids = [int(pids[j].item()) for j in a_g1 if sig[j] == 1]
-        g2_pids = [int(pids[j].item()) for j in a_g2 if sig[j] == 1]
-
-        if len(g1_pids) > 0 and len(set(g1_pids)) == 1:
-            score += len(g1_pids)
-        if len(g2_pids) > 0 and len(set(g2_pids)) == 1:
-            score += len(g2_pids)
-
-        if score > best_score:
-            best_score = score
-            best_idx = idx
-
-    return best_idx
+    return -1
