@@ -1,0 +1,19 @@
+model:
+  d_model: 128
+  nhead: 8
+  num_layers: 4
+  dim_feedforward: 256
+  dropout: 0.1
+
+training:
+  batch_size: 512
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  num_epochs: 100
+  warmup_epochs: 5
+  lambda_adv: 1.0
+  lambda_adv_rampup: 10
+
+data:
+  normalize_by_ht: true
+  num_jets: 7
