@@ -11,7 +11,8 @@ training:
   weight_decay: 1.0e-4
   num_epochs: 200
   warmup_epochs: 15
-  patience: 30
+  restart_period: 30
+  patience: 40
   lambda_adv: 0.0
   lambda_adv_rampup: 50
 

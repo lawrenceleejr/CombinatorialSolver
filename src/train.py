@@ -57,12 +57,23 @@ def export_onnx(model, num_jets, device, val_acc):
     print(f"  -> Exported ONNX model to {onnx_path} (val_acc={val_acc:.4f})")
 
 
-def cosine_with_warmup(optimizer, epoch, num_epochs, warmup_epochs):
-    """Adjust learning rate: linear warmup then cosine decay."""
+def cosine_with_warmup(optimizer, epoch, num_epochs, warmup_epochs, restart_period=0):
+    """Adjust learning rate: linear warmup then cosine decay with optional warm restarts.
+
+    Args:
+        restart_period: If >0, restart the cosine cycle every this many epochs
+            after warmup. Each restart resets LR to peak, giving the optimizer
+            a chance to escape local minima.
+    """
     if epoch < warmup_epochs:
         lr_scale = (epoch + 1) / warmup_epochs
     else:
-        progress = (epoch - warmup_epochs) / max(num_epochs - warmup_epochs, 1)
+        post_warmup = epoch - warmup_epochs
+        if restart_period > 0:
+            cycle_pos = post_warmup % restart_period
+            progress = cycle_pos / restart_period
+        else:
+            progress = post_warmup / max(num_epochs - warmup_epochs, 1)
         lr_scale = 0.5 * (1.0 + math.cos(math.pi * progress))
 
     for pg in optimizer.param_groups:
@@ -169,7 +180,10 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
     for epoch in range(tc["num_epochs"]):
         # Update learning rate
-        cosine_with_warmup(optimizer, epoch, tc["num_epochs"], tc["warmup_epochs"])
+        cosine_with_warmup(
+            optimizer, epoch, tc["num_epochs"], tc["warmup_epochs"],
+            restart_period=tc.get("restart_period", 0),
+        )
         current_lr = optimizer.param_groups[0]["lr"]
 
         # Ramp up adversarial strength (only if multiple mass points)
