@@ -277,8 +277,9 @@ def _run_epoch(model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optim
         # Adversarial mass loss (MSE on predicted vs true parent mass)
         # Only compute for events where we have truth mass > 0
         mass_mask = parent_mass > 0
-        if mass_mask.any():
+        if mass_mask.any() and lambda_adv > 0:
             loss_adv = mse_loss_fn(mass_pred[mass_mask], parent_mass[mass_mask])
+            loss_adv = torch.clamp(loss_adv, max=10.0)
         else:
             loss_adv = torch.tensor(0.0, device=device)
 

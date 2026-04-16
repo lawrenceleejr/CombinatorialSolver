@@ -12,7 +12,7 @@ training:
   num_epochs: 200
   warmup_epochs: 15
   patience: 30
-  lambda_adv: 1.0
+  lambda_adv: 0.0
   lambda_adv_rampup: 50
 
 data:
