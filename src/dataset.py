@@ -306,11 +306,15 @@ class JetAssignmentDataset(Dataset):
             # Determine ISR: any jet in the sorted list not in g1 or g2
             all_assigned = set(g1_sorted + g2_sorted)
             isr_jets = [j for j in range(num_jets) if j not in all_assigned and sort_indices[i, j] >= 0]
+            # Also consider zero-padded slots as ISR candidates (events with fewer jets)
+            padded_slots = [j for j in range(num_jets) if j not in all_assigned and sort_indices[i, j] < 0]
 
             if num_jets == 6:
                 truth_isr = None
             elif len(isr_jets) == 1:
                 truth_isr = isr_jets[0]
+            elif len(isr_jets) == 0 and len(padded_slots) == 1:
+                truth_isr = padded_slots[0]
             elif len(isr_jets) == 0 and num_jets > 6:
                 n_not_enough_jets += 1
                 continue
