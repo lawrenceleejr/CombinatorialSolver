@@ -7,15 +7,15 @@ model:
 
 training:
   batch_size: 256
-  learning_rate: 3.0e-4
+  learning_rate: 1.0e-4
   weight_decay: 1.0e-4
   num_epochs: 200
-  warmup_epochs: 5
-  patience: 25
+  warmup_epochs: 15
+  patience: 30
   lambda_adv: 1.0
-  lambda_adv_rampup: 10
+  lambda_adv_rampup: 50
 
 data:
   normalize_by_ht: true
-  num_jets: 6
+  num_jets: 7
   pt_smear_frac: 0.0
