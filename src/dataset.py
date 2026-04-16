@@ -267,6 +267,10 @@ class JetAssignmentDataset(Dataset):
             src_pz = src_pt * np.sinh(src_eta)
             src_e = np.sqrt(src_px**2 + src_py**2 + src_pz**2 + src_mass**2)
 
+        n_signal_outside = 0
+        n_not_enough_jets = 0
+        n_wrong_isr_count = 0
+
         for i in range(n_events):
             # Map original truth indices to sorted positions
             idx_map = {}
@@ -296,6 +300,7 @@ class JetAssignmentDataset(Dataset):
                         break
 
             if not valid or len(g1_sorted) != 3 or len(g2_sorted) != 3:
+                n_signal_outside += 1
                 continue
 
             # Determine ISR: any jet in the sorted list not in g1 or g2
@@ -307,9 +312,10 @@ class JetAssignmentDataset(Dataset):
             elif len(isr_jets) == 1:
                 truth_isr = isr_jets[0]
             elif len(isr_jets) == 0 and num_jets > 6:
-                # No ISR found but we expected 7 jets — skip or handle
+                n_not_enough_jets += 1
                 continue
             else:
+                n_wrong_isr_count += 1
                 continue
 
             labels[i] = match_truth_groups(g1_sorted, g2_sorted, num_jets, truth_isr)
@@ -327,6 +333,17 @@ class JetAssignmentDataset(Dataset):
                     g1_4vec[3] += pz
                 m2 = g1_4vec[0]**2 - g1_4vec[1]**2 - g1_4vec[2]**2 - g1_4vec[3]**2
                 parent_mass[i] = np.sqrt(max(m2, 0))
+
+        n_valid = (labels >= 0).sum()
+        n_invalid = n_events - n_valid
+        if n_invalid > 0:
+            print(f"  Label failures ({n_invalid}/{n_events}):")
+            if n_signal_outside > 0:
+                print(f"    Signal jet outside top {num_jets} by pT: {n_signal_outside}")
+            if n_not_enough_jets > 0:
+                print(f"    Fewer than {num_jets} valid jets: {n_not_enough_jets}")
+            if n_wrong_isr_count > 0:
+                print(f"    Multiple ISR candidates: {n_wrong_isr_count}")
 
         return labels, parent_mass
 
