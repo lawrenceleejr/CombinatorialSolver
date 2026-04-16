@@ -161,6 +161,9 @@ def train(config_path: str | None = None, data_path: str | None = None):
         ])
 
     best_val_acc = 0.0
+    best_epoch = 0
+    patience = tc.get("patience", 25)
+    no_improve = 0
 
     for epoch in range(tc["num_epochs"]):
         # Update learning rate
@@ -222,6 +225,8 @@ def train(config_path: str | None = None, data_path: str | None = None):
         # Checkpoint
         if val_metrics["acc"] > best_val_acc:
             best_val_acc = val_metrics["acc"]
+            best_epoch = epoch + 1
+            no_improve = 0
             torch.save(
                 {
                     "epoch": epoch + 1,
@@ -233,10 +238,18 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 "checkpoints/best_model.pt",
             )
             print(f"  -> Saved best model (val_acc={best_val_acc:.4f})")
+        else:
+            no_improve += 1
 
-    print(f"\nTraining complete. Best val accuracy: {best_val_acc:.4f}")
+        if no_improve >= patience:
+            print(f"Early stopping at epoch {epoch+1} (no improvement for {patience} epochs)")
+            break
 
-    # Export best model to ONNX
+    print(f"\nTraining complete. Best val accuracy: {best_val_acc:.4f} at epoch {best_epoch}")
+
+    # Reload best checkpoint before ONNX export
+    ckpt = torch.load("checkpoints/best_model.pt", map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
     export_onnx(model, dc["num_jets"], device, best_val_acc)
 
 
