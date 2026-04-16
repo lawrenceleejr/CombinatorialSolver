@@ -5,7 +5,7 @@ Supports:
   - Combined cross-entropy (assignment) + adversarial mass decorrelation loss
   - Cosine LR schedule with linear warmup
   - Automatic device selection (MPS / CUDA / CPU)
-  - Checkpointing and CSV logging
+  - Checkpointing, CSV logging, and ONNX export
 """
 
 import argparse
@@ -16,11 +16,45 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.onnx
 from torch.utils.data import DataLoader, random_split
 
 from .dataset import JetAssignmentDataset
 from .model import JetAssignmentTransformer
 from .utils import get_config, get_device
+
+
+def export_onnx(model, num_jets, device, val_acc):
+    """Export model to ONNX format."""
+    model.eval()
+    dummy = torch.randn(1, num_jets, 4, device=device)
+    onnx_path = "checkpoints/best_model.onnx"
+
+    # Wrap to export only logits (single tensor output)
+    class _Wrapper(nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.m = m
+
+        def forward(self, four_momenta):
+            return self.m(four_momenta)["logits"]
+
+    wrapper = _Wrapper(model)
+    wrapper.eval()
+
+    torch.onnx.export(
+        wrapper,
+        dummy,
+        onnx_path,
+        input_names=["four_momenta"],
+        output_names=["logits"],
+        dynamic_axes={
+            "four_momenta": {0: "batch_size"},
+            "logits": {0: "batch_size"},
+        },
+        opset_version=18,
+    )
+    print(f"  -> Exported ONNX model to {onnx_path} (val_acc={val_acc:.4f})")
 
 
 def cosine_with_warmup(optimizer, epoch, num_epochs, warmup_epochs):
@@ -201,6 +235,9 @@ def train(config_path: str | None = None, data_path: str | None = None):
             print(f"  -> Saved best model (val_acc={best_val_acc:.4f})")
 
     print(f"\nTraining complete. Best val accuracy: {best_val_acc:.4f}")
+
+    # Export best model to ONNX
+    export_onnx(model, dc["num_jets"], device, best_val_acc)
 
 
 def _run_epoch(model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optimizer=None):

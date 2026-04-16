@@ -94,6 +94,14 @@ class JetAssignmentDataset(Dataset):
         if n_after < n_before:
             print(f"  Filtered {n_before - n_after}/{n_before} events with invalid labels")
 
+        if n_after == 0:
+            raise ValueError(
+                f"No valid events found for num_jets={num_jets}. "
+                f"The data may not contain enough jets per event "
+                f"(need >={num_jets}). Check that your data has ISR jets "
+                f"if using num_jets=7."
+            )
+
         if self.normalize_by_ht:
             ht_expanded = self.ht.unsqueeze(-1).unsqueeze(-1)
             self.four_momenta = self.four_momenta / ht_expanded.clamp(min=1e-6)

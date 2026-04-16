@@ -98,17 +98,16 @@ class JetAssignmentTransformer(nn.Module):
         self.num_assignments = at["num_assignments"]
 
         # Physics-informed features per assignment:
-        # - m(g1), m(g2): invariant masses of each group
-        # - mass_asym = |m1-m2|/(m1+m2)
-        # - mass_sum = m1+m2, mass_ratio = min/max
-        # - deltaR between group centroids
-        # Total: 6 physics features per assignment
-        self.n_physics_features = 6
+        # Group features (6): m(g1), m(g2), mass_asym, mass_sum, mass_ratio, deltaR
+        # ISR features (4, only for 7+ jets): isr_pt_frac, isr_abs_eta,
+        #   min_deltaR(isr, other jets), isr_mass_pull (how much ISR hurts mass balance)
+        self.n_group_physics = 6
+        self.n_isr_physics = 4 if self.has_isr else 0
+        self.n_physics_features = self.n_group_physics + self.n_isr_physics
 
         # Assignment scoring MLP
         # For 7 jets: input is [isr_embed, sym_sum, sym_prod, physics] = 3*d_model + n_phys
         # For 6 jets: input is [sym_sum, sym_prod, physics] = 2*d_model + n_phys
-        # Use symmetric features: sum and product are invariant to swap
         scorer_input_dim = (3 * d_model if self.has_isr else 2 * d_model) + self.n_physics_features
         self.score_mlp = nn.Sequential(
             nn.Linear(scorer_input_dim, 2 * d_model),
@@ -207,11 +206,67 @@ class JetAssignmentTransformer(nn.Module):
         deta = eta1 - eta2
         delta_r = torch.sqrt(deta**2 + dphi**2)
 
-        # Stack features: (batch, na, 6)
-        physics = torch.stack([
-            mass_sum, mass_asym, mass_ratio, m1, m2, delta_r
-        ], dim=-1)
+        # Group features: (batch, na, 6)
+        group_features = [mass_sum, mass_asym, mass_ratio, m1, m2, delta_r]
 
+        if self.has_isr:
+            # ISR-specific features to help identify which jet is ISR
+            isr_idx_expanded = self.isr_indices.unsqueeze(0).unsqueeze(-1).expand(
+                batch_size, -1, 4
+            )  # (batch, na, 4)
+            isr_4vec = torch.gather(
+                four_momenta.unsqueeze(1).expand(-1, na, -1, -1),
+                2, isr_idx_expanded.unsqueeze(2)
+            ).squeeze(2)  # (batch, na, 4)
+
+            # ISR pT fraction: ISR jets tend to be softer
+            isr_px, isr_py = isr_4vec[..., 1], isr_4vec[..., 2]
+            isr_pt = torch.sqrt(isr_px**2 + isr_py**2).clamp(min=1e-8)
+            all_px, all_py = four_momenta[..., 1], four_momenta[..., 2]
+            ht = torch.sqrt(all_px**2 + all_py**2).sum(dim=-1, keepdim=True)  # (batch, 1)
+            isr_pt_frac = isr_pt / ht.clamp(min=1e-8)  # (batch, na)
+
+            # ISR |eta|: ISR can be more forward
+            isr_pz = isr_4vec[..., 3]
+            isr_eta = torch.asinh(isr_pz / isr_pt)
+            isr_abs_eta = torch.abs(isr_eta)
+
+            # Min deltaR between ISR candidate and all other jets
+            def jet_eta_phi(p):
+                px, py, pz = p[..., 1], p[..., 2], p[..., 3]
+                pt = torch.sqrt(px**2 + py**2).clamp(min=1e-8)
+                return torch.asinh(pz / pt), torch.atan2(py, px)
+
+            all_eta, all_phi = jet_eta_phi(four_momenta)  # (batch, num_jets)
+            isr_eta_r = isr_eta.unsqueeze(-1)  # (batch, na, 1)
+            isr_phi_r = torch.atan2(isr_py, isr_px).unsqueeze(-1)
+            all_eta_r = all_eta.unsqueeze(1)  # (batch, 1, num_jets)
+            all_phi_r = all_phi.unsqueeze(1)
+
+            d_eta = isr_eta_r - all_eta_r
+            d_phi = isr_phi_r - all_phi_r
+            d_phi = d_phi - 2 * torch.pi * torch.round(d_phi / (2 * torch.pi))
+            dr_all = torch.sqrt(d_eta**2 + d_phi**2 + 1e-8)  # (batch, na, num_jets)
+            # Set self-distance to large value before taking min
+            isr_mask = torch.zeros(batch_size, na, self.num_jets, device=four_momenta.device)
+            isr_positions = self.isr_indices.unsqueeze(0).expand(batch_size, -1)
+            isr_mask.scatter_(2, isr_positions.unsqueeze(-1), 1.0)
+            dr_all = dr_all + isr_mask * 100.0
+            isr_min_dr = dr_all.min(dim=-1).values  # (batch, na)
+
+            # Mass pull: how much adding ISR to each group worsens mass balance
+            g1_plus_isr = g1_4vec + isr_4vec
+            g2_plus_isr = g2_4vec + isr_4vec
+            m1_with_isr = inv_mass(g1_plus_isr)
+            m2_with_isr = inv_mass(g2_plus_isr)
+            mass_pull = torch.min(
+                torch.abs(m1_with_isr - m2) / mass_sum.clamp(min=1e-8),
+                torch.abs(m1 - m2_with_isr) / mass_sum.clamp(min=1e-8),
+            )
+
+            group_features.extend([isr_pt_frac, isr_abs_eta, isr_min_dr, mass_pull])
+
+        physics = torch.stack(group_features, dim=-1)
         return physics
 
     def score_assignments(
