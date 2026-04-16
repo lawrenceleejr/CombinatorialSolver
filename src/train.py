@@ -140,10 +140,12 @@ def train(config_path: str | None = None, data_path: str | None = None):
     ce_loss_fn = nn.CrossEntropyLoss()
     mse_loss_fn = nn.MSELoss()
 
-    # Check if adversarial training is useful (need multiple mass points)
+    # Check if adversarial training is useful
     mass_std = dataset.parent_masses.std().item()
-    use_adversary = mass_std > 0.01  # Disable if all events have same mass
-    if not use_adversary:
+    use_adversary = tc["lambda_adv"] > 0 and mass_std > 0.01
+    if tc["lambda_adv"] == 0:
+        print("Adversary disabled: lambda_adv=0")
+    elif not use_adversary:
         print("Adversary disabled: single mass point detected")
     else:
         print(f"Adversary enabled: mass std = {mass_std:.3f} TeV")
