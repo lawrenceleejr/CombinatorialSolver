@@ -36,6 +36,10 @@ class JetAssignmentDataset(Dataset):
         data_paths: Path(s) to HDF5 files — a single path, list, or glob pattern.
         num_jets: Number of leading jets to use (6 or 7).
         normalize_by_ht: If True, divide 4-vectors by event HT for scale invariance.
+        pt_smear_frac: If > 0, apply Gaussian pT smearing with this fractional
+            resolution (e.g. 0.05 for 5%). Smearing is applied per-jet before
+            the four-vector conversion, simulating detector resolution effects.
+            The smearing is applied once at load time (fixed per event).
     """
 
     def __init__(
@@ -43,9 +47,11 @@ class JetAssignmentDataset(Dataset):
         data_paths: str | list[str],
         num_jets: int = 7,
         normalize_by_ht: bool = True,
+        pt_smear_frac: float = 0.0,
     ):
         self.num_jets = num_jets
         self.normalize_by_ht = normalize_by_ht
+        self.pt_smear_frac = pt_smear_frac
 
         # Resolve file paths
         if isinstance(data_paths, str):
@@ -107,6 +113,13 @@ class JetAssignmentDataset(Dataset):
 
             n_events = pt.shape[0]
             max_jets_in_file = pt.shape[1]
+
+            # Apply pT smearing if requested (simulates detector resolution)
+            if self.pt_smear_frac > 0:
+                rng = np.random.RandomState(seed=12345)
+                smear = 1.0 + rng.normal(0, self.pt_smear_frac, size=pt.shape).astype(np.float32)
+                smear = np.clip(smear, 0.5, 1.5)  # Prevent extreme outliers
+                pt = pt * smear * mask  # Only smear valid jets
 
             # Count valid jets per event
             n_valid = mask.sum(axis=1)

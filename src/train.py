@@ -53,6 +53,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
         data_paths=data_path,
         num_jets=dc["num_jets"],
         normalize_by_ht=dc["normalize_by_ht"],
+        pt_smear_frac=dc.get("pt_smear_frac", 0.0),
     )
     print(f"Dataset size: {len(dataset)} events")
 

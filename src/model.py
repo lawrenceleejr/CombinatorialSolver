@@ -6,7 +6,9 @@ Architecture:
   2. Transformer encoder with self-attention over jet tokens
   3. Assignment scoring: enumerate all possible assignments,
      aggregate jet embeddings per group, score with MLP
-  4. Adversarial mass decorrelation head (gradient reversal)
+  4. Physics-informed features: per-assignment invariant masses, mass
+     asymmetry, and angular features computed directly from four-vectors
+  5. Adversarial mass decorrelation head (gradient reversal)
 
 Supports both 6-jet (10 assignments, no ISR) and 7-jet (70 assignments, with ISR).
 """
@@ -95,11 +97,19 @@ class JetAssignmentTransformer(nn.Module):
         self.register_buffer("group2_indices", at["group2_indices"])
         self.num_assignments = at["num_assignments"]
 
+        # Physics-informed features per assignment:
+        # - m(g1), m(g2): invariant masses of each group
+        # - mass_asym = |m1-m2|/(m1+m2)
+        # - mass_sum = m1+m2, mass_ratio = min/max
+        # - deltaR between group centroids
+        # Total: 6 physics features per assignment
+        self.n_physics_features = 6
+
         # Assignment scoring MLP
-        # For 7 jets: input is [isr_embed, sym_sum, sym_prod] = 3 * d_model
-        # For 6 jets: input is [sym_sum, sym_prod] = 2 * d_model (no ISR)
-        # Use symmetric features: sum and elementwise product of group embeddings
-        scorer_input_dim = 3 * d_model if self.has_isr else 2 * d_model
+        # For 7 jets: input is [isr_embed, sym_sum, sym_prod, physics] = 3*d_model + n_phys
+        # For 6 jets: input is [sym_sum, sym_prod, physics] = 2*d_model + n_phys
+        # Use symmetric features: sum and product are invariant to swap
+        scorer_input_dim = (3 * d_model if self.has_isr else 2 * d_model) + self.n_physics_features
         self.score_mlp = nn.Sequential(
             nn.Linear(scorer_input_dim, 2 * d_model),
             nn.GELU(),
@@ -135,11 +145,83 @@ class JetAssignmentTransformer(nn.Module):
         x = self.transformer_encoder(x)
         return x
 
-    def score_assignments(self, jet_embeddings: torch.Tensor) -> torch.Tensor:
-        """Score all assignments given jet embeddings.
+    def _compute_physics_features(
+        self, four_momenta: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute physics-informed features for each assignment.
+
+        Directly computes invariant masses, mass asymmetry, and angular
+        features from the raw four-vectors for each candidate assignment.
+
+        Args:
+            four_momenta: (batch, num_jets, 4) in (E, px, py, pz)
+
+        Returns:
+            (batch, num_assignments, n_physics_features) tensor
+        """
+        batch_size = four_momenta.shape[0]
+        na = self.num_assignments
+
+        # Expand four_momenta for gathering: (batch, na, num_jets, 4)
+        fm = four_momenta.unsqueeze(1).expand(-1, na, -1, -1)
+
+        # Gather group 4-vectors
+        g1_idx = self.group1_indices.unsqueeze(0).unsqueeze(-1).expand(
+            batch_size, -1, -1, 4
+        )
+        g2_idx = self.group2_indices.unsqueeze(0).unsqueeze(-1).expand(
+            batch_size, -1, -1, 4
+        )
+        g1_4vec = torch.gather(fm, 2, g1_idx).sum(dim=2)  # (batch, na, 4)
+        g2_4vec = torch.gather(fm, 2, g2_idx).sum(dim=2)  # (batch, na, 4)
+
+        # Invariant masses: m^2 = E^2 - px^2 - py^2 - pz^2
+        def inv_mass(p):
+            m2 = p[..., 0]**2 - p[..., 1]**2 - p[..., 2]**2 - p[..., 3]**2
+            return torch.sqrt(torch.clamp(m2, min=1e-8))
+
+        m1 = inv_mass(g1_4vec)  # (batch, na)
+        m2 = inv_mass(g2_4vec)
+
+        # Symmetric mass features
+        mass_sum = m1 + m2
+        mass_asym = torch.abs(m1 - m2) / mass_sum.clamp(min=1e-8)
+        mass_min = torch.min(m1, m2)
+        mass_max = torch.max(m1, m2)
+        mass_ratio = mass_min / mass_max.clamp(min=1e-8)
+
+        # Angular separation between group centroids
+        # Use pseudo-rapidity and azimuthal angle of summed 4-vectors
+        def eta_phi(p):
+            px, py, pz = p[..., 1], p[..., 2], p[..., 3]
+            pt = torch.sqrt(px**2 + py**2).clamp(min=1e-8)
+            eta = torch.asinh(pz / pt)
+            phi = torch.atan2(py, px)
+            return eta, phi
+
+        eta1, phi1 = eta_phi(g1_4vec)
+        eta2, phi2 = eta_phi(g2_4vec)
+        dphi = phi1 - phi2
+        # Wrap dphi to [-pi, pi]
+        dphi = dphi - 2 * torch.pi * torch.round(dphi / (2 * torch.pi))
+        deta = eta1 - eta2
+        delta_r = torch.sqrt(deta**2 + dphi**2)
+
+        # Stack features: (batch, na, 6)
+        physics = torch.stack([
+            mass_sum, mass_asym, mass_ratio, m1, m2, delta_r
+        ], dim=-1)
+
+        return physics
+
+    def score_assignments(
+        self, jet_embeddings: torch.Tensor, four_momenta: torch.Tensor
+    ) -> torch.Tensor:
+        """Score all assignments given jet embeddings and raw four-vectors.
 
         Args:
             jet_embeddings: (batch, num_jets, d_model)
+            four_momenta: (batch, num_jets, 4) raw (E, px, py, pz)
 
         Returns:
             (batch, num_assignments) logits
@@ -166,6 +248,9 @@ class JetAssignmentTransformer(nn.Module):
         sym_sum = g1_pooled + g2_pooled      # (batch, na, d_model)
         sym_prod = g1_pooled * g2_pooled     # (batch, na, d_model)
 
+        # Physics features computed directly from four-vectors
+        physics = self._compute_physics_features(four_momenta)
+
         if self.has_isr:
             # Gather ISR embeddings
             isr_idx = self.isr_indices.unsqueeze(0).unsqueeze(-1).expand(
@@ -175,9 +260,9 @@ class JetAssignmentTransformer(nn.Module):
                 je_expanded, 2, isr_idx.unsqueeze(2)
             ).squeeze(2)  # (batch, na, d_model)
 
-            combined = torch.cat([isr_embed, sym_sum, sym_prod], dim=-1)
+            combined = torch.cat([isr_embed, sym_sum, sym_prod, physics], dim=-1)
         else:
-            combined = torch.cat([sym_sum, sym_prod], dim=-1)
+            combined = torch.cat([sym_sum, sym_prod, physics], dim=-1)
 
         scores = self.score_mlp(combined).squeeze(-1)
         return scores
@@ -198,6 +283,6 @@ class JetAssignmentTransformer(nn.Module):
             dict with logits (batch, num_assignments) and mass_pred (batch, 1)
         """
         jet_embeddings = self.encode_jets(four_momenta)
-        logits = self.score_assignments(jet_embeddings)
+        logits = self.score_assignments(jet_embeddings, four_momenta)
         mass_pred = self.predict_mass(jet_embeddings)
         return {"logits": logits, "mass_pred": mass_pred}
