@@ -19,6 +19,7 @@ training:
   tf_end: 0.3
   tf_decay_epochs: 100
   lambda_sym: 0.1
+  lambda_qcd: 0.1
 
 data:
   normalize_by_ht: true
