@@ -200,6 +200,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
     tf_start = tc.get("tf_start", 1.0)
     tf_end = tc.get("tf_end", 0.3)
     tf_decay_epochs = tc.get("tf_decay_epochs", 100)
+    lambda_isr = tc.get("lambda_isr", 1.0)
     lambda_sym_max = tc.get("lambda_sym", 0.0)
     lambda_qcd_max = tc.get("lambda_qcd", 0.0)
     lambda_sym_rampup = tc.get("lambda_sym_rampup", 0)
@@ -247,6 +248,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
             model, train_loader, ce_loss_fn, mse_loss_fn,
             lambda_adv, device, optimizer=optimizer,
             tf_ratio=tf_ratio, lambda_sym=lambda_sym, lambda_qcd=lambda_qcd,
+            lambda_isr=lambda_isr,
         )
 
         # Validation (no augmentation, no teacher forcing: tf_ratio=0 = pure end-to-end)
@@ -256,6 +258,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 model, val_loader, ce_loss_fn, mse_loss_fn,
                 lambda_adv, device, optimizer=None,
                 tf_ratio=0.0, lambda_sym=0.0, lambda_qcd=0.0,
+                lambda_isr=lambda_isr,
             )
 
         # Log
@@ -326,7 +329,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
 def _run_epoch(
     model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optimizer=None,
-    tf_ratio=1.0, lambda_sym=0.0, lambda_qcd=0.0,
+    tf_ratio=1.0, lambda_sym=0.0, lambda_qcd=0.0, lambda_isr=1.0,
 ):
     """Run one epoch of training or validation."""
     total_loss = 0.0
@@ -380,8 +383,13 @@ def _run_epoch(
 
             # Blend teacher-forced factored loss with flat end-to-end loss
             # tf_ratio=1: fully teacher-forced (original); tf_ratio=0: flat CE only
+            # lambda_isr upweights the ISR loss to compensate for a gradient imbalance:
+            # each signal jet appears in all num_groupings groupings, so loss_grp_tf
+            # produces num_groupings gradient paths per signal jet while the ISR jet
+            # (excluded from every group) receives gradient only from loss_isr.
+            # Scaling loss_isr by lambda_isr partially rebalances this asymmetry.
             loss_flat = ce_loss_fn(logits, labels)
-            loss_ce = tf_ratio * (loss_isr + loss_grp_tf) + (1.0 - tf_ratio) * loss_flat
+            loss_ce = tf_ratio * (lambda_isr * loss_isr + loss_grp_tf) + (1.0 - tf_ratio) * loss_flat
 
             total_isr_correct += (isr_logits.argmax(dim=-1) == isr_labels).sum().item()
             total_grp_correct += (gt_grp_logits.argmax(dim=-1) == grouping_labels).sum().item()
