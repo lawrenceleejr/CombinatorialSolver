@@ -104,6 +104,7 @@ class JetAssignmentDataset(Dataset):
 
         if self.normalize_by_ht:
             ht_expanded = self.ht.unsqueeze(-1).unsqueeze(-1)
+            # Normalize all four-vector dims (E, px, py, pz) by event HT
             self.four_momenta = self.four_momenta / ht_expanded.clamp(min=1e-6)
 
     def _load_file(self, fpath: str):
@@ -370,7 +371,7 @@ class JetAssignmentDataset(Dataset):
             if valid_count < 6:
                 continue
 
-            # Extract is_signal and parent_pdg for selected jets
+            # Extract is_signal (col 5) and parent_pdg (col 4) for selected jets
             is_sig = np.array([jf[i, orig_indices[j], 5] if orig_indices[j] >= 0 else 0
                               for j in range(num_jets)])
             p_ids = np.array([jf[i, orig_indices[j], 4] if orig_indices[j] >= 0 else 0
