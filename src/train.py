@@ -137,12 +137,30 @@ def train(config_path: str | None = None, data_path: str | None = None):
     else:
         print(f"Architecture: flat ({model.num_assignments}-way)")
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=tc["learning_rate"],
-        weight_decay=tc["weight_decay"],
-    )
+    # Optimizer — separate param groups so ISR head gets a higher LR to avoid
+    # being drowned out by grouping/GroupTransformer gradients.
+    isr_lr_mult = tc.get("isr_lr_multiplier", 1.0)
+    base_lr = tc["learning_rate"]
+
+    if model.has_isr and isr_lr_mult != 1.0:
+        isr_params = list(model.isr_head.parameters())
+        isr_param_ids = {id(p) for p in isr_params}
+        other_params = [p for p in model.parameters() if id(p) not in isr_param_ids]
+
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": other_params, "lr": base_lr},
+                {"params": isr_params, "lr": base_lr * isr_lr_mult},
+            ],
+            weight_decay=tc["weight_decay"],
+        )
+        print(f"Separate LR groups: base={base_lr:.1e}, ISR head={base_lr * isr_lr_mult:.1e}")
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=base_lr,
+            weight_decay=tc["weight_decay"],
+        )
     for pg in optimizer.param_groups:
         pg["initial_lr"] = pg["lr"]
 
@@ -182,8 +200,10 @@ def train(config_path: str | None = None, data_path: str | None = None):
     tf_start = tc.get("tf_start", 1.0)
     tf_end = tc.get("tf_end", 0.3)
     tf_decay_epochs = tc.get("tf_decay_epochs", 100)
-    lambda_sym = tc.get("lambda_sym", 0.0)
-    lambda_qcd = tc.get("lambda_qcd", 0.0)
+    lambda_sym_max = tc.get("lambda_sym", 0.0)
+    lambda_qcd_max = tc.get("lambda_qcd", 0.0)
+    lambda_sym_rampup = tc.get("lambda_sym_rampup", 0)
+    lambda_qcd_rampup = tc.get("lambda_qcd_rampup", 0)
 
     for epoch in range(tc["num_epochs"]):
         cosine_with_warmup(
@@ -209,6 +229,17 @@ def train(config_path: str | None = None, data_path: str | None = None):
             tf_ratio = tf_start + (tf_end - tf_start) * epoch / tf_decay_epochs
         else:
             tf_ratio = tf_end
+
+        # Ramp up auxiliary losses: off at start, linearly reach full strength
+        if lambda_sym_rampup > 0:
+            lambda_sym = lambda_sym_max * min(1.0, epoch / lambda_sym_rampup)
+        else:
+            lambda_sym = lambda_sym_max
+
+        if lambda_qcd_rampup > 0:
+            lambda_qcd = lambda_qcd_max * min(1.0, epoch / lambda_qcd_rampup)
+        else:
+            lambda_qcd = lambda_qcd_max
 
         # Training
         model.train()
