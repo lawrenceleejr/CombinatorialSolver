@@ -259,10 +259,17 @@ class JetAssignmentTransformer(nn.Module):
     def _compute_isr_logits(
         self, jet_embeddings: torch.Tensor, four_momenta: torch.Tensor
     ) -> torch.Tensor:
-        """Score each jet as ISR candidate. Returns (batch, num_jets)."""
-        global_ctx = jet_embeddings.mean(dim=1, keepdim=True).expand_as(jet_embeddings)
+        """Score each jet as ISR candidate. Returns (batch, num_jets).
+
+        Uses leave-one-out context: for each jet j, the context is the mean of
+        all *other* jets' embeddings.  This gives the ISR head a clean comparison
+        between each jet and the rest of the event, which is the key signal for
+        identifying an outlier ISR jet.
+        """
+        total = jet_embeddings.sum(dim=1, keepdim=True)              # (batch, 1, d_model)
+        loo_ctx = (total - jet_embeddings) / (self.num_jets - 1)     # (batch, num_jets, d_model)
         physics = self._isr_physics(four_momenta)
-        features = torch.cat([jet_embeddings, global_ctx, physics], dim=-1)
+        features = torch.cat([jet_embeddings, loo_ctx, physics], dim=-1)
         return self.isr_head(features).squeeze(-1)
 
     def _group_physics_factored(self, four_momenta: torch.Tensor) -> torch.Tensor:

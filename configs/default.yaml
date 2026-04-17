@@ -19,6 +19,7 @@ training:
   tf_start: 1.0
   tf_end: 0.3
   tf_decay_epochs: 100
+  lambda_isr: 3.0
   lambda_sym: 0.05
   lambda_sym_rampup: 20
   lambda_qcd: 0.1
