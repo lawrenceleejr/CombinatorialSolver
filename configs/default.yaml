@@ -15,8 +15,13 @@ training:
   patience: 40
   lambda_adv: 0.0
   lambda_adv_rampup: 50
+  tf_start: 1.0
+  tf_end: 0.3
+  tf_decay_epochs: 100
+  lambda_sym: 0.1
 
 data:
   normalize_by_ht: true
   num_jets: 7
   pt_smear_frac: 0.0
+  use_constituents: true

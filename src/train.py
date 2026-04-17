@@ -28,7 +28,8 @@ from .utils import get_config, get_device
 def export_onnx(model, num_jets, device, val_acc):
     """Export model to ONNX format."""
     model.eval()
-    dummy = torch.randn(1, num_jets, 4, device=device)
+    input_dim = model.input_proj.in_features
+    dummy = torch.randn(1, num_jets, input_dim, device=device)
     onnx_path = "checkpoints/best_model.onnx"
 
     class _Wrapper(nn.Module):
@@ -93,6 +94,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
         num_jets=dc["num_jets"],
         normalize_by_ht=dc["normalize_by_ht"],
         pt_smear_frac=dc.get("pt_smear_frac", 0.0),
+        use_constituents=dc.get("use_constituents", False),
     )
     print(f"Dataset size: {len(dataset)} events")
 
@@ -119,6 +121,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
     )
 
     # Model
+    input_dim = 5 if dc.get("use_constituents", False) else 4
     model = JetAssignmentTransformer(
         d_model=mc["d_model"],
         nhead=mc["nhead"],
@@ -126,6 +129,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
         dim_feedforward=mc["dim_feedforward"],
         dropout=mc["dropout"],
         num_jets=dc["num_jets"],
+        input_dim=input_dim,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -177,6 +181,11 @@ def train(config_path: str | None = None, data_path: str | None = None):
     patience = tc.get("patience", 25)
     no_improve = 0
 
+    tf_start = tc.get("tf_start", 1.0)
+    tf_end = tc.get("tf_end", 0.3)
+    tf_decay_epochs = tc.get("tf_decay_epochs", 100)
+    lambda_sym = tc.get("lambda_sym", 0.0)
+
     for epoch in range(tc["num_epochs"]):
         cosine_with_warmup(
             optimizer, epoch, tc["num_epochs"], tc["warmup_epochs"],
@@ -196,19 +205,27 @@ def train(config_path: str | None = None, data_path: str | None = None):
             lambda_adv = 0.0
             model.gradient_reversal.set_lambda(0.0)
 
+        # Teacher forcing ratio: linearly decay from tf_start to tf_end over tf_decay_epochs
+        if epoch < tf_decay_epochs:
+            tf_ratio = tf_start + (tf_end - tf_start) * epoch / tf_decay_epochs
+        else:
+            tf_ratio = tf_end
+
         # Training
         model.train()
         train_metrics = _run_epoch(
             model, train_loader, ce_loss_fn, mse_loss_fn,
             lambda_adv, device, optimizer=optimizer,
+            tf_ratio=tf_ratio, lambda_sym=lambda_sym,
         )
 
-        # Validation
+        # Validation (no augmentation, no teacher forcing: tf_ratio=0 = pure end-to-end)
         model.eval()
         with torch.no_grad():
             val_metrics = _run_epoch(
                 model, val_loader, ce_loss_fn, mse_loss_fn,
                 lambda_adv, device, optimizer=None,
+                tf_ratio=0.0, lambda_sym=0.0,
             )
 
         # Log
@@ -277,7 +294,10 @@ def train(config_path: str | None = None, data_path: str | None = None):
     export_onnx(model, dc["num_jets"], device, best_val_acc)
 
 
-def _run_epoch(model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optimizer=None):
+def _run_epoch(
+    model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optimizer=None,
+    tf_ratio=1.0, lambda_sym=0.0,
+):
     """Run one epoch of training or validation."""
     total_loss = 0.0
     total_correct = 0
@@ -293,6 +313,22 @@ def _run_epoch(model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optim
         four_mom = batch["four_momenta"].to(device)
         labels = batch["label"].to(device)
         parent_mass = batch["parent_mass"].to(device)
+
+        # φ/η augmentation during training (hard symmetries of the problem)
+        if optimizer is not None:
+            four_mom = four_mom.clone()
+            batch_size = four_mom.shape[0]
+
+            theta = torch.rand(batch_size, device=device) * 2 * torch.pi
+            cos_t = theta.cos().view(-1, 1)   # (batch, 1) for broadcasting over jets
+            sin_t = theta.sin().view(-1, 1)
+            px_orig = four_mom[:, :, 1].clone()
+            py_orig = four_mom[:, :, 2].clone()
+            four_mom[:, :, 1] = px_orig * cos_t - py_orig * sin_t
+            four_mom[:, :, 2] = px_orig * sin_t + py_orig * cos_t
+
+            flip = (torch.rand(batch_size, device=device) > 0.5).float().view(-1, 1)
+            four_mom[:, :, 3] = four_mom[:, :, 3] * (1.0 - 2.0 * flip)
 
         output = model(four_mom)
         logits = output["logits"]
@@ -310,14 +346,24 @@ def _run_epoch(model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optim
 
             batch_idx = torch.arange(labels.shape[0], device=device)
             gt_grp_logits = grouping_logits[batch_idx, isr_labels]
-            loss_grp = ce_loss_fn(gt_grp_logits, grouping_labels)
+            loss_grp_tf = ce_loss_fn(gt_grp_logits, grouping_labels)
 
-            loss_ce = loss_isr + loss_grp
+            # Blend teacher-forced factored loss with flat end-to-end loss
+            # tf_ratio=1: fully teacher-forced (original); tf_ratio=0: flat CE only
+            loss_flat = ce_loss_fn(logits, labels)
+            loss_ce = tf_ratio * (loss_isr + loss_grp_tf) + (1.0 - tf_ratio) * loss_flat
 
             total_isr_correct += (isr_logits.argmax(dim=-1) == isr_labels).sum().item()
             total_grp_correct += (gt_grp_logits.argmax(dim=-1) == grouping_labels).sum().item()
         else:
             loss_ce = ce_loss_fn(logits, labels)
+
+        # Mass symmetry auxiliary loss: minimize expected |m1-m2|/(m1+m2) over assignments
+        if lambda_sym > 0 and "mass_asym_flat" in output:
+            mass_asym = output["mass_asym_flat"].detach()  # (batch, num_assignments)
+            probs = logits.softmax(dim=-1)
+            loss_sym = (probs * mass_asym).sum(dim=-1).mean()
+            loss_ce = loss_ce + lambda_sym * loss_sym
 
         # Adversarial mass loss
         mass_mask = parent_mass > 0

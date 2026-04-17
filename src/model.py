@@ -61,13 +61,17 @@ class JetAssignmentTransformer(nn.Module):
         dim_feedforward: int = 256,
         dropout: float = 0.1,
         num_jets: int = 7,
+        input_dim: int = 4,
     ):
         super().__init__()
         self.d_model = d_model
+        self.nhead = nhead
         self.num_jets = num_jets
         self.has_isr = num_jets >= 7
 
-        self.input_proj = nn.Linear(4, d_model)
+        self.input_proj = nn.Linear(input_dim, d_model)
+        # Per-head learnable weight for pT hierarchy attention bias; init to 0 (no effect at start)
+        self.pt_bias_weight = nn.Parameter(torch.zeros(nhead))
         self.pos_embedding = nn.Embedding(num_jets, d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -134,11 +138,26 @@ class JetAssignmentTransformer(nn.Module):
             nn.Linear(d_model // 2, 1),
         )
 
+    def _compute_pt_bias(self, four_momenta: torch.Tensor) -> torch.Tensor:
+        """Log pT ratio matrix: log(pT_i/pT_j). Returns (batch, J, J)."""
+        px, py = four_momenta[..., 1], four_momenta[..., 2]
+        pt = torch.sqrt(px**2 + py**2).clamp(min=1e-8)
+        log_pt = torch.log(pt)
+        return log_pt.unsqueeze(-1) - log_pt.unsqueeze(-2)
+
     def encode_jets(self, four_momenta: torch.Tensor) -> torch.Tensor:
         x = self.input_proj(four_momenta)
         positions = torch.arange(self.num_jets, device=four_momenta.device)
         x = x + self.pos_embedding(positions).unsqueeze(0)
-        x = self.transformer_encoder(x)
+
+        # pT hierarchy attention bias: scale log(pT_i/pT_j) per head, add to attention logits
+        batch_size = four_momenta.shape[0]
+        pt_bias = self._compute_pt_bias(four_momenta)  # (batch, J, J)
+        pt_bias_expanded = (
+            pt_bias.unsqueeze(1) * self.pt_bias_weight.view(1, self.nhead, 1, 1)
+        ).reshape(batch_size * self.nhead, self.num_jets, self.num_jets)
+
+        x = self.transformer_encoder(x, mask=pt_bias_expanded)
         return x
 
     def _isr_physics(self, four_momenta: torch.Tensor) -> torch.Tensor:
@@ -182,7 +201,7 @@ class JetAssignmentTransformer(nn.Module):
         g1_flat = self.f_group1.reshape(-1, 3)
         g2_flat = self.f_group2.reshape(-1, 3)
 
-        fm = four_momenta.unsqueeze(1).expand(-1, n_combos, -1, -1)
+        fm = four_momenta[:, :, :4].unsqueeze(1).expand(-1, n_combos, -1, -1)
         g1_idx = g1_flat.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, -1, 4)
         g2_idx = g2_flat.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, -1, 4)
 
@@ -220,10 +239,12 @@ class JetAssignmentTransformer(nn.Module):
 
     def _compute_grouping_logits(
         self, jet_embeddings: torch.Tensor, four_momenta: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Score all groupings for each ISR choice.
 
-        Returns (batch, num_jets, num_groupings).
+        Returns:
+            grouping_logits: (batch, num_jets, num_groupings)
+            mass_asym_flat: (batch, num_assignments) mass asymmetry per flat assignment
         """
         batch_size = jet_embeddings.shape[0]
         n_combos = self.num_jets * self.num_groupings
@@ -241,12 +262,18 @@ class JetAssignmentTransformer(nn.Module):
         sym_sum = g1_pooled + g2_pooled
         sym_prod = g1_pooled * g2_pooled
 
-        physics = self._group_physics_factored(four_momenta)
+        physics = self._group_physics_factored(four_momenta)  # (batch, n_combos, 6)
 
         combined = torch.cat([sym_sum, sym_prod, physics], dim=-1)
         scores = self.grouping_scorer(combined).squeeze(-1)
+        grouping_logits = scores.reshape(batch_size, self.num_jets, self.num_groupings)
 
-        return scores.reshape(batch_size, self.num_jets, self.num_groupings)
+        # Remap mass asymmetry (physics dim 1) to flat assignment ordering
+        mass_asym_factored = physics[:, :, 1]  # (batch, n_combos)
+        source_idx = self.flat_to_factored[:, 0] * self.num_groupings + self.flat_to_factored[:, 1]
+        mass_asym_flat = mass_asym_factored[:, source_idx]  # (batch, num_assignments)
+
+        return grouping_logits, mass_asym_flat
 
     def _combine_logits(
         self, isr_logits: torch.Tensor, grouping_logits: torch.Tensor
@@ -284,7 +311,7 @@ class JetAssignmentTransformer(nn.Module):
         sym_sum = g1_pooled + g2_pooled
         sym_prod = g1_pooled * g2_pooled
 
-        fm = four_momenta.unsqueeze(1).expand(-1, na, -1, -1)
+        fm = four_momenta[:, :, :4].unsqueeze(1).expand(-1, na, -1, -1)
         g1_4idx = self.group1_indices.unsqueeze(0).unsqueeze(-1).expand(
             batch_size, -1, -1, 4
         )
@@ -309,7 +336,7 @@ class JetAssignmentTransformer(nn.Module):
 
         if self.has_isr:
             isr_logits = self._compute_isr_logits(jet_embeddings, four_momenta)
-            grouping_logits = self._compute_grouping_logits(
+            grouping_logits, mass_asym_flat = self._compute_grouping_logits(
                 jet_embeddings, four_momenta
             )
             logits = self._combine_logits(isr_logits, grouping_logits)
@@ -317,6 +344,7 @@ class JetAssignmentTransformer(nn.Module):
                 "logits": logits,
                 "isr_logits": isr_logits,
                 "grouping_logits": grouping_logits,
+                "mass_asym_flat": mass_asym_flat,
                 "mass_pred": mass_pred,
             }
         else:
