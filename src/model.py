@@ -154,6 +154,11 @@ class JetAssignmentTransformer(nn.Module):
         # 6 inter-group features + 9 intra-group features per group × 2 groups = 24
         self.n_group_physics = 24
 
+        # Normalize physics features before feeding to scorer MLPs.
+        # The 24 features span very different scales (ratios ∈ [0,1] vs masses
+        # vs angular quantities), so LayerNorm stabilises the scorer inputs.
+        self.physics_norm = nn.LayerNorm(self.n_group_physics)
+
         if self.has_isr:
             ft = build_factored_tensors(num_jets)
             self.register_buffer("f_group1", ft["group1_indices"])
@@ -469,6 +474,7 @@ class JetAssignmentTransformer(nn.Module):
         sym_prod = g1_pooled * g2_pooled
 
         physics = self._group_physics_factored(four_momenta)  # (batch, n_combos, n_group_physics)
+        physics = self.physics_norm(physics)
 
         combined = torch.cat([sym_sum, sym_prod, physics], dim=-1)
         scores = self.grouping_scorer(combined).squeeze(-1)
@@ -543,6 +549,7 @@ class JetAssignmentTransformer(nn.Module):
         g2_4vec = g2_jets.sum(dim=2)
 
         physics = self._mass_features(g1_4vec, g2_4vec, g1_jets, g2_jets)
+        physics = self.physics_norm(physics)
         combined = torch.cat([sym_sum, sym_prod, physics], dim=-1)
         logits = self.score_mlp(combined).squeeze(-1)
         mass_asym_flat = physics[..., 1]             # index 1 = mass_asym
