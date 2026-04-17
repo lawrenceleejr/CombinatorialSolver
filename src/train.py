@@ -143,7 +143,10 @@ def train(config_path: str | None = None, data_path: str | None = None):
     base_lr = tc["learning_rate"]
 
     if model.has_isr and isr_lr_mult != 1.0:
-        isr_params = list(model.isr_head.parameters())
+        isr_params = (
+            list(model.isr_head.parameters())
+            + list(model.grouping_summary_proj.parameters())
+        )
         isr_param_ids = {id(p) for p in isr_params}
         other_params = [p for p in model.parameters() if id(p) not in isr_param_ids]
 

@@ -5,8 +5,12 @@ Architecture:
   1. Linear projection of (E, px, py, pz) to d_model
   2. Transformer encoder with self-attention over jet tokens
   3. Factored scoring (7+ jets):
-     a. ISR head: per-jet classification (which jet is ISR?)
-     b. Grouping head: per-grouping scoring (how to split remaining 6 into 2x3?)
+     a. Grouping head: per-grouping scoring (how to split remaining 6 into 2x3?)
+     b. ISR head: per-jet classification informed by grouping quality — for each
+        ISR candidate, an attention-weighted summary of its grouping features is
+        fed into the ISR scorer, creating interplay between ISR identification and
+        combinatorial assignment (if removing jet j yields groupings that look
+        like pair production, jet j is more likely ISR)
      c. Combined logits: log P(assignment) = log P(ISR) + log P(grouping|ISR)
   4. Flat scoring (6 jets): direct 10-way classification
   5. Adversarial mass decorrelation head (gradient reversal)
@@ -91,8 +95,10 @@ class JetAssignmentTransformer(nn.Module):
     """Transformer encoder + factored jet assignment scorer.
 
     For 7+ jets (ISR mode):
-      - ISR head: num_jets-way classification over jets
       - Grouping head: 10-way classification for each ISR choice
+      - ISR head: num_jets-way classification informed by grouping quality —
+        an attention-pooled summary of each ISR candidate's grouping features
+        feeds into the ISR scorer so ISR and grouping are explored jointly
       - Combined: flat logits via log P(ISR=j) + log P(grouping=k|ISR=j)
 
     For 6 jets (no ISR):
@@ -170,8 +176,20 @@ class JetAssignmentTransformer(nn.Module):
             self.num_assignments = num_jets * ft["num_groupings"]
 
             self.n_isr_physics = 3
+            # Project pooled grouping features to d_model for the ISR head.
+            # For each ISR candidate, attention-weighted grouping features are
+            # projected to d_model and fed into the ISR scorer, enabling the
+            # ISR decision to see how well the remaining jets form pair-production
+            # groupings.
+            self.grouping_summary_proj = nn.Sequential(
+                nn.Linear(2 * d_model + self.n_group_physics, d_model),
+                nn.GELU(),
+            )
             self.isr_head = nn.Sequential(
-                nn.Linear(2 * d_model + self.n_isr_physics, d_model),
+                nn.Linear(3 * d_model + self.n_isr_physics, 2 * d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(2 * d_model, d_model),
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(d_model, 1),
@@ -257,12 +275,22 @@ class JetAssignmentTransformer(nn.Module):
         return torch.stack([pt_frac, abs_eta, min_dr], dim=-1)
 
     def _compute_isr_logits(
-        self, jet_embeddings: torch.Tensor, four_momenta: torch.Tensor
+        self, jet_embeddings: torch.Tensor, four_momenta: torch.Tensor,
+        grouping_context: torch.Tensor,
     ) -> torch.Tensor:
-        """Score each jet as ISR candidate. Returns (batch, num_jets)."""
+        """Score each jet as ISR candidate, informed by grouping quality.
+
+        Args:
+            jet_embeddings: (batch, num_jets, d_model)
+            four_momenta: (batch, num_jets, 4)
+            grouping_context: (batch, num_jets, d_model) — per-ISR-candidate
+                attention-pooled summary of grouping features
+
+        Returns (batch, num_jets).
+        """
         global_ctx = jet_embeddings.mean(dim=1, keepdim=True).expand_as(jet_embeddings)
         physics = self._isr_physics(four_momenta)
-        features = torch.cat([jet_embeddings, global_ctx, physics], dim=-1)
+        features = torch.cat([jet_embeddings, global_ctx, physics, grouping_context], dim=-1)
         return self.isr_head(features).squeeze(-1)
 
     def _group_physics_factored(self, four_momenta: torch.Tensor) -> torch.Tensor:
@@ -439,16 +467,22 @@ class JetAssignmentTransformer(nn.Module):
 
     def _compute_grouping_logits(
         self, jet_embeddings: torch.Tensor, four_momenta: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Score all groupings for each ISR choice.
 
         Group embeddings are pooled via the shared GroupTransformer (one layer of
         self-attention over the 3 jets in each candidate group) instead of
         sum-pooling, preserving intra-group angular ordering.
 
+        Also produces a per-ISR-candidate summary of grouping features via
+        attention-weighted pooling (softmax over grouping scores), enabling
+        downstream ISR scoring to see how well the remaining jets form
+        pair-production groupings.
+
         Returns:
             grouping_logits: (batch, num_jets, num_groupings)
             mass_asym_flat: (batch, num_assignments) mass asymmetry per flat assignment
+            grouping_summary: (batch, num_jets, d_model) per-ISR-candidate quality summary
         """
         batch_size = jet_embeddings.shape[0]
         n_combos = self.num_jets * self.num_groupings
@@ -481,12 +515,21 @@ class JetAssignmentTransformer(nn.Module):
         scores = self.grouping_scorer(combined).squeeze(-1)
         grouping_logits = scores.reshape(batch_size, self.num_jets, self.num_groupings)
 
+        # Attention-pooled grouping summary per ISR candidate:
+        # softmax over the 10 grouping scores weights the grouping features,
+        # then project to d_model. This tells the ISR head how good the
+        # pair-production interpretations look when each jet is removed.
+        combined_per_isr = combined.reshape(batch_size, self.num_jets, self.num_groupings, -1)
+        grp_weights = grouping_logits.softmax(dim=-1).unsqueeze(-1)     # (batch, J, 10, 1)
+        grp_context = (grp_weights * combined_per_isr).sum(dim=2)       # (batch, J, 2*d+phys)
+        grouping_summary = self.grouping_summary_proj(grp_context)      # (batch, J, d_model)
+
         # Remap mass asymmetry (physics dim 1) to flat assignment ordering
         mass_asym_factored = physics[:, :, 1]  # (batch, n_combos)
         source_idx = self.flat_to_factored[:, 0] * self.num_groupings + self.flat_to_factored[:, 1]
         mass_asym_flat = mass_asym_factored[:, source_idx]  # (batch, num_assignments)
 
-        return grouping_logits, mass_asym_flat
+        return grouping_logits, mass_asym_flat, grouping_summary
 
     def _combine_logits(
         self, isr_logits: torch.Tensor, grouping_logits: torch.Tensor
@@ -565,9 +608,12 @@ class JetAssignmentTransformer(nn.Module):
         jet_embeddings = self.encode_jets(four_momenta)
         mass_pred = self.predict_mass(jet_embeddings)
         if self.has_isr:
-            isr_logits = self._compute_isr_logits(jet_embeddings, four_momenta)
-            grouping_logits, mass_asym_flat = self._compute_grouping_logits(
+            # Compute groupings first so the ISR head can see grouping quality
+            grouping_logits, mass_asym_flat, grp_summary = self._compute_grouping_logits(
                 jet_embeddings, four_momenta
+            )
+            isr_logits = self._compute_isr_logits(
+                jet_embeddings, four_momenta, grp_summary
             )
             logits = self._combine_logits(isr_logits, grouping_logits)
             return {
