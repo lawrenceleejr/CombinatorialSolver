@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 
 from .combinatorics import enumerate_assignments
 from .dataset import JetAssignmentDataset
-from .model import JetAssignmentTransformer
+from .model import JetAssignmentTransformer, MassAsymmetryClassicalSolver
 from .utils import compute_invariant_mass, get_config, get_device
 
 
@@ -25,6 +25,7 @@ def evaluate(
     data_path: str,
     output_dir: str = "results",
     config_path: str | None = None,
+    include_classical: bool = True,
 ):
     """Evaluate model and reconstruct masses.
 
@@ -33,6 +34,8 @@ def evaluate(
         data_path: Path to HDF5 test data (glob pattern).
         output_dir: Directory for output files.
         config_path: Optional config override.
+        include_classical: Also run the classical mass-asymmetry solver and
+            save its results alongside the ML model results.
     """
     device = get_device()
     print(f"Using device: {device}")
@@ -84,7 +87,7 @@ def evaluate(
     # Enumerate assignments for index lookup
     assignments = enumerate_assignments(dc["num_jets"])
 
-    # Run inference
+    # Run ML model inference
     all_preds = []
     all_labels = []
     all_logits = []
@@ -108,7 +111,7 @@ def evaluate(
 
     n_events = len(all_preds)
 
-    # Compute accuracy
+    # Compute ML accuracy
     correct = (all_preds == all_labels).sum().item()
     accuracy = correct / n_events
     num_assignments = all_logits.shape[1]
@@ -116,8 +119,40 @@ def evaluate(
     _, top5 = all_logits.topk(topk, dim=-1)
     acc5 = (top5 == all_labels.unsqueeze(-1)).any(dim=-1).float().mean().item()
     print(f"Num assignments: {num_assignments} ({dc['num_jets']} jets)")
-    print(f"Top-1 accuracy: {accuracy:.4f} ({correct}/{n_events})")
-    print(f"Top-{topk} accuracy: {acc5:.4f}")
+    print(f"[ML]      Top-1 accuracy: {accuracy:.4f} ({correct}/{n_events})")
+    print(f"[ML]      Top-{topk} accuracy: {acc5:.4f}")
+
+    # --- Classical mass-asymmetry solver ---
+    all_classical_preds = None
+    if include_classical:
+        classical_solver = MassAsymmetryClassicalSolver(num_jets=dc["num_jets"])
+        classical_solver.eval()
+
+        loader_raw = DataLoader(
+            dataset_raw,
+            batch_size=1024,
+            shuffle=False,
+            num_workers=0,
+        )
+
+        classical_preds_list = []
+        cls_all_logits_parts = []
+        with torch.no_grad():
+            for batch in loader_raw:
+                four_mom_raw = batch["four_momenta"]
+                cls_logits = classical_solver(four_mom_raw)["logits"]
+                classical_preds_list.append(cls_logits.argmax(dim=-1))
+                cls_all_logits_parts.append(cls_logits)
+
+        all_classical_preds = torch.cat(classical_preds_list)
+        cls_all_logits = torch.cat(cls_all_logits_parts)
+
+        cls_correct = (all_classical_preds == all_labels).sum().item()
+        cls_accuracy = cls_correct / n_events
+        _, cls_top5_idx = cls_all_logits.topk(topk, dim=-1)
+        cls_acc5 = (cls_top5_idx == all_labels.unsqueeze(-1)).any(dim=-1).float().mean().item()
+        print(f"[Classical] Top-1 accuracy: {cls_accuracy:.4f} ({cls_correct}/{n_events})")
+        print(f"[Classical] Top-{topk} accuracy: {cls_acc5:.4f}")
 
     # Reconstruct invariant masses
     mass1_pred = []  # mass of group1 in predicted assignment
@@ -126,6 +161,10 @@ def evaluate(
     mass1_truth = []
     mass2_truth = []
     mass_avg_truth = []
+    # Classical solver mass arrays (populated only if include_classical=True)
+    mass1_classical = []
+    mass2_classical = []
+    mass_avg_classical = []
 
     for i in range(n_events):
         p_idx = all_preds[i].item()
@@ -158,42 +197,80 @@ def evaluate(
             mass2_truth.append(float("nan"))
             mass_avg_truth.append(float("nan"))
 
+        # Classical assignment masses
+        if all_classical_preds is not None:
+            c_idx = all_classical_preds[i].item()
+            _, g1_cls_idx, g2_cls_idx = assignments[c_idx]
+            c_g1 = raw[list(g1_cls_idx)].sum(dim=0)
+            c_g2 = raw[list(g2_cls_idx)].sum(dim=0)
+            m1_c = compute_invariant_mass(c_g1).item()
+            m2_c = compute_invariant_mass(c_g2).item()
+            mass1_classical.append(m1_c)
+            mass2_classical.append(m2_c)
+            mass_avg_classical.append((m1_c + m2_c) / 2.0)
+
     # Save results
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     # Mass distributions as CSV
     csv_path = Path(output_dir) / "mass_reconstruction.csv"
+    has_classical = all_classical_preds is not None
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
+        header = [
             "event_idx", "pred_assignment", "truth_assignment", "correct",
             "mass1_pred", "mass2_pred", "mass_avg_pred",
             "mass1_truth", "mass2_truth", "mass_avg_truth",
-        ])
+        ]
+        if has_classical:
+            header += [
+                "classical_assignment", "classical_correct",
+                "mass1_classical", "mass2_classical", "mass_avg_classical",
+            ]
+        writer.writerow(header)
         for i in range(n_events):
-            writer.writerow([
+            row = [
                 i, all_preds[i].item(), all_labels[i].item(),
                 int(all_preds[i].item() == all_labels[i].item()),
                 f"{mass1_pred[i]:.2f}", f"{mass2_pred[i]:.2f}", f"{mass_avg_pred[i]:.2f}",
                 f"{mass1_truth[i]:.2f}", f"{mass2_truth[i]:.2f}", f"{mass_avg_truth[i]:.2f}",
-            ])
+            ]
+            if has_classical:
+                row += [
+                    all_classical_preds[i].item(),
+                    int(all_classical_preds[i].item() == all_labels[i].item()),
+                    f"{mass1_classical[i]:.2f}",
+                    f"{mass2_classical[i]:.2f}",
+                    f"{mass_avg_classical[i]:.2f}",
+                ]
+            writer.writerow(row)
 
     # Summary numpy arrays (for quick plotting)
-    np.savez(
-        Path(output_dir) / "mass_arrays.npz",
+    npz_kwargs = dict(
         mass_avg_pred=np.array(mass_avg_pred),
         mass_avg_truth=np.array(mass_avg_truth),
         mass1_pred=np.array(mass1_pred),
         mass2_pred=np.array(mass2_pred),
         correct=np.array([all_preds[i].item() == all_labels[i].item() for i in range(n_events)]),
     )
+    if has_classical:
+        npz_kwargs["mass_avg_classical"] = np.array(mass_avg_classical)
+        npz_kwargs["mass1_classical"] = np.array(mass1_classical)
+        npz_kwargs["mass2_classical"] = np.array(mass2_classical)
+        npz_kwargs["correct_classical"] = np.array(
+            [all_classical_preds[i].item() == all_labels[i].item() for i in range(n_events)]
+        )
+    np.savez(Path(output_dir) / "mass_arrays.npz", **npz_kwargs)
 
     print(f"\nResults saved to {output_dir}/")
     print(f"  mass_reconstruction.csv: per-event results")
     print(f"  mass_arrays.npz: numpy arrays for plotting")
-    print(f"\nMass avg (predicted): mean={np.nanmean(mass_avg_pred):.1f} GeV, "
+    print(f"\nMass avg (ML predicted): mean={np.nanmean(mass_avg_pred):.1f} GeV, "
           f"std={np.nanstd(mass_avg_pred):.1f} GeV")
-    print(f"Mass avg (truth):     mean={np.nanmean(mass_avg_truth):.1f} GeV, "
+    if has_classical:
+        print(f"Mass avg (classical):     mean={np.nanmean(mass_avg_classical):.1f} GeV, "
+              f"std={np.nanstd(mass_avg_classical):.1f} GeV")
+    print(f"Mass avg (truth):         mean={np.nanmean(mass_avg_truth):.1f} GeV, "
           f"std={np.nanstd(mass_avg_truth):.1f} GeV")
 
 
@@ -203,5 +280,10 @@ if __name__ == "__main__":
     parser.add_argument("--data", type=str, required=True, help="Test HDF5 data (glob)")
     parser.add_argument("--output", type=str, default="results", help="Output directory")
     parser.add_argument("--config", type=str, default=None, help="Config override")
+    parser.add_argument(
+        "--no-classical",
+        action="store_true",
+        help="Skip the classical mass-asymmetry solver comparison",
+    )
     args = parser.parse_args()
-    evaluate(args.checkpoint, args.data, args.output, args.config)
+    evaluate(args.checkpoint, args.data, args.output, args.config, not args.no_classical)
