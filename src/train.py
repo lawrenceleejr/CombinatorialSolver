@@ -2,8 +2,9 @@
 Training loop for the jet assignment transformer.
 
 Supports:
-  - Combined cross-entropy (assignment) + adversarial mass decorrelation loss
-  - Cosine LR schedule with linear warmup
+  - Factored loss: ISR cross-entropy + grouping cross-entropy (7-jet mode)
+  - Combined cross-entropy (6-jet mode) + adversarial mass decorrelation
+  - Cosine LR schedule with linear warmup and optional warm restarts
   - Automatic device selection (MPS / CUDA / CPU)
   - Checkpointing, CSV logging, and ONNX export
 """
@@ -30,7 +31,6 @@ def export_onnx(model, num_jets, device, val_acc):
     dummy = torch.randn(1, num_jets, 4, device=device)
     onnx_path = "checkpoints/best_model.onnx"
 
-    # Wrap to export only logits (single tensor output)
     class _Wrapper(nn.Module):
         def __init__(self, m):
             super().__init__()
@@ -58,13 +58,7 @@ def export_onnx(model, num_jets, device, val_acc):
 
 
 def cosine_with_warmup(optimizer, epoch, num_epochs, warmup_epochs, restart_period=0):
-    """Adjust learning rate: linear warmup then cosine decay with optional warm restarts.
-
-    Args:
-        restart_period: If >0, restart the cosine cycle every this many epochs
-            after warmup. Each restart resets LR to peak, giving the optimizer
-            a chance to escape local minima.
-    """
+    """Adjust learning rate: linear warmup then cosine decay with optional warm restarts."""
     if epoch < warmup_epochs:
         lr_scale = (epoch + 1) / warmup_epochs
     else:
@@ -136,6 +130,10 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
+    if model.has_isr:
+        print(f"Architecture: factored (ISR {model.num_jets}-way + grouping {model.num_groupings}-way)")
+    else:
+        print(f"Architecture: flat ({model.num_assignments}-way)")
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -143,7 +141,6 @@ def train(config_path: str | None = None, data_path: str | None = None):
         lr=tc["learning_rate"],
         weight_decay=tc["weight_decay"],
     )
-    # Store initial LR for scheduler
     for pg in optimizer.param_groups:
         pg["initial_lr"] = pg["lr"]
 
@@ -170,7 +167,9 @@ def train(config_path: str | None = None, data_path: str | None = None):
         writer = csv.writer(f)
         writer.writerow([
             "epoch", "train_loss", "train_acc", "train_acc5",
-            "val_loss", "val_acc", "val_acc5", "adv_r2", "lr",
+            "val_loss", "val_acc", "val_acc5",
+            "train_isr_acc", "train_grp_acc", "val_isr_acc", "val_grp_acc",
+            "adv_r2", "lr",
         ])
 
     best_val_acc = 0.0
@@ -179,14 +178,12 @@ def train(config_path: str | None = None, data_path: str | None = None):
     no_improve = 0
 
     for epoch in range(tc["num_epochs"]):
-        # Update learning rate
         cosine_with_warmup(
             optimizer, epoch, tc["num_epochs"], tc["warmup_epochs"],
             restart_period=tc.get("restart_period", 0),
         )
         current_lr = optimizer.param_groups[0]["lr"]
 
-        # Ramp up adversarial strength (only if multiple mass points)
         if use_adversary:
             rampup = tc.get("lambda_adv_rampup", 10)
             if rampup > 0:
@@ -216,11 +213,18 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
         # Log
         adv_str = f" | Adv R²={val_metrics['adv_r2']:.3f}" if use_adversary else ""
+        isr_str = ""
+        if "isr_acc" in val_metrics:
+            isr_str = (
+                f" | ISR={val_metrics['isr_acc']:.3f}"
+                f" Grp={val_metrics['grp_acc']:.3f}"
+            )
+
         print(
             f"Epoch {epoch+1:3d}/{tc['num_epochs']} | "
             f"Train loss={train_metrics['loss']:.4f} acc={train_metrics['acc']:.3f} | "
             f"Val loss={val_metrics['loss']:.4f} acc={val_metrics['acc']:.3f}"
-            f"{adv_str} | "
+            f"{isr_str}{adv_str} | "
             f"LR={current_lr:.2e}"
         )
 
@@ -234,6 +238,10 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 f"{val_metrics['loss']:.6f}",
                 f"{val_metrics['acc']:.4f}",
                 f"{val_metrics['acc5']:.4f}",
+                f"{train_metrics.get('isr_acc', 0):.4f}",
+                f"{train_metrics.get('grp_acc', 0):.4f}",
+                f"{val_metrics.get('isr_acc', 0):.4f}",
+                f"{val_metrics.get('grp_acc', 0):.4f}",
                 f"{val_metrics['adv_r2']:.4f}",
                 f"{current_lr:.6e}",
             ])
@@ -274,9 +282,12 @@ def _run_epoch(model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optim
     total_loss = 0.0
     total_correct = 0
     total_correct5 = 0
+    total_isr_correct = 0
+    total_grp_correct = 0
     total_samples = 0
     all_mass_pred = []
     all_mass_true = []
+    factored = model.has_isr
 
     for batch in loader:
         four_mom = batch["four_momenta"].to(device)
@@ -287,11 +298,28 @@ def _run_epoch(model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optim
         logits = output["logits"]
         mass_pred = output["mass_pred"].squeeze(-1)
 
-        # Assignment cross-entropy loss
-        loss_ce = ce_loss_fn(logits, labels)
+        # Assignment loss
+        if factored and "isr_logits" in output:
+            isr_logits = output["isr_logits"]
+            grouping_logits = output["grouping_logits"]
 
-        # Adversarial mass loss (MSE on predicted vs true parent mass)
-        # Only compute for events where we have truth mass > 0
+            isr_labels = model.flat_to_factored[labels, 0]
+            grouping_labels = model.flat_to_factored[labels, 1]
+
+            loss_isr = ce_loss_fn(isr_logits, isr_labels)
+
+            batch_idx = torch.arange(labels.shape[0], device=device)
+            gt_grp_logits = grouping_logits[batch_idx, isr_labels]
+            loss_grp = ce_loss_fn(gt_grp_logits, grouping_labels)
+
+            loss_ce = loss_isr + loss_grp
+
+            total_isr_correct += (isr_logits.argmax(dim=-1) == isr_labels).sum().item()
+            total_grp_correct += (gt_grp_logits.argmax(dim=-1) == grouping_labels).sum().item()
+        else:
+            loss_ce = ce_loss_fn(logits, labels)
+
+        # Adversarial mass loss
         mass_mask = parent_mass > 0
         if mass_mask.any() and lambda_adv > 0:
             loss_adv = mse_loss_fn(mass_pred[mass_mask], parent_mass[mass_mask])
@@ -299,7 +327,6 @@ def _run_epoch(model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optim
         else:
             loss_adv = torch.tensor(0.0, device=device)
 
-        # Combined loss: CE + adversarial (GRL handles gradient sign flip)
         loss = loss_ce + lambda_adv * loss_adv
 
         if optimizer is not None:
@@ -316,11 +343,9 @@ def _run_epoch(model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optim
         preds = logits.argmax(dim=-1)
         total_correct += (preds == labels).sum().item()
 
-        # Top-5 accuracy
         _, top5 = logits.topk(5, dim=-1)
         total_correct5 += (top5 == labels.unsqueeze(-1)).any(dim=-1).sum().item()
 
-        # Track mass predictions for R² computation
         if mass_mask.any():
             all_mass_pred.append(mass_pred[mass_mask].detach().cpu())
             all_mass_true.append(parent_mass[mass_mask].detach().cpu())
@@ -329,7 +354,6 @@ def _run_epoch(model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optim
     acc = total_correct / max(total_samples, 1)
     acc5 = total_correct5 / max(total_samples, 1)
 
-    # Compute adversary R² (should stay low if decorrelation works)
     adv_r2 = 0.0
     if all_mass_pred:
         pred_cat = torch.cat(all_mass_pred)
@@ -339,7 +363,11 @@ def _run_epoch(model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optim
         if ss_tot > 0:
             adv_r2 = 1.0 - (ss_res / ss_tot).item()
 
-    return {"loss": avg_loss, "acc": acc, "acc5": acc5, "adv_r2": adv_r2}
+    result = {"loss": avg_loss, "acc": acc, "acc5": acc5, "adv_r2": adv_r2}
+    if factored:
+        result["isr_acc"] = total_isr_correct / max(total_samples, 1)
+        result["grp_acc"] = total_grp_correct / max(total_samples, 1)
+    return result
 
 
 if __name__ == "__main__":
