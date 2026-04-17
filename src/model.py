@@ -186,6 +186,8 @@ class JetAssignmentTransformer(nn.Module):
                 nn.GELU(),
             )
             self.isr_head = nn.Sequential(
+                # Input: [jet_emb, global_ctx, isr_physics, grouping_summary]
+                # = d_model + d_model + n_isr_physics + d_model
                 nn.Linear(3 * d_model + self.n_isr_physics, 2 * d_model),
                 nn.GELU(),
                 nn.Dropout(dropout),
