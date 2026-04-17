@@ -183,6 +183,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
     tf_end = tc.get("tf_end", 0.3)
     tf_decay_epochs = tc.get("tf_decay_epochs", 100)
     lambda_sym = tc.get("lambda_sym", 0.0)
+    lambda_qcd = tc.get("lambda_qcd", 0.0)
 
     for epoch in range(tc["num_epochs"]):
         cosine_with_warmup(
@@ -214,7 +215,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
         train_metrics = _run_epoch(
             model, train_loader, ce_loss_fn, mse_loss_fn,
             lambda_adv, device, optimizer=optimizer,
-            tf_ratio=tf_ratio, lambda_sym=lambda_sym,
+            tf_ratio=tf_ratio, lambda_sym=lambda_sym, lambda_qcd=lambda_qcd,
         )
 
         # Validation (no augmentation, no teacher forcing: tf_ratio=0 = pure end-to-end)
@@ -223,7 +224,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
             val_metrics = _run_epoch(
                 model, val_loader, ce_loss_fn, mse_loss_fn,
                 lambda_adv, device, optimizer=None,
-                tf_ratio=0.0, lambda_sym=0.0,
+                tf_ratio=0.0, lambda_sym=0.0, lambda_qcd=0.0,
             )
 
         # Log
@@ -294,7 +295,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
 def _run_epoch(
     model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optimizer=None,
-    tf_ratio=1.0, lambda_sym=0.0,
+    tf_ratio=1.0, lambda_sym=0.0, lambda_qcd=0.0,
 ):
     """Run one epoch of training or validation."""
     total_loss = 0.0
@@ -362,6 +363,30 @@ def _run_epoch(
             probs = logits.softmax(dim=-1)
             loss_sym = (probs * mass_asym).sum(dim=-1).mean()
             loss_ce = loss_ce + lambda_sym * loss_sym
+
+        # QCD hierarchy penalty: events with large pT hierarchies (QCD-like) are pushed
+        # to prefer high-mass-asymmetry assignments, making them self-select interpretations
+        # that look maximally unlike a symmetric signal decay.
+        # loss_qcd = -mean(H_i * expected_mass_asym_i), where H = log(pT_max/pT_min).
+        # Minimising this negative quantity increases H-weighted expected asymmetry,
+        # disfavouring signal-like (low-asymmetry) interpretations for QCD-dominated events.
+        if lambda_qcd > 0 and "mass_asym_flat" in output:
+            px_all = four_mom[..., 1]
+            py_all = four_mom[..., 2]
+            pt_all = torch.sqrt(px_all**2 + py_all**2).clamp(min=1e-8)
+            pt_max = pt_all.max(dim=-1).values
+            pt_min = pt_all.min(dim=-1).values.clamp(min=1e-8)
+            # Clamp H to prevent very large values from degenerate (near-zero pT_min) events
+            H = torch.log(pt_max / pt_min).clamp(max=10.0)             # (batch,) hierarchy score
+
+            # Detach mass_asym: we only want to steer the assignment probabilities,
+            # not back-propagate through the physics feature computation itself.
+            mass_asym_qcd = output["mass_asym_flat"].detach()           # (batch, num_assignments)
+            probs_qcd = logits.softmax(dim=-1)
+            expected_asym = (probs_qcd * mass_asym_qcd).sum(dim=-1)    # (batch,)
+            # Negative sign: minimising drives H * expected_asym upward for high-H events
+            loss_qcd_term = -(H * expected_asym).mean()
+            loss_ce = loss_ce + lambda_qcd * loss_qcd_term
 
         # Adversarial mass loss
         mass_mask = parent_mass > 0

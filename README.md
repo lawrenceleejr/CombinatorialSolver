@@ -7,9 +7,24 @@ Given 7 leading jets per event, the model identifies which jet is ISR and assign
 ## Architecture
 
 - **Input**: 7 jets as (E, px, py, pz) four-vectors, normalized by event HT
-- **Encoder**: Transformer with self-attention over jet tokens (4 layers, 8 heads, d=128)
-- **Scorer**: Enumerates all 70 possible (ISR, group1, group2) assignments, aggregates jet embeddings per group with sum-pooling, scores with an MLP. Symmetry between the two parent groups is handled by sorting group embeddings by norm before concatenation.
+- **Encoder**: Transformer with self-attention over jet tokens (4 layers, 8 heads, d=128) plus per-head learnable pT-hierarchy attention bias (log pT_i/pT_j)
+- **GroupTransformer**: Shared mini-Transformer (1 layer, 4 heads) replaces sum-pooling for group embeddings, preserving intra-group angular ordering and multi-particle correlations
+- **Scorer**: Enumerates all 70 possible (ISR, group1, group2) assignments, pools jet embeddings per group with the GroupTransformer, scores with an MLP. Group symmetry is handled via sum and Hadamard product of the two group embeddings.
+- **Extended physics features** (`n_group_physics=24`) per assignment:
+  - *6 inter-group*: mass sum, mass asymmetry |m1-m2|/(m1+m2), mass ratio, m1, m2, ΔR between group CoM
+  - *9 intra-group × 2 groups = 18*: max pT ratio, pT coefficient of variation, minimum Lund splitting fraction z, maximum Lund kT, ECF₂(β=1), ECF₃(β=1), D₂ = ECF₃/ECF₂², max and min Dalitz pairwise mass ratio
 - **Adversarial head**: Gradient-reversed MLP predicts parent mass from jet embeddings — penalizes the encoder if mass information leaks, preventing sculpting of the m_avg distribution.
+
+## Training Losses
+
+| Loss term | Purpose |
+|-----------|---------|
+| `CrossEntropyLoss` (assignment) | Main supervised combinatorial loss |
+| `lambda_adv × MSE` (adversary) | Decorrelate latent space from parent mass |
+| `lambda_sym × E[mass_asym]` | Prefer balanced-mass assignments on average |
+| `lambda_qcd × (-E[H · mass_asym])` | QCD penalty: push high-pT-hierarchy events to prefer high-asymmetry interpretations, making QCD background self-select non-signal-like regions of mass space |
+
+The **QCD penalty** (`lambda_qcd`) uses H = log(pT_max / pT_min) as a per-event hierarchy score. Events with large H (QCD-like, one dominant jet) are pushed to assign to interpretations with large mass asymmetry and low average mass, disfavouring the signal-like bump-hunt region. Signal events (more balanced pT) are governed by the cross-entropy loss and resist this push.
 
 ## Setup
 
@@ -73,3 +88,13 @@ The network is designed to not learn a specific mass value:
 4. **No mass-based loss**: Only combinatorial assignment cross-entropy
 
 This ensures the m_avg distribution is not sculpted when applied to background events.
+
+## QCD Background Handling
+
+Several design choices make QCD multijet backgrounds self-select non-signal-like combinatorial interpretations:
+
+1. **pT hierarchy features** in each candidate group (max pT ratio, pT CV, Lund splitting z, Lund kT): QCD splittings are collinear/soft-enhanced, so these features directly identify QCD-like internal topology
+2. **Energy Correlation Functions** (ECF₂, ECF₃, D₂ with β=1): IRC-safe multi-particle angular observables that distinguish isotropic signal from collimated QCD topologies
+3. **Dalitz pairwise mass ratios**: Probe internal 3-body resonance structure; signal decays populate specific Dalitz regions while QCD fills it according to DGLAP evolution
+4. **QCD penalty loss** (`lambda_qcd`): Soft-weights the assignment distribution by the event's pT hierarchy, pushing QCD-like events to prefer high-mass-asymmetry interpretations
+5. **GroupTransformer pooling**: Attention over the 3 jets in each group preserves angular ordering and relative momentum flow that sum-pooling destroys
