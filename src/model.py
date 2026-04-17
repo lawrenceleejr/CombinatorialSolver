@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from .combinatorics import build_assignment_tensors
+from .utils import compute_invariant_mass
 
 
 class GradientReversalFunction(torch.autograd.Function):
@@ -201,3 +202,73 @@ class JetAssignmentTransformer(nn.Module):
         logits = self.score_assignments(jet_embeddings)
         mass_pred = self.predict_mass(jet_embeddings)
         return {"logits": logits, "mass_pred": mass_pred}
+
+
+class MassAsymmetryClassicalSolver(nn.Module):
+    """Classical jet assignment solver that minimises mass asymmetry.
+
+    For every event all combinatorial assignments are enumerated (same set
+    as used by the ML model).  The invariant masses of the two candidate
+    groups are computed for each assignment and the one with the smallest
+    relative mass asymmetry
+
+        A = |m1 - m2| / (m1 + m2)
+
+    is selected.  Logits are returned as the *negative* asymmetry so that
+    ``argmax(logits)`` gives the best (minimum-asymmetry) assignment —
+    matching the inference interface of :class:`JetAssignmentTransformer`.
+
+    Args:
+        num_jets: Number of input jets (6 or 7).
+    """
+
+    def __init__(self, num_jets: int = 7):
+        super().__init__()
+        self.num_jets = num_jets
+
+        at = build_assignment_tensors(num_jets)
+        self.register_buffer("group1_indices", at["group1_indices"])
+        self.register_buffer("group2_indices", at["group2_indices"])
+        self.num_assignments = at["num_assignments"]
+
+    def forward(self, four_momenta: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Compute negative mass-asymmetry scores for all assignments.
+
+        Args:
+            four_momenta: (batch, num_jets, 4) tensor with (E, px, py, pz).
+                          Values should be in the *un-normalised* physical
+                          units so that meaningful invariant masses can be
+                          computed.
+
+        Returns:
+            dict with ``logits`` of shape (batch, num_assignments).
+            ``logits.argmax(dim=-1)`` gives the minimum-asymmetry assignment.
+        """
+        batch_size = four_momenta.shape[0]
+        na = self.num_assignments
+
+        # Expand for batched gathering: (batch, na, num_jets, 4)
+        fm_expanded = four_momenta.unsqueeze(1).expand(-1, na, -1, -1)
+
+        # Gather and sum group1 four-momenta → (batch, na, 4)
+        g1_idx = (
+            self.group1_indices.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, -1, 4)
+        )
+        g1_sum = torch.gather(fm_expanded, 2, g1_idx).sum(dim=2)
+
+        # Gather and sum group2 four-momenta → (batch, na, 4)
+        g2_idx = (
+            self.group2_indices.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, -1, 4)
+        )
+        g2_sum = torch.gather(fm_expanded, 2, g2_idx).sum(dim=2)
+
+        # Invariant masses for each assignment → (batch, na)
+        m1 = compute_invariant_mass(g1_sum)
+        m2 = compute_invariant_mass(g2_sum)
+
+        # Relative mass asymmetry; clamp denominator to avoid division by zero
+        asymmetry = torch.abs(m1 - m2) / (m1 + m2).clamp(min=1e-8)
+
+        # Negative asymmetry as logits: argmax selects minimum asymmetry
+        logits = -asymmetry
+        return {"logits": logits}
