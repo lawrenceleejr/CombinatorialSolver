@@ -266,8 +266,12 @@ class JetAssignmentTransformer(nn.Module):
         between each jet and the rest of the event, which is the key signal for
         identifying an outlier ISR jet.
         """
-        total = jet_embeddings.sum(dim=1, keepdim=True)              # (batch, 1, d_model)
-        loo_ctx = (total - jet_embeddings) / (self.num_jets - 1)     # (batch, num_jets, d_model)
+        # _compute_isr_logits is only called when has_isr=True (num_jets >= 7),
+        # so num_jets - 1 >= 6 and division is safe.  The guard prevents a
+        # confusing ZeroDivisionError if the method is ever called with num_jets=1.
+        n_others = max(self.num_jets - 1, 1)
+        total = jet_embeddings.sum(dim=1, keepdim=True)    # (batch, 1, d_model)
+        loo_ctx = (total - jet_embeddings) / n_others      # (batch, num_jets, d_model)
         physics = self._isr_physics(four_momenta)
         features = torch.cat([jet_embeddings, loo_ctx, physics], dim=-1)
         return self.isr_head(features).squeeze(-1)

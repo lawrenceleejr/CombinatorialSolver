@@ -383,10 +383,11 @@ def _run_epoch(
 
             # Blend teacher-forced factored loss with flat end-to-end loss
             # tf_ratio=1: fully teacher-forced (original); tf_ratio=0: flat CE only
-            # lambda_isr upweights the ISR loss to compensate for the gradient imbalance:
-            # each signal jet receives 10x more gradient paths from the grouping loss than
-            # the ISR jet does from the ISR loss (signal jets appear in all 10 groupings,
-            # ISR jet appears in none).  Scaling loss_isr by lambda_isr rebalances this.
+            # lambda_isr upweights the ISR loss to compensate for a gradient imbalance:
+            # each signal jet appears in all num_groupings groupings, so loss_grp_tf
+            # produces num_groupings gradient paths per signal jet while the ISR jet
+            # (excluded from every group) receives gradient only from loss_isr.
+            # Scaling loss_isr by lambda_isr partially rebalances this asymmetry.
             loss_flat = ce_loss_fn(logits, labels)
             loss_ce = tf_ratio * (lambda_isr * loss_isr + loss_grp_tf) + (1.0 - tf_ratio) * loss_flat
 
