@@ -13,6 +13,18 @@ import h5py
 import numpy as np
 
 
+def _print_tree(group, prefix=""):
+    """Recursively print HDF5 group/dataset tree."""
+    for key in group.keys():
+        item = group[key]
+        full_path = f"{prefix}/{key}" if prefix else key
+        if isinstance(item, h5py.Group):
+            print(f"  {full_path}/ (group, {len(item)} children)")
+            _print_tree(item, full_path)
+        else:
+            print(f"  {full_path}: shape={item.shape}, dtype={item.dtype}")
+
+
 def inspect_h5(path: str):
     print(f"=== Inspecting: {path} ===\n")
 
@@ -20,8 +32,15 @@ def inspect_h5(path: str):
         print("Top-level keys:", list(f.keys()))
         print()
 
+        print("Full tree:")
+        _print_tree(f)
+        print()
+
         for key in f.keys():
-            ds = f[key]
+            item = f[key]
+            if isinstance(item, h5py.Group):
+                continue
+            ds = item
             print(f"  {key}:")
             print(f"    shape: {ds.shape}")
             print(f"    dtype: {ds.dtype}")
@@ -125,8 +144,11 @@ def inspect_h5(path: str):
         print(f"\n  All available keys: {list(f.keys())}")
         for key in f.keys():
             if key not in expected:
-                ds = f[key]
-                print(f"    Extra key '{key}': shape={ds.shape}, dtype={ds.dtype}")
+                item = f[key]
+                if isinstance(item, h5py.Group):
+                    print(f"    Extra key '{key}': group with keys {list(item.keys())}")
+                else:
+                    print(f"    Extra key '{key}': shape={item.shape}, dtype={item.dtype}")
 
 
 if __name__ == "__main__":

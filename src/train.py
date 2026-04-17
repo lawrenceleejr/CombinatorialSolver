@@ -2,10 +2,11 @@
 Training loop for the jet assignment transformer.
 
 Supports:
-  - Combined cross-entropy (assignment) + adversarial mass decorrelation loss
-  - Cosine LR schedule with linear warmup
+  - Factored loss: ISR cross-entropy + grouping cross-entropy (7-jet mode)
+  - Combined cross-entropy (6-jet mode) + adversarial mass decorrelation
+  - Cosine LR schedule with linear warmup and optional warm restarts
   - Automatic device selection (MPS / CUDA / CPU)
-  - Checkpointing and CSV logging
+  - Checkpointing, CSV logging, and ONNX export
 """
 
 import argparse
@@ -16,6 +17,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.onnx
 from torch.utils.data import DataLoader, random_split
 
 from .dataset import JetAssignmentDataset
@@ -23,12 +25,50 @@ from .model import JetAssignmentTransformer
 from .utils import get_config, get_device
 
 
-def cosine_with_warmup(optimizer, epoch, num_epochs, warmup_epochs):
-    """Adjust learning rate: linear warmup then cosine decay."""
+def export_onnx(model, num_jets, device, val_acc):
+    """Export model to ONNX format."""
+    model.eval()
+    input_dim = model.input_proj.in_features
+    dummy = torch.randn(1, num_jets, input_dim, device=device)
+    onnx_path = "checkpoints/best_model.onnx"
+
+    class _Wrapper(nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.m = m
+
+        def forward(self, four_momenta):
+            return self.m(four_momenta)["logits"]
+
+    wrapper = _Wrapper(model)
+    wrapper.eval()
+
+    torch.onnx.export(
+        wrapper,
+        dummy,
+        onnx_path,
+        input_names=["four_momenta"],
+        output_names=["logits"],
+        dynamic_axes={
+            "four_momenta": {0: "batch_size"},
+            "logits": {0: "batch_size"},
+        },
+        opset_version=18,
+    )
+    print(f"  -> Exported ONNX model to {onnx_path} (val_acc={val_acc:.4f})")
+
+
+def cosine_with_warmup(optimizer, epoch, num_epochs, warmup_epochs, restart_period=0):
+    """Adjust learning rate: linear warmup then cosine decay with optional warm restarts."""
     if epoch < warmup_epochs:
         lr_scale = (epoch + 1) / warmup_epochs
     else:
-        progress = (epoch - warmup_epochs) / max(num_epochs - warmup_epochs, 1)
+        post_warmup = epoch - warmup_epochs
+        if restart_period > 0:
+            cycle_pos = post_warmup % restart_period
+            progress = cycle_pos / restart_period
+        else:
+            progress = post_warmup / max(num_epochs - warmup_epochs, 1)
         lr_scale = 0.5 * (1.0 + math.cos(math.pi * progress))
 
     for pg in optimizer.param_groups:
@@ -53,6 +93,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
         data_paths=data_path,
         num_jets=dc["num_jets"],
         normalize_by_ht=dc["normalize_by_ht"],
+        pt_smear_frac=dc.get("pt_smear_frac", 0.0),
     )
     print(f"Dataset size: {len(dataset)} events")
 
@@ -86,10 +127,15 @@ def train(config_path: str | None = None, data_path: str | None = None):
         dim_feedforward=mc["dim_feedforward"],
         dropout=mc["dropout"],
         num_jets=dc["num_jets"],
+        input_dim=4,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
+    if model.has_isr:
+        print(f"Architecture: factored (ISR {model.num_jets}-way + grouping {model.num_groupings}-way)")
+    else:
+        print(f"Architecture: flat ({model.num_assignments}-way)")
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -97,7 +143,6 @@ def train(config_path: str | None = None, data_path: str | None = None):
         lr=tc["learning_rate"],
         weight_decay=tc["weight_decay"],
     )
-    # Store initial LR for scheduler
     for pg in optimizer.param_groups:
         pg["initial_lr"] = pg["lr"]
 
@@ -105,10 +150,12 @@ def train(config_path: str | None = None, data_path: str | None = None):
     ce_loss_fn = nn.CrossEntropyLoss()
     mse_loss_fn = nn.MSELoss()
 
-    # Check if adversarial training is useful (need multiple mass points)
+    # Check if adversarial training is useful
     mass_std = dataset.parent_masses.std().item()
-    use_adversary = mass_std > 0.01  # Disable if all events have same mass
-    if not use_adversary:
+    use_adversary = tc["lambda_adv"] > 0 and mass_std > 0.01
+    if tc["lambda_adv"] == 0:
+        print("Adversary disabled: lambda_adv=0")
+    elif not use_adversary:
         print("Adversary disabled: single mass point detected")
     else:
         print(f"Adversary enabled: mass std = {mass_std:.3f} TeV")
@@ -122,17 +169,29 @@ def train(config_path: str | None = None, data_path: str | None = None):
         writer = csv.writer(f)
         writer.writerow([
             "epoch", "train_loss", "train_acc", "train_acc5",
-            "val_loss", "val_acc", "val_acc5", "adv_r2", "lr",
+            "val_loss", "val_acc", "val_acc5",
+            "train_isr_acc", "train_grp_acc", "val_isr_acc", "val_grp_acc",
+            "adv_r2", "lr",
         ])
 
     best_val_acc = 0.0
+    best_epoch = 0
+    patience = tc.get("patience", 25)
+    no_improve = 0
+
+    tf_start = tc.get("tf_start", 1.0)
+    tf_end = tc.get("tf_end", 0.3)
+    tf_decay_epochs = tc.get("tf_decay_epochs", 100)
+    lambda_sym = tc.get("lambda_sym", 0.0)
+    lambda_qcd = tc.get("lambda_qcd", 0.0)
 
     for epoch in range(tc["num_epochs"]):
-        # Update learning rate
-        cosine_with_warmup(optimizer, epoch, tc["num_epochs"], tc["warmup_epochs"])
+        cosine_with_warmup(
+            optimizer, epoch, tc["num_epochs"], tc["warmup_epochs"],
+            restart_period=tc.get("restart_period", 0),
+        )
         current_lr = optimizer.param_groups[0]["lr"]
 
-        # Ramp up adversarial strength (only if multiple mass points)
         if use_adversary:
             rampup = tc.get("lambda_adv_rampup", 10)
             if rampup > 0:
@@ -145,28 +204,43 @@ def train(config_path: str | None = None, data_path: str | None = None):
             lambda_adv = 0.0
             model.gradient_reversal.set_lambda(0.0)
 
+        # Teacher forcing ratio: linearly decay from tf_start to tf_end over tf_decay_epochs
+        if epoch < tf_decay_epochs:
+            tf_ratio = tf_start + (tf_end - tf_start) * epoch / tf_decay_epochs
+        else:
+            tf_ratio = tf_end
+
         # Training
         model.train()
         train_metrics = _run_epoch(
             model, train_loader, ce_loss_fn, mse_loss_fn,
             lambda_adv, device, optimizer=optimizer,
+            tf_ratio=tf_ratio, lambda_sym=lambda_sym, lambda_qcd=lambda_qcd,
         )
 
-        # Validation
+        # Validation (no augmentation, no teacher forcing: tf_ratio=0 = pure end-to-end)
         model.eval()
         with torch.no_grad():
             val_metrics = _run_epoch(
                 model, val_loader, ce_loss_fn, mse_loss_fn,
                 lambda_adv, device, optimizer=None,
+                tf_ratio=0.0, lambda_sym=0.0, lambda_qcd=0.0,
             )
 
         # Log
         adv_str = f" | Adv R²={val_metrics['adv_r2']:.3f}" if use_adversary else ""
+        isr_str = ""
+        if "isr_acc" in val_metrics:
+            isr_str = (
+                f" | ISR={val_metrics['isr_acc']:.3f}"
+                f" Grp={val_metrics['grp_acc']:.3f}"
+            )
+
         print(
             f"Epoch {epoch+1:3d}/{tc['num_epochs']} | "
             f"Train loss={train_metrics['loss']:.4f} acc={train_metrics['acc']:.3f} | "
             f"Val loss={val_metrics['loss']:.4f} acc={val_metrics['acc']:.3f}"
-            f"{adv_str} | "
+            f"{isr_str}{adv_str} | "
             f"LR={current_lr:.2e}"
         )
 
@@ -180,6 +254,10 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 f"{val_metrics['loss']:.6f}",
                 f"{val_metrics['acc']:.4f}",
                 f"{val_metrics['acc5']:.4f}",
+                f"{train_metrics.get('isr_acc', 0):.4f}",
+                f"{train_metrics.get('grp_acc', 0):.4f}",
+                f"{val_metrics.get('isr_acc', 0):.4f}",
+                f"{val_metrics.get('grp_acc', 0):.4f}",
                 f"{val_metrics['adv_r2']:.4f}",
                 f"{current_lr:.6e}",
             ])
@@ -187,6 +265,8 @@ def train(config_path: str | None = None, data_path: str | None = None):
         # Checkpoint
         if val_metrics["acc"] > best_val_acc:
             best_val_acc = val_metrics["acc"]
+            best_epoch = epoch + 1
+            no_improve = 0
             torch.save(
                 {
                     "epoch": epoch + 1,
@@ -198,40 +278,124 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 "checkpoints/best_model.pt",
             )
             print(f"  -> Saved best model (val_acc={best_val_acc:.4f})")
+        else:
+            no_improve += 1
 
-    print(f"\nTraining complete. Best val accuracy: {best_val_acc:.4f}")
+        if no_improve >= patience:
+            print(f"Early stopping at epoch {epoch+1} (no improvement for {patience} epochs)")
+            break
+
+    print(f"\nTraining complete. Best val accuracy: {best_val_acc:.4f} at epoch {best_epoch}")
+
+    # Reload best checkpoint before ONNX export
+    ckpt = torch.load("checkpoints/best_model.pt", map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    export_onnx(model, dc["num_jets"], device, best_val_acc)
 
 
-def _run_epoch(model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optimizer=None):
+def _run_epoch(
+    model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optimizer=None,
+    tf_ratio=1.0, lambda_sym=0.0, lambda_qcd=0.0,
+):
     """Run one epoch of training or validation."""
     total_loss = 0.0
     total_correct = 0
     total_correct5 = 0
+    total_isr_correct = 0
+    total_grp_correct = 0
     total_samples = 0
     all_mass_pred = []
     all_mass_true = []
+    factored = model.has_isr
 
     for batch in loader:
         four_mom = batch["four_momenta"].to(device)
         labels = batch["label"].to(device)
         parent_mass = batch["parent_mass"].to(device)
 
+        # φ/η augmentation during training (hard symmetries of the problem)
+        if optimizer is not None:
+            four_mom = four_mom.clone()
+            batch_size = four_mom.shape[0]
+
+            theta = torch.rand(batch_size, device=device) * 2 * torch.pi
+            cos_t = theta.cos().view(-1, 1)   # (batch, 1) for broadcasting over jets
+            sin_t = theta.sin().view(-1, 1)
+            px_orig = four_mom[:, :, 1].clone()
+            py_orig = four_mom[:, :, 2].clone()
+            four_mom[:, :, 1] = px_orig * cos_t - py_orig * sin_t
+            four_mom[:, :, 2] = px_orig * sin_t + py_orig * cos_t
+
+            flip = (torch.rand(batch_size, device=device) > 0.5).float().view(-1, 1)
+            four_mom[:, :, 3] = four_mom[:, :, 3] * (1.0 - 2.0 * flip)
+
         output = model(four_mom)
         logits = output["logits"]
         mass_pred = output["mass_pred"].squeeze(-1)
 
-        # Assignment cross-entropy loss
-        loss_ce = ce_loss_fn(logits, labels)
+        # Assignment loss
+        if factored and "isr_logits" in output:
+            isr_logits = output["isr_logits"]
+            grouping_logits = output["grouping_logits"]
 
-        # Adversarial mass loss (MSE on predicted vs true parent mass)
-        # Only compute for events where we have truth mass > 0
+            isr_labels = model.flat_to_factored[labels, 0]
+            grouping_labels = model.flat_to_factored[labels, 1]
+
+            loss_isr = ce_loss_fn(isr_logits, isr_labels)
+
+            batch_idx = torch.arange(labels.shape[0], device=device)
+            gt_grp_logits = grouping_logits[batch_idx, isr_labels]
+            loss_grp_tf = ce_loss_fn(gt_grp_logits, grouping_labels)
+
+            # Blend teacher-forced factored loss with flat end-to-end loss
+            # tf_ratio=1: fully teacher-forced (original); tf_ratio=0: flat CE only
+            loss_flat = ce_loss_fn(logits, labels)
+            loss_ce = tf_ratio * (loss_isr + loss_grp_tf) + (1.0 - tf_ratio) * loss_flat
+
+            total_isr_correct += (isr_logits.argmax(dim=-1) == isr_labels).sum().item()
+            total_grp_correct += (gt_grp_logits.argmax(dim=-1) == grouping_labels).sum().item()
+        else:
+            loss_ce = ce_loss_fn(logits, labels)
+
+        # Mass symmetry auxiliary loss: minimize expected |m1-m2|/(m1+m2) over assignments
+        if lambda_sym > 0 and "mass_asym_flat" in output:
+            mass_asym = output["mass_asym_flat"].detach()  # (batch, num_assignments)
+            probs = logits.softmax(dim=-1)
+            loss_sym = (probs * mass_asym).sum(dim=-1).mean()
+            loss_ce = loss_ce + lambda_sym * loss_sym
+
+        # QCD hierarchy penalty: events with large pT hierarchies (QCD-like) are pushed
+        # to prefer high-mass-asymmetry assignments, making them self-select interpretations
+        # that look maximally unlike a symmetric signal decay.
+        # loss_qcd = -mean(H_i * expected_mass_asym_i), where H = log(pT_max/pT_min).
+        # Minimising this negative quantity increases H-weighted expected asymmetry,
+        # disfavouring signal-like (low-asymmetry) interpretations for QCD-dominated events.
+        if lambda_qcd > 0 and "mass_asym_flat" in output:
+            px_all = four_mom[..., 1]
+            py_all = four_mom[..., 2]
+            pt_all = torch.sqrt(px_all**2 + py_all**2).clamp(min=1e-8)
+            pt_max = pt_all.max(dim=-1).values
+            pt_min = pt_all.min(dim=-1).values.clamp(min=1e-8)
+            # Clamp H to prevent very large values from degenerate (near-zero pT_min) events
+            H = torch.log(pt_max / pt_min).clamp(max=10.0)             # (batch,) hierarchy score
+
+            # Detach mass_asym: we only want to steer the assignment probabilities,
+            # not back-propagate through the physics feature computation itself.
+            mass_asym_qcd = output["mass_asym_flat"].detach()           # (batch, num_assignments)
+            probs_qcd = logits.softmax(dim=-1)
+            expected_asym = (probs_qcd * mass_asym_qcd).sum(dim=-1)    # (batch,)
+            # Negative sign: minimising drives H * expected_asym upward for high-H events
+            loss_qcd_term = -(H * expected_asym).mean()
+            loss_ce = loss_ce + lambda_qcd * loss_qcd_term
+
+        # Adversarial mass loss
         mass_mask = parent_mass > 0
-        if mass_mask.any():
+        if mass_mask.any() and lambda_adv > 0:
             loss_adv = mse_loss_fn(mass_pred[mass_mask], parent_mass[mass_mask])
+            loss_adv = torch.clamp(loss_adv, max=10.0)
         else:
             loss_adv = torch.tensor(0.0, device=device)
 
-        # Combined loss: CE + adversarial (GRL handles gradient sign flip)
         loss = loss_ce + lambda_adv * loss_adv
 
         if optimizer is not None:
@@ -248,11 +412,9 @@ def _run_epoch(model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optim
         preds = logits.argmax(dim=-1)
         total_correct += (preds == labels).sum().item()
 
-        # Top-5 accuracy
         _, top5 = logits.topk(5, dim=-1)
         total_correct5 += (top5 == labels.unsqueeze(-1)).any(dim=-1).sum().item()
 
-        # Track mass predictions for R² computation
         if mass_mask.any():
             all_mass_pred.append(mass_pred[mass_mask].detach().cpu())
             all_mass_true.append(parent_mass[mass_mask].detach().cpu())
@@ -261,7 +423,6 @@ def _run_epoch(model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optim
     acc = total_correct / max(total_samples, 1)
     acc5 = total_correct5 / max(total_samples, 1)
 
-    # Compute adversary R² (should stay low if decorrelation works)
     adv_r2 = 0.0
     if all_mass_pred:
         pred_cat = torch.cat(all_mass_pred)
@@ -271,7 +432,11 @@ def _run_epoch(model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optim
         if ss_tot > 0:
             adv_r2 = 1.0 - (ss_res / ss_tot).item()
 
-    return {"loss": avg_loss, "acc": acc, "acc5": acc5, "adv_r2": adv_r2}
+    result = {"loss": avg_loss, "acc": acc, "acc5": acc5, "adv_r2": adv_r2}
+    if factored:
+        result["isr_acc"] = total_isr_correct / max(total_samples, 1)
+        result["grp_acc"] = total_grp_correct / max(total_samples, 1)
+    return result
 
 
 if __name__ == "__main__":

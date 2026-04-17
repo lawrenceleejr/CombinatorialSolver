@@ -36,6 +36,10 @@ class JetAssignmentDataset(Dataset):
         data_paths: Path(s) to HDF5 files — a single path, list, or glob pattern.
         num_jets: Number of leading jets to use (6 or 7).
         normalize_by_ht: If True, divide 4-vectors by event HT for scale invariance.
+        pt_smear_frac: If > 0, apply Gaussian pT smearing with this fractional
+            resolution (e.g. 0.05 for 5%). Smearing is applied per-jet before
+            the four-vector conversion, simulating detector resolution effects.
+            The smearing is applied once at load time (fixed per event).
     """
 
     def __init__(
@@ -43,9 +47,11 @@ class JetAssignmentDataset(Dataset):
         data_paths: str | list[str],
         num_jets: int = 7,
         normalize_by_ht: bool = True,
+        pt_smear_frac: float = 0.0,
     ):
         self.num_jets = num_jets
         self.normalize_by_ht = normalize_by_ht
+        self.pt_smear_frac = pt_smear_frac
 
         # Resolve file paths
         if isinstance(data_paths, str):
@@ -88,8 +94,17 @@ class JetAssignmentDataset(Dataset):
         if n_after < n_before:
             print(f"  Filtered {n_before - n_after}/{n_before} events with invalid labels")
 
+        if n_after == 0:
+            raise ValueError(
+                f"No valid events found for num_jets={num_jets}. "
+                f"The data may not contain enough jets per event "
+                f"(need >={num_jets}). Check that your data has ISR jets "
+                f"if using num_jets=7."
+            )
+
         if self.normalize_by_ht:
             ht_expanded = self.ht.unsqueeze(-1).unsqueeze(-1)
+            # Normalize all four-vector dims (E, px, py, pz) by event HT
             self.four_momenta = self.four_momenta / ht_expanded.clamp(min=1e-6)
 
     def _load_file(self, fpath: str):
@@ -107,6 +122,13 @@ class JetAssignmentDataset(Dataset):
 
             n_events = pt.shape[0]
             max_jets_in_file = pt.shape[1]
+
+            # Apply pT smearing if requested (simulates detector resolution)
+            if self.pt_smear_frac > 0:
+                rng = np.random.RandomState(seed=12345)
+                smear = 1.0 + rng.normal(0, self.pt_smear_frac, size=pt.shape).astype(np.float32)
+                smear = np.clip(smear, 0.5, 1.5)  # Prevent extreme outliers
+                pt = pt * smear * mask  # Only smear valid jets
 
             # Count valid jets per event
             n_valid = mask.sum(axis=1)
@@ -246,6 +268,10 @@ class JetAssignmentDataset(Dataset):
             src_pz = src_pt * np.sinh(src_eta)
             src_e = np.sqrt(src_px**2 + src_py**2 + src_pz**2 + src_mass**2)
 
+        n_signal_outside = 0
+        n_not_enough_jets = 0
+        n_wrong_isr_count = 0
+
         for i in range(n_events):
             # Map original truth indices to sorted positions
             idx_map = {}
@@ -275,20 +301,26 @@ class JetAssignmentDataset(Dataset):
                         break
 
             if not valid or len(g1_sorted) != 3 or len(g2_sorted) != 3:
+                n_signal_outside += 1
                 continue
 
             # Determine ISR: any jet in the sorted list not in g1 or g2
             all_assigned = set(g1_sorted + g2_sorted)
             isr_jets = [j for j in range(num_jets) if j not in all_assigned and sort_indices[i, j] >= 0]
+            # Also consider zero-padded slots as ISR candidates (events with fewer jets)
+            padded_slots = [j for j in range(num_jets) if j not in all_assigned and sort_indices[i, j] < 0]
 
             if num_jets == 6:
                 truth_isr = None
             elif len(isr_jets) == 1:
                 truth_isr = isr_jets[0]
+            elif len(isr_jets) == 0 and len(padded_slots) == 1:
+                truth_isr = padded_slots[0]
             elif len(isr_jets) == 0 and num_jets > 6:
-                # No ISR found but we expected 7 jets — skip or handle
+                n_not_enough_jets += 1
                 continue
             else:
+                n_wrong_isr_count += 1
                 continue
 
             labels[i] = match_truth_groups(g1_sorted, g2_sorted, num_jets, truth_isr)
@@ -306,6 +338,17 @@ class JetAssignmentDataset(Dataset):
                     g1_4vec[3] += pz
                 m2 = g1_4vec[0]**2 - g1_4vec[1]**2 - g1_4vec[2]**2 - g1_4vec[3]**2
                 parent_mass[i] = np.sqrt(max(m2, 0))
+
+        n_valid = (labels >= 0).sum()
+        n_invalid = n_events - n_valid
+        if n_invalid > 0:
+            print(f"  Label failures ({n_invalid}/{n_events}):")
+            if n_signal_outside > 0:
+                print(f"    Signal jet outside top {num_jets} by pT: {n_signal_outside}")
+            if n_not_enough_jets > 0:
+                print(f"    Fewer than {num_jets} valid jets: {n_not_enough_jets}")
+            if n_wrong_isr_count > 0:
+                print(f"    Multiple ISR candidates: {n_wrong_isr_count}")
 
         return labels, parent_mass
 
@@ -328,10 +371,10 @@ class JetAssignmentDataset(Dataset):
             if valid_count < 6:
                 continue
 
-            # Extract is_signal and parent_pdg for selected jets
-            is_sig = np.array([jf[i, orig_indices[j], 6] if orig_indices[j] >= 0 else 0
+            # Extract is_signal (col 5) and parent_pdg (col 4) for selected jets
+            is_sig = np.array([jf[i, orig_indices[j], 5] if orig_indices[j] >= 0 else 0
                               for j in range(num_jets)])
-            p_ids = np.array([jf[i, orig_indices[j], 5] if orig_indices[j] >= 0 else 0
+            p_ids = np.array([jf[i, orig_indices[j], 4] if orig_indices[j] >= 0 else 0
                              for j in range(num_jets)])
 
             # Find signal jets and group by parent
