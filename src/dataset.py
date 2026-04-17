@@ -48,12 +48,10 @@ class JetAssignmentDataset(Dataset):
         num_jets: int = 7,
         normalize_by_ht: bool = True,
         pt_smear_frac: float = 0.0,
-        use_constituents: bool = False,
     ):
         self.num_jets = num_jets
         self.normalize_by_ht = normalize_by_ht
         self.pt_smear_frac = pt_smear_frac
-        self.use_constituents = use_constituents
 
         # Resolve file paths
         if isinstance(data_paths, str):
@@ -106,10 +104,8 @@ class JetAssignmentDataset(Dataset):
 
         if self.normalize_by_ht:
             ht_expanded = self.ht.unsqueeze(-1).unsqueeze(-1)
-            # Only normalize the four-vector dims; n_constituents (dim 4) is already z-scored
-            self.four_momenta[:, :, :4] = (
-                self.four_momenta[:, :, :4] / ht_expanded.clamp(min=1e-6)
-            )
+            # Normalize all four-vector dims (E, px, py, pz) by event HT
+            self.four_momenta = self.four_momenta / ht_expanded.clamp(min=1e-6)
 
     def _load_file(self, fpath: str):
         """Load a single HDF5 file and return processed tensors."""
@@ -144,29 +140,6 @@ class JetAssignmentDataset(Dataset):
             sorted_four_mom, sorted_mask, sort_indices = self._pt_sort_and_select(
                 pt, eta, phi, mass, mask, effective_num_jets
             )
-
-            # Optionally append n_constituents as a 5th feature (z-score normalized)
-            if self.use_constituents:
-                if "jet_features" in f and f["jet_features"].shape[2] > 4:
-                    n_const_raw = f["jet_features"][:, :, 4].astype(np.float32)
-                else:
-                    n_const_raw = np.zeros((n_events, pt.shape[1]), dtype=np.float32)
-
-                n_const_sorted = np.zeros((n_events, effective_num_jets), dtype=np.float32)
-                for i in range(n_events):
-                    for j in range(effective_num_jets):
-                        orig = sort_indices[i, j]
-                        if orig >= 0:
-                            n_const_sorted[i, j] = n_const_raw[i, orig]
-
-                # Z-score over all entries; clamp std to avoid collapse on binary/constant features
-                mean_nc = float(n_const_sorted.mean())
-                std_nc = max(float(n_const_sorted.std()), 0.1) + 1e-8
-                n_const_sorted = (n_const_sorted - mean_nc) / std_nc
-
-                sorted_four_mom = np.concatenate(
-                    [sorted_four_mom, n_const_sorted[:, :, np.newaxis]], axis=-1
-                )
 
             # Read truth labels
             if has_targets:
@@ -398,10 +371,10 @@ class JetAssignmentDataset(Dataset):
             if valid_count < 6:
                 continue
 
-            # Extract is_signal and parent_pdg for selected jets
-            is_sig = np.array([jf[i, orig_indices[j], 6] if orig_indices[j] >= 0 else 0
+            # Extract is_signal (col 5) and parent_pdg (col 4) for selected jets
+            is_sig = np.array([jf[i, orig_indices[j], 5] if orig_indices[j] >= 0 else 0
                               for j in range(num_jets)])
-            p_ids = np.array([jf[i, orig_indices[j], 5] if orig_indices[j] >= 0 else 0
+            p_ids = np.array([jf[i, orig_indices[j], 4] if orig_indices[j] >= 0 else 0
                              for j in range(num_jets)])
 
             # Find signal jets and group by parent

@@ -77,21 +77,20 @@ def generate_event(parent_mass: float, include_isr: bool = False) -> dict:
 
     ht = pt[mask].sum()
 
-    # jet_features: [pt, eta, phi, mass, n_constituents, parent_idx, is_signal]
-    jet_features = np.zeros((max_jets, 7), dtype=np.float32)
+    # jet_features: [pt, eta, phi, mass, parent_idx, is_signal]
+    jet_features = np.zeros((max_jets, 6), dtype=np.float32)
     for i in range(n_jets):
         jet_features[i, 0] = pt[i]
         jet_features[i, 1] = eta[i]
         jet_features[i, 2] = phi[i]
         jet_features[i, 3] = mass[i]
-        jet_features[i, 4] = 1.0  # n_constituents placeholder
         if i < 3:
-            jet_features[i, 5] = 1.0  # parent_idx for g1
+            jet_features[i, 4] = 1.0  # parent_idx for g1
         elif i < 6:
-            jet_features[i, 5] = 2.0  # parent_idx for g2
+            jet_features[i, 4] = 2.0  # parent_idx for g2
         else:
-            jet_features[i, 5] = 0.0  # ISR
-        jet_features[i, 6] = 0.0  # is_signal (matches real data convention)
+            jet_features[i, 4] = 0.0  # ISR
+        jet_features[i, 5] = 0.0  # is_signal (matches real data convention)
 
     event_features = np.array(
         [n_jets, 0.0, 0.0, 0.0, ht, 6, 1.0], dtype=np.float32
@@ -120,7 +119,7 @@ def generate_dataset(
     n_jets_per_event = 7 if include_isr else 6
 
     # Preallocate
-    jet_features_all = np.zeros((n_events, max_jets, 7), dtype=np.float32)
+    jet_features_all = np.zeros((n_events, max_jets, 6), dtype=np.float32)
     jet_mask_all = np.zeros((n_events, max_jets), dtype=bool)
     event_features_all = np.zeros((n_events, 7), dtype=np.float32)
     particle_features_all = np.zeros((n_events, max_jets, 100, 5), dtype=np.float32)

@@ -24,4 +24,3 @@ data:
   normalize_by_ht: true
   num_jets: 7
   pt_smear_frac: 0.0
-  use_constituents: true

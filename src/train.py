@@ -94,7 +94,6 @@ def train(config_path: str | None = None, data_path: str | None = None):
         num_jets=dc["num_jets"],
         normalize_by_ht=dc["normalize_by_ht"],
         pt_smear_frac=dc.get("pt_smear_frac", 0.0),
-        use_constituents=dc.get("use_constituents", False),
     )
     print(f"Dataset size: {len(dataset)} events")
 
@@ -121,7 +120,6 @@ def train(config_path: str | None = None, data_path: str | None = None):
     )
 
     # Model
-    input_dim = 5 if dc.get("use_constituents", False) else 4
     model = JetAssignmentTransformer(
         d_model=mc["d_model"],
         nhead=mc["nhead"],
@@ -129,7 +127,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
         dim_feedforward=mc["dim_feedforward"],
         dropout=mc["dropout"],
         num_jets=dc["num_jets"],
-        input_dim=input_dim,
+        input_dim=4,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())

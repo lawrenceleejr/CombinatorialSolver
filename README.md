@@ -59,7 +59,7 @@ Outputs `results/mass_reconstruction.csv` (per-event) and `results/mass_arrays.n
 
 Expects HDF5 files in the [MadGraphMLProducer](https://github.com/lawrenceleejr/MadGraphMLProducer) format:
 
-- `jet_features`: (N, 20, 7) — [pt, eta, phi, mass, n_constituents, parent_pdg, is_signal]
+- `jet_features`: (N, 20, 6) — [pt, eta, phi, mass, parent_pdg, is_signal]
 - `jet_mask`: (N, 20)
 - `event_features`: (N, 7) — [n_jets, met_x, met_y, met_pt, ht, n_signal, weight]
 
