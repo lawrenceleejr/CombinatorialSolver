@@ -376,11 +376,14 @@ def _run_epoch(
             pt_all = torch.sqrt(px_all**2 + py_all**2).clamp(min=1e-8)
             pt_max = pt_all.max(dim=-1).values
             pt_min = pt_all.min(dim=-1).values.clamp(min=1e-8)
-            H = torch.log(pt_max / pt_min)                      # (batch,) hierarchy score
+            # Clamp H to prevent very large values from degenerate (near-zero pT_min) events
+            H = torch.log(pt_max / pt_min).clamp(max=10.0)             # (batch,) hierarchy score
 
-            mass_asym_qcd = output["mass_asym_flat"].detach()   # (batch, num_assignments)
+            # Detach mass_asym: we only want to steer the assignment probabilities,
+            # not back-propagate through the physics feature computation itself.
+            mass_asym_qcd = output["mass_asym_flat"].detach()           # (batch, num_assignments)
             probs_qcd = logits.softmax(dim=-1)
-            expected_asym = (probs_qcd * mass_asym_qcd).sum(dim=-1)  # (batch,)
+            expected_asym = (probs_qcd * mass_asym_qcd).sum(dim=-1)    # (batch,)
             # Negative sign: minimising drives H * expected_asym upward for high-H events
             loss_qcd_term = -(H * expected_asym).mean()
             loss_ce = loss_ce + lambda_qcd * loss_qcd_term

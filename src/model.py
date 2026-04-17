@@ -139,8 +139,11 @@ class JetAssignmentTransformer(nn.Module):
         )
 
         # Shared mini-Transformer for intra-group attention pooling.
-        # nhead must divide d_model; use min(4, d_model//32) for a lightweight head count.
-        group_nhead = min(4, max(1, d_model // 32))
+        # Aim for ~32 features per head (a common effective head size), capped at 4 heads
+        # to keep the group sub-network lightweight relative to the main encoder.
+        # nhead must evenly divide d_model; d_model // 32 gives the target head count.
+        _GROUP_HEAD_SIZE = 32
+        group_nhead = min(4, max(1, d_model // _GROUP_HEAD_SIZE))
         self.group_transformer = GroupTransformer(
             d_model=d_model,
             nhead=group_nhead,
@@ -207,6 +210,11 @@ class JetAssignmentTransformer(nn.Module):
         log_pt = torch.log(pt)
         return log_pt.unsqueeze(-1) - log_pt.unsqueeze(-2)
 
+    @staticmethod
+    def _wrap_dphi(dphi: torch.Tensor) -> torch.Tensor:
+        """Wrap Δφ into [-π, π]."""
+        return dphi - 2 * torch.pi * torch.round(dphi / (2 * torch.pi))
+
     def encode_jets(self, four_momenta: torch.Tensor) -> torch.Tensor:
         x = self.input_proj(four_momenta)
         positions = torch.arange(self.num_jets, device=four_momenta.device)
@@ -234,8 +242,7 @@ class JetAssignmentTransformer(nn.Module):
 
         phi = torch.atan2(py, px)
         deta = eta.unsqueeze(-1) - eta.unsqueeze(-2)
-        dphi = phi.unsqueeze(-1) - phi.unsqueeze(-2)
-        dphi = dphi - 2 * torch.pi * torch.round(dphi / (2 * torch.pi))
+        dphi = self._wrap_dphi(phi.unsqueeze(-1) - phi.unsqueeze(-2))
         dr = torch.sqrt(deta**2 + dphi**2 + 1e-8)
         eye = torch.eye(self.num_jets, device=four_momenta.device).unsqueeze(0)
         dr = dr + eye * 100.0
@@ -301,8 +308,8 @@ class JetAssignmentTransformer(nn.Module):
         pt_max = pt.max(dim=-1).values                                  # (...,)
         pt_min = pt.min(dim=-1).values.clamp(min=1e-8)
         pt_mean = pt.mean(dim=-1).clamp(min=1e-8)
-        pt_var = (pt**2).mean(dim=-1) - pt_mean**2
-        pt_std = torch.sqrt(pt_var.clamp(min=0))
+        # Use torch.var for numerical stability (two-pass, unbiased=False for 3-element groups)
+        pt_std = torch.sqrt(torch.var(pt, dim=-1, unbiased=False).clamp(min=0))
 
         max_pt_ratio = pt_max / pt_min                                  # (...,)
         pt_cv = pt_std / pt_mean                                        # (...,)
@@ -320,11 +327,11 @@ class JetAssignmentTransformer(nn.Module):
         for i, j in pairs:
             pt_i, pt_j = pt[..., i], pt[..., j]
             pt_soft = torch.min(pt_i, pt_j)
-            z_ij = pt_soft / (pt_i + pt_j).clamp(min=1e-8)  # splitting fraction z∈(0,0.5]
+            # Splitting fraction z = pT_soft / (pT_soft + pT_hard) ∈ [0, 0.5]
+            z_ij = pt_soft / (pt_i + pt_j).clamp(min=1e-8)
 
             deta = eta[..., i] - eta[..., j]
-            dphi = phi[..., i] - phi[..., j]
-            dphi = dphi - 2 * torch.pi * torch.round(dphi / (2 * torch.pi))
+            dphi = JetAssignmentTransformer._wrap_dphi(phi[..., i] - phi[..., j])
             dr = torch.sqrt(deta**2 + dphi**2 + 1e-8)
 
             z_lund_list.append(z_ij)
@@ -348,8 +355,9 @@ class JetAssignmentTransformer(nn.Module):
             * dr_list[0] * dr_list[1] * dr_list[2]
         )
 
-        # D₂ = ECF₃ / ECF₂² — probes 2-prong vs 3-prong substructure
-        d2 = ecf3 / (ecf2**2).clamp(min=1e-8)
+        # D₂ = ECF₃ / ECF₂² — probes 2-prong vs 3-prong substructure.
+        # Clamp ECF₂ before squaring to avoid underflow when jets are nearly collinear.
+        d2 = ecf3 / ecf2.clamp(min=1e-4) ** 2
 
         # --- Dalitz pairwise invariant masses, normalized by group mass ---
         p_group = jets_4vec.sum(dim=-2)                                 # (..., 4)
@@ -411,8 +419,7 @@ class JetAssignmentTransformer(nn.Module):
 
         eta1, phi1 = eta_phi(g1_4vec)
         eta2, phi2 = eta_phi(g2_4vec)
-        dphi = phi1 - phi2
-        dphi = dphi - 2 * torch.pi * torch.round(dphi / (2 * torch.pi))
+        dphi = JetAssignmentTransformer._wrap_dphi(phi1 - phi2)
         delta_r = torch.sqrt((eta1 - eta2) ** 2 + dphi**2)
 
         inter = torch.stack([mass_sum, mass_asym, mass_ratio, m1, m2, delta_r], dim=-1)
