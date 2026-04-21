@@ -19,6 +19,12 @@ training:
   tf_start: 1.0
   tf_end: 0.3
   tf_decay_epochs: 100
+  # Upweights the ISR classification loss relative to the teacher-forced grouping loss.
+  # Root cause: signal jets receive gradient from loss_grp_tf via all 10 groupings (10
+  # gradient paths per signal jet), while the ISR jet receives gradient only from loss_isr
+  # (1 path).  Setting lambda_isr=3 partially compensates for this imbalance without
+  # over-dominating the grouping signal.  Tune upward (e.g. 5-10) if ISR still plateaus.
+  lambda_isr: 3.0
   lambda_sym: 0.05
   lambda_sym_rampup: 20
   lambda_qcd: 0.1
