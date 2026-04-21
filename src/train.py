@@ -394,8 +394,16 @@ def _run_epoch(
             loss_flat = ce_loss_fn(logits, labels)
             loss_ce = tf_ratio * (lambda_isr * loss_isr + loss_grp_tf) + (1.0 - tf_ratio) * loss_flat
 
-            total_isr_correct += (isr_logits.argmax(dim=-1) == isr_labels).sum().item()
-            total_grp_correct += (gt_grp_logits.argmax(dim=-1) == grouping_labels).sum().item()
+            # Measure ISR and grouping accuracy from the combined flat prediction,
+            # not from the raw factored heads independently.  The combined logit
+            # logit(j,k) = isr_logit[j] + grouping_logit[j,k] lets the grouping
+            # head correct the raw ISR head, so argmax(isr_logits) frequently
+            # disagrees with the model's actual ISR choice.  The operationally
+            # meaningful metric is the ISR/grouping encoded in the combined
+            # prediction that the model actually outputs.
+            flat_pred = logits.argmax(dim=-1)
+            total_isr_correct += (model.flat_to_factored[flat_pred, 0] == isr_labels).sum().item()
+            total_grp_correct += (model.flat_to_factored[flat_pred, 1] == grouping_labels).sum().item()
         else:
             loss_ce = ce_loss_fn(logits, labels)
 
