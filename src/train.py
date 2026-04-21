@@ -391,7 +391,11 @@ def _run_epoch(
             # produces num_groupings gradient paths per signal jet while the ISR jet
             # (excluded from every group) receives gradient only from loss_isr.
             # Scaling loss_isr by lambda_isr partially rebalances this asymmetry.
-            loss_flat = ce_loss_fn(logits, labels)
+            # loss_flat: logits are log-probabilities (output of _combine_logits
+            # which applies log_softmax to each factored component), so use
+            # NLLLoss rather than CrossEntropyLoss which would incorrectly
+            # re-apply softmax.
+            loss_flat = torch.nn.functional.nll_loss(logits, labels)
             loss_ce = tf_ratio * (lambda_isr * loss_isr + loss_grp_tf) + (1.0 - tf_ratio) * loss_flat
 
             # Measure ISR and grouping accuracy from the combined flat prediction,
@@ -410,7 +414,8 @@ def _run_epoch(
         # Mass symmetry auxiliary loss: minimize expected |m1-m2|/(m1+m2) over assignments
         if lambda_sym > 0 and "mass_asym_flat" in output:
             mass_asym = output["mass_asym_flat"].detach()  # (batch, num_assignments)
-            probs = logits.softmax(dim=-1)
+            # logits are log-probabilities; convert to probabilities with .exp()
+            probs = logits.exp()
             loss_sym = (probs * mass_asym).sum(dim=-1).mean()
             loss_ce = loss_ce + lambda_sym * loss_sym
 
@@ -440,7 +445,8 @@ def _run_epoch(
                 # Detach mass_asym: we only want to steer the assignment probabilities,
                 # not back-propagate through the physics feature computation itself.
                 mass_asym_qcd = output["mass_asym_flat"].detach()[qcd_mask]  # (n_bkg, num_assign)
-                probs_qcd = logits.softmax(dim=-1)[qcd_mask]
+                # logits are log-probabilities; convert to probabilities with .exp()
+                probs_qcd = logits.exp()[qcd_mask]
                 expected_asym = (probs_qcd * mass_asym_qcd).sum(dim=-1)     # (n_bkg,)
                 # Negative sign: minimising drives H * expected_asym upward for high-H events
                 loss_qcd_term = -(H * expected_asym).mean()

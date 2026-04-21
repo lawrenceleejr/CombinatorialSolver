@@ -25,6 +25,7 @@ Architecture:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .combinatorics import build_assignment_tensors, build_factored_tensors
 from .utils import compute_invariant_mass
@@ -538,12 +539,27 @@ class JetAssignmentTransformer(nn.Module):
     def _combine_logits(
         self, isr_logits: torch.Tensor, grouping_logits: torch.Tensor
     ) -> torch.Tensor:
-        """Combine ISR and grouping logits into flat assignment logits.
+        """Combine ISR and grouping logits into flat log-joint-probability scores.
 
         Returns (batch, num_assignments) in canonical flat ordering.
+
+        Uses log-softmax for each component so the output represents proper
+        log-joint-probabilities:
+            log P(isr=j, grp=k) = log_softmax(isr_logits)[j]
+                                 + log_softmax_per_row(grouping_logits)[j, k]
+
+        Using raw logits instead would be incorrect: the argmax of the raw sum
+        isr_logit[j] + grp_logit[j,k] is NOT the argmax of
+        P(isr=j) * P(grp=k|isr=j) because the per-ISR grouping partition
+        functions log(Σ_k exp(grp_logit[j,k])) differ across j, artificially
+        biasing the combined argmax toward ISR candidates whose grouping head
+        produces high-magnitude (high-entropy) logits regardless of whether
+        that ISR candidate is actually more probable.
         """
         batch_size = isr_logits.shape[0]
-        combined = isr_logits.unsqueeze(-1) + grouping_logits
+        log_p_isr = F.log_softmax(isr_logits, dim=-1)          # (batch, num_jets)
+        log_p_grp = F.log_softmax(grouping_logits, dim=-1)     # (batch, num_jets, num_groupings)
+        combined = log_p_isr.unsqueeze(-1) + log_p_grp         # (batch, num_jets, num_groupings)
         combined_flat = combined.reshape(batch_size, -1)
 
         f2f = self.flat_to_factored
@@ -609,6 +625,20 @@ class JetAssignmentTransformer(nn.Module):
         return self.mass_adversary(reversed_pooled)
 
     def forward(self, four_momenta: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Run the full forward pass.
+
+        Returns a dict with:
+          - ``logits``: (batch, num_assignments) log-joint-probabilities
+            log P(isr=j, grp=k) for each flat assignment.  These are proper
+            log-probabilities (sum of log_softmax components) so use
+            ``logits.argmax(dim=-1)`` for the predicted assignment and
+            ``logits.exp()`` to recover probabilities.
+          - ``isr_logits``: (batch, num_jets) raw ISR scores (unnormalized).
+          - ``grouping_logits``: (batch, num_jets, num_groupings) raw grouping
+            scores (unnormalized), indexed as [isr_choice, grouping_idx].
+          - ``mass_asym_flat``: (batch, num_assignments) mass-asymmetry feature.
+          - ``mass_pred``: (batch, 1) adversarial mass prediction.
+        """
         jet_embeddings = self.encode_jets(four_momenta)
         mass_pred = self.predict_mass(jet_embeddings)
         if self.has_isr:
