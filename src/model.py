@@ -294,7 +294,7 @@ class JetAssignmentTransformer(nn.Module):
         total = jet_embeddings.sum(dim=1, keepdim=True)    # (batch, 1, d_model)
         loo_ctx = (total - jet_embeddings) / n_others      # (batch, num_jets, d_model)
         physics = self._isr_physics(four_momenta)
-        features = torch.cat([jet_embeddings, loo_ctx, physics], dim=-1)
+        features = torch.cat([jet_embeddings, loo_ctx, physics, grouping_context], dim=-1)
         return self.isr_head(features).squeeze(-1)
 
     def _group_physics_factored(self, four_momenta: torch.Tensor) -> torch.Tensor:
