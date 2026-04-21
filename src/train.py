@@ -391,31 +391,27 @@ def _run_epoch(
             # produces num_groupings gradient paths per signal jet while the ISR jet
             # (excluded from every group) receives gradient only from loss_isr.
             # Scaling loss_isr by lambda_isr partially rebalances this asymmetry.
-            # loss_flat: logits are log-probabilities (output of _combine_logits
-            # which applies log_softmax to each factored component), so use
-            # NLLLoss rather than CrossEntropyLoss which would incorrectly
-            # re-apply softmax.
-            loss_flat = torch.nn.functional.nll_loss(logits, labels)
+            loss_flat = ce_loss_fn(logits, labels)
             loss_ce = tf_ratio * (lambda_isr * loss_isr + loss_grp_tf) + (1.0 - tf_ratio) * loss_flat
 
-            # Measure ISR and grouping accuracy from the combined flat prediction,
-            # not from the raw factored heads independently.  The combined logit
-            # logit(j,k) = isr_logit[j] + grouping_logit[j,k] lets the grouping
-            # head correct the raw ISR head, so argmax(isr_logits) frequently
-            # disagrees with the model's actual ISR choice.  The operationally
-            # meaningful metric is the ISR/grouping encoded in the combined
-            # prediction that the model actually outputs.
-            flat_pred = logits.argmax(dim=-1)
+            # Use partition-function-corrected logits for accuracy metrics.
+            # logits_eval[j,k] = log P(isr=j) + log P(grp=k|isr=j) gives the
+            # true MAP assignment without the grouping-partition-function bias
+            # present in the raw sum argmax.  The ISR head already incorporates
+            # grouping quality through its input features, so using the raw sum
+            # would double-count that signal.
+            eval_logits = output.get("logits_eval", logits)
+            flat_pred = eval_logits.argmax(dim=-1)
             total_isr_correct += (model.flat_to_factored[flat_pred, 0] == isr_labels).sum().item()
             total_grp_correct += (model.flat_to_factored[flat_pred, 1] == grouping_labels).sum().item()
         else:
             loss_ce = ce_loss_fn(logits, labels)
+            eval_logits = logits  # flat mode: raw logits are already the correct score
 
         # Mass symmetry auxiliary loss: minimize expected |m1-m2|/(m1+m2) over assignments
         if lambda_sym > 0 and "mass_asym_flat" in output:
             mass_asym = output["mass_asym_flat"].detach()  # (batch, num_assignments)
-            # logits are log-probabilities; convert to probabilities with .exp()
-            probs = logits.exp()
+            probs = logits.softmax(dim=-1)
             loss_sym = (probs * mass_asym).sum(dim=-1).mean()
             loss_ce = loss_ce + lambda_sym * loss_sym
 
@@ -445,8 +441,8 @@ def _run_epoch(
                 # Detach mass_asym: we only want to steer the assignment probabilities,
                 # not back-propagate through the physics feature computation itself.
                 mass_asym_qcd = output["mass_asym_flat"].detach()[qcd_mask]  # (n_bkg, num_assign)
-                # logits are log-probabilities; convert to probabilities with .exp()
-                probs_qcd = logits.exp()[qcd_mask]
+                # logits are raw combined logits; softmax gives assignment probabilities.
+                probs_qcd = logits.softmax(dim=-1)[qcd_mask]
                 expected_asym = (probs_qcd * mass_asym_qcd).sum(dim=-1)     # (n_bkg,)
                 # Negative sign: minimising drives H * expected_asym upward for high-H events
                 loss_qcd_term = -(H * expected_asym).mean()
@@ -473,10 +469,10 @@ def _run_epoch(
         total_loss += loss.item() * batch_size
         total_samples += batch_size
 
-        preds = logits.argmax(dim=-1)
+        preds = eval_logits.argmax(dim=-1)
         total_correct += (preds == labels).sum().item()
 
-        _, top5 = logits.topk(5, dim=-1)
+        _, top5 = eval_logits.topk(5, dim=-1)
         total_correct5 += (top5 == labels.unsqueeze(-1)).any(dim=-1).sum().item()
 
         if mass_mask.any():

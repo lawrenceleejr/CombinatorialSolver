@@ -539,22 +539,46 @@ class JetAssignmentTransformer(nn.Module):
     def _combine_logits(
         self, isr_logits: torch.Tensor, grouping_logits: torch.Tensor
     ) -> torch.Tensor:
-        """Combine ISR and grouping logits into flat log-joint-probability scores.
+        """Combine ISR and grouping logits into flat raw-sum scores for training.
 
         Returns (batch, num_assignments) in canonical flat ordering.
 
-        Uses log-softmax for each component so the output represents proper
-        log-joint-probabilities:
-            log P(isr=j, grp=k) = log_softmax(isr_logits)[j]
-                                 + log_softmax_per_row(grouping_logits)[j, k]
+        The raw sum isr_logit[j] + grp_logit[j,k] is used here so that the
+        training losses (CrossEntropyLoss, sym, QCD) operate on unnormalized
+        logits with the full 70-class gradient structure intact.  Applying
+        log_softmax here instead would zero-out the gradient to wrong-ISR
+        grouping logits (since they don't appear in the correct label's
+        log-prob), causing those logits to grow unconstrained during early
+        training when lambda_sym is still ramping up.
 
-        Using raw logits instead would be incorrect: the argmax of the raw sum
-        isr_logit[j] + grp_logit[j,k] is NOT the argmax of
-        P(isr=j) * P(grp=k|isr=j) because the per-ISR grouping partition
-        functions log(Σ_k exp(grp_logit[j,k])) differ across j, artificially
-        biasing the combined argmax toward ISR candidates whose grouping head
-        produces high-magnitude (high-entropy) logits regardless of whether
-        that ISR candidate is actually more probable.
+        For inference (argmax), use ``_combine_logits_eval`` which applies
+        the correct per-component log_softmax, giving the true MAP assignment
+        log P(isr=j) + log P(grp=k|isr=j) without partition-function bias.
+        """
+        batch_size = isr_logits.shape[0]
+        combined = isr_logits.unsqueeze(-1) + grouping_logits  # (batch, num_jets, num_groupings)
+        combined_flat = combined.reshape(batch_size, -1)
+
+        f2f = self.flat_to_factored
+        source_idx = f2f[:, 0] * self.num_groupings + f2f[:, 1]
+        return combined_flat[:, source_idx]
+
+    def _combine_logits_eval(
+        self, isr_logits: torch.Tensor, grouping_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """Combine ISR and grouping logits into flat log-joint-probabilities for inference.
+
+        Returns (batch, num_assignments) log P(isr=j, grp=k) in flat ordering.
+
+        Uses per-component log_softmax so the argmax gives the correct MAP
+        assignment without partition-function bias: the raw sum argmax is
+        biased toward ISR choices whose grouping head happens to produce
+        high-magnitude logits (large log Σ_k exp(grp[j,k])), even when that
+        ISR candidate has lower true probability.  The ISR head already sees
+        the grouping quality summary, so its logit directly encodes P(isr=j) —
+        adding the raw grouping partition function again would double-count it.
+
+        This is used ONLY for argmax/accuracy metrics, never for loss computation.
         """
         batch_size = isr_logits.shape[0]
         log_p_isr = F.log_softmax(isr_logits, dim=-1)          # (batch, num_jets)
@@ -628,11 +652,14 @@ class JetAssignmentTransformer(nn.Module):
         """Run the full forward pass.
 
         Returns a dict with:
-          - ``logits``: (batch, num_assignments) log-joint-probabilities
-            log P(isr=j, grp=k) for each flat assignment.  These are proper
-            log-probabilities (sum of log_softmax components) so use
-            ``logits.argmax(dim=-1)`` for the predicted assignment and
-            ``logits.exp()`` to recover probabilities.
+          - ``logits``: (batch, num_assignments) raw sum isr_logit[j] +
+            grp_logit[j,k] for each flat assignment.  Used for all loss
+            computations (CrossEntropyLoss, sym, QCD).
+          - ``logits_eval``: (batch, num_assignments) partition-function-
+            corrected log-joint-probabilities log P(isr=j) + log P(grp=k|isr=j)
+            for each flat assignment.  Use ``logits_eval.argmax(dim=-1)`` for
+            the predicted assignment — this gives the true MAP estimate without
+            the grouping-partition-function bias present in the raw sum argmax.
           - ``isr_logits``: (batch, num_jets) raw ISR scores (unnormalized).
           - ``grouping_logits``: (batch, num_jets, num_groupings) raw grouping
             scores (unnormalized), indexed as [isr_choice, grouping_idx].
@@ -650,8 +677,11 @@ class JetAssignmentTransformer(nn.Module):
                 jet_embeddings, four_momenta, grp_summary
             )
             logits = self._combine_logits(isr_logits, grouping_logits)
+            # Partition-function-corrected log-probs for argmax (not for losses)
+            logits_eval = self._combine_logits_eval(isr_logits, grouping_logits)
             return {
                 "logits": logits,
+                "logits_eval": logits_eval,
                 "isr_logits": isr_logits,
                 "grouping_logits": grouping_logits,
                 "mass_asym_flat": mass_asym_flat,
