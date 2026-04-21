@@ -406,29 +406,37 @@ def _run_epoch(
             loss_sym = (probs * mass_asym).sum(dim=-1).mean()
             loss_ce = loss_ce + lambda_sym * loss_sym
 
-        # QCD hierarchy penalty: events with large pT hierarchies (QCD-like) are pushed
+        # QCD hierarchy penalty: background events with large pT hierarchies are pushed
         # to prefer high-mass-asymmetry assignments, making them self-select interpretations
         # that look maximally unlike a symmetric signal decay.
         # loss_qcd = -mean(H_i * expected_mass_asym_i), where H = log(pT_max/pT_min).
         # Minimising this negative quantity increases H-weighted expected asymmetry,
         # disfavouring signal-like (low-asymmetry) interpretations for QCD-dominated events.
+        #
+        # IMPORTANT: applied only to background events (parent_mass == 0).  On signal events
+        # H > 0 but the correct assignment already has low asymmetry, so firing this penalty
+        # on signal events would push the model toward wrong (high-asymmetry) assignments and
+        # degrade training.  On a signal-only dataset the mask is always False and the term
+        # never contributes; on a mixed dataset it fires exclusively on QCD background events.
         if lambda_qcd > 0 and "mass_asym_flat" in output:
-            px_all = four_mom[..., 1]
-            py_all = four_mom[..., 2]
-            pt_all = torch.sqrt(px_all**2 + py_all**2).clamp(min=1e-8)
-            pt_max = pt_all.max(dim=-1).values
-            pt_min = pt_all.min(dim=-1).values.clamp(min=1e-8)
-            # Clamp H to prevent very large values from degenerate (near-zero pT_min) events
-            H = torch.log(pt_max / pt_min).clamp(max=10.0)             # (batch,) hierarchy score
+            qcd_mask = parent_mass == 0
+            if qcd_mask.any():
+                px_all = four_mom[qcd_mask, :, 1]
+                py_all = four_mom[qcd_mask, :, 2]
+                pt_all = torch.sqrt(px_all**2 + py_all**2).clamp(min=1e-8)
+                pt_max = pt_all.max(dim=-1).values
+                pt_min = pt_all.min(dim=-1).values.clamp(min=1e-8)
+                # Clamp H to prevent very large values from degenerate (near-zero pT_min) events
+                H = torch.log(pt_max / pt_min).clamp(max=10.0)         # (n_bkg,) hierarchy score
 
-            # Detach mass_asym: we only want to steer the assignment probabilities,
-            # not back-propagate through the physics feature computation itself.
-            mass_asym_qcd = output["mass_asym_flat"].detach()           # (batch, num_assignments)
-            probs_qcd = logits.softmax(dim=-1)
-            expected_asym = (probs_qcd * mass_asym_qcd).sum(dim=-1)    # (batch,)
-            # Negative sign: minimising drives H * expected_asym upward for high-H events
-            loss_qcd_term = -(H * expected_asym).mean()
-            loss_ce = loss_ce + lambda_qcd * loss_qcd_term
+                # Detach mass_asym: we only want to steer the assignment probabilities,
+                # not back-propagate through the physics feature computation itself.
+                mass_asym_qcd = output["mass_asym_flat"].detach()[qcd_mask]  # (n_bkg, num_assign)
+                probs_qcd = logits.softmax(dim=-1)[qcd_mask]
+                expected_asym = (probs_qcd * mass_asym_qcd).sum(dim=-1)     # (n_bkg,)
+                # Negative sign: minimising drives H * expected_asym upward for high-H events
+                loss_qcd_term = -(H * expected_asym).mean()
+                loss_ce = loss_ce + lambda_qcd * loss_qcd_term
 
         # Adversarial mass loss
         mass_mask = parent_mass > 0
