@@ -28,7 +28,7 @@ from .utils import get_config, get_device
 def export_onnx(model, num_jets, device, val_acc):
     """Export model to ONNX format."""
     model.eval()
-    input_dim = model.input_proj.in_features
+    input_dim = model.raw_input_dim  # raw 4-vector dim; model augments internally
     dummy = torch.randn(1, num_jets, input_dim, device=device)
     onnx_path = "checkpoints/best_model.onnx"
 

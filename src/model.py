@@ -2,8 +2,13 @@
 Transformer-based jet assignment model with factored architecture.
 
 Architecture:
-  1. Linear projection of (E, px, py, pz) to d_model
-  2. Transformer encoder with self-attention over jet tokens
+  1. Input augmentation: append physics-derived features (log_pT, η, sin_φ, cos_φ)
+     to raw (E, px, py, pz), giving an 8-dimensional per-jet representation.
+     These natural physics coordinates are the primary discriminants for ISR
+     identification and are expensive for the Transformer to re-derive from
+     Cartesian coordinates alone.
+  2. Linear projection of the 8-D augmented features to d_model
+  3. Transformer encoder with self-attention over jet tokens
   3. Factored scoring (7+ jets):
      a. Grouping head: per-grouping scoring (how to split remaining 6 into 2x3?)
      b. ISR head: per-jet classification informed by grouping quality — for each
@@ -110,6 +115,11 @@ class JetAssignmentTransformer(nn.Module):
 
     Physics features per assignment include 6 inter-group features plus 9
     intra-group features per group (18 total), giving n_group_physics=24.
+
+    Per-jet input is augmented from 4 to 8 features by appending (log_pT, η,
+    sin_φ, cos_φ) to the raw (E, px, py, pz).  This gives the Transformer
+    direct access to the coordinates that best discriminate ISR from signal jets
+    without forcing it to re-derive them from Cartesian components.
     """
 
     def __init__(
@@ -128,7 +138,12 @@ class JetAssignmentTransformer(nn.Module):
         self.num_jets = num_jets
         self.has_isr = num_jets >= 7
 
-        self.input_proj = nn.Linear(input_dim, d_model)
+        # Store raw input dim so ONNX export can create a correctly-sized dummy
+        # (model.input_proj.in_features is larger due to derived features).
+        self.raw_input_dim = input_dim
+        # 4 physics-derived features appended to raw 4-vector: log_pT, η, sin_φ, cos_φ
+        self._n_derived = 4
+        self.input_proj = nn.Linear(input_dim + self._n_derived, d_model)
         # Per-head learnable weight for pT hierarchy attention bias; init to 0 (no effect at start)
         self.pt_bias_weight = nn.Parameter(torch.zeros(nhead))
         self.pos_embedding = nn.Embedding(num_jets, d_model)
@@ -237,13 +252,44 @@ class JetAssignmentTransformer(nn.Module):
         log_pt = torch.log(pt)
         return log_pt.unsqueeze(-1) - log_pt.unsqueeze(-2)
 
+    def _augment_jet_features(self, four_momenta: torch.Tensor) -> torch.Tensor:
+        """Append physics-derived features to raw 4-vectors.
+
+        Augments (E, px, py, pz) with (log_pT, η, sin_φ, cos_φ), producing an
+        8-dimensional per-jet representation.  The derived features are in natural
+        physical ranges and directly encode the primary ISR discriminants:
+          - log_pT: log(pT/HT) after HT normalisation — ISR and signal jets have
+            different pT spectra; providing it explicitly avoids the model needing
+            to re-derive it from the Cartesian components.
+          - η: pseudo-rapidity — ISR jets are on average more forward (|η| larger)
+            than signal jets from symmetric, central pair-production decays.
+          - sin_φ, cos_φ: angular position without periodicity artefacts; lets the
+            Transformer directly compute angular separations in attention.
+
+        Args:
+            four_momenta: (batch, num_jets, 4) in (E, px, py, pz), HT-normalised.
+
+        Returns:
+            (batch, num_jets, 8) — original 4 components followed by 4 derived.
+        """
+        px = four_momenta[..., 1]
+        py = four_momenta[..., 2]
+        pz = four_momenta[..., 3]
+        pt = torch.sqrt(px**2 + py**2).clamp(min=1e-8)
+        log_pt = torch.log(pt)      # log(pT/HT) — HT-normalised input
+        eta = torch.asinh(pz / pt)  # pseudo-rapidity
+        sin_phi = py / pt           # ∈ [-1, 1], avoids atan2 discontinuity
+        cos_phi = px / pt           # ∈ [-1, 1]
+        derived = torch.stack([log_pt, eta, sin_phi, cos_phi], dim=-1)
+        return torch.cat([four_momenta, derived], dim=-1)
+
     @staticmethod
     def _wrap_dphi(dphi: torch.Tensor) -> torch.Tensor:
         """Wrap Δφ into [-π, π]."""
         return dphi - 2 * torch.pi * torch.round(dphi / (2 * torch.pi))
 
     def encode_jets(self, four_momenta: torch.Tensor) -> torch.Tensor:
-        x = self.input_proj(four_momenta)
+        x = self.input_proj(self._augment_jet_features(four_momenta))
         positions = torch.arange(self.num_jets, device=four_momenta.device)
         x = x + self.pos_embedding(positions).unsqueeze(0)
 
