@@ -144,8 +144,14 @@ class JetAssignmentTransformer(nn.Module):
         # 4 physics-derived features appended to raw 4-vector: log_pT, η, sin_φ, cos_φ
         self._n_derived = 4
         self.input_proj = nn.Linear(input_dim + self._n_derived, d_model)
-        # Per-head learnable weight for pT hierarchy attention bias; init to 0 (no effect at start)
+        # Per-head learnable weights for pT hierarchy and ΔR attention biases.
+        # Both init to 0 so they have no effect at the start of training and are
+        # only incorporated once the Transformer has learned basic representations.
         self.pt_bias_weight = nn.Parameter(torch.zeros(nhead))
+        # ΔR bias: jets from the same parton shower cluster in (η,φ) space.
+        # A negative dr_bias_weight will discourage attention across large ΔR,
+        # effectively encoding jet-clustering structure into the attention pattern.
+        self.dr_bias_weight = nn.Parameter(torch.zeros(nhead))
         self.pos_embedding = nn.Embedding(num_jets, d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -252,6 +258,34 @@ class JetAssignmentTransformer(nn.Module):
         log_pt = torch.log(pt)
         return log_pt.unsqueeze(-1) - log_pt.unsqueeze(-2)
 
+    def _compute_deltaR_bias(self, four_momenta: torch.Tensor) -> torch.Tensor:
+        """Pairwise ΔR matrix: sqrt(Δη² + Δφ²). Returns (batch, J, J).
+
+        Jets from the same parton cluster in ΔR.  Adding ΔR_ij (scaled by a
+        learnable per-head weight, typically negative) as an attention bias
+        allows the model to directly encode jet-proximity structure: attention
+        heads can specialize to focus on nearby jets (small ΔR, likely same
+        parent) or isolate the most distant jet (large ΔR, likely ISR).
+
+        Diagonal is set to 0 (self-attention has no geometric separation).
+        """
+        px, py, pz = four_momenta[..., 1], four_momenta[..., 2], four_momenta[..., 3]
+        pt = torch.sqrt(px**2 + py**2).clamp(min=1e-8)
+        eta = torch.asinh(pz / pt)           # pseudo-rapidity
+        sin_phi = py / pt                    # periodic-safe angular coordinate
+        cos_phi = px / pt
+        # Δη: straightforward difference
+        deta = eta.unsqueeze(-1) - eta.unsqueeze(-2)           # (batch, J, J)
+        # Δφ via dot product of unit vectors: cos(Δφ) = cos_i*cos_j + sin_i*sin_j
+        # Δφ ∈ [0, π] — symmetric, no periodicity issues
+        cos_dphi = (
+            cos_phi.unsqueeze(-1) * cos_phi.unsqueeze(-2)
+            + sin_phi.unsqueeze(-1) * sin_phi.unsqueeze(-2)
+        ).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+        dphi = torch.acos(cos_dphi)                             # (batch, J, J)
+        dr = torch.sqrt(deta**2 + dphi**2)                      # (batch, J, J)
+        return dr
+
     def _augment_jet_features(self, four_momenta: torch.Tensor) -> torch.Tensor:
         """Append physics-derived features to raw 4-vectors.
 
@@ -293,14 +327,18 @@ class JetAssignmentTransformer(nn.Module):
         positions = torch.arange(self.num_jets, device=four_momenta.device)
         x = x + self.pos_embedding(positions).unsqueeze(0)
 
-        # pT hierarchy attention bias: scale log(pT_i/pT_j) per head, add to attention logits
+        # Attention biases: pT hierarchy + ΔR proximity, both per-head learnable.
+        # Initialised to 0 so they have no effect before the Transformer has
+        # learned basic representations; the optimiser gradually activates them.
         batch_size = four_momenta.shape[0]
-        pt_bias = self._compute_pt_bias(four_momenta)  # (batch, J, J)
-        pt_bias_expanded = (
+        pt_bias = self._compute_pt_bias(four_momenta)      # (batch, J, J)
+        dr_bias = self._compute_deltaR_bias(four_momenta)  # (batch, J, J)
+        attn_bias = (
             pt_bias.unsqueeze(1) * self.pt_bias_weight.view(1, self.nhead, 1, 1)
+            + dr_bias.unsqueeze(1) * self.dr_bias_weight.view(1, self.nhead, 1, 1)
         ).reshape(batch_size * self.nhead, self.num_jets, self.num_jets)
 
-        x = self.transformer_encoder(x, mask=pt_bias_expanded)
+        x = self.transformer_encoder(x, mask=attn_bias)
         return x
 
     def _isr_physics(self, four_momenta: torch.Tensor) -> torch.Tensor:
