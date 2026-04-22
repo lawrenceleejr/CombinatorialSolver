@@ -17,7 +17,7 @@ training:
   lambda_adv: 0.0
   lambda_adv_rampup: 50
   tf_start: 1.0
-  tf_end: 0.3
+  tf_end: 0.0
   tf_decay_epochs: 100
   # Upweights the ISR classification loss relative to the teacher-forced grouping loss.
   # Root cause: signal jets receive gradient from loss_grp_tf via all 10 groupings (10
@@ -29,6 +29,12 @@ training:
   lambda_sym_rampup: 20
   lambda_qcd: 0.1
   lambda_qcd_rampup: 20
+  # Label smoothing for all CrossEntropyLoss calls (flat, ISR, grouping).
+  # Prevents overconfidence (entropy collapse): at epoch 80+ val_loss was rising
+  # while val_acc was flat, indicating the model was assigning high probability
+  # to correct predictions without improving on wrong ones.  0.1 is a standard
+  # value that retains most of the hard-target signal while adding a soft floor.
+  label_smoothing: 0.1
 
 data:
   normalize_by_ht: true

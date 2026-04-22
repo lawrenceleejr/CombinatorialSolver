@@ -168,7 +168,8 @@ def train(config_path: str | None = None, data_path: str | None = None):
         pg["initial_lr"] = pg["lr"]
 
     # Loss functions
-    ce_loss_fn = nn.CrossEntropyLoss()
+    label_smoothing = tc.get("label_smoothing", 0.0)
+    ce_loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
     mse_loss_fn = nn.MSELoss()
 
     # Check if adversarial training is useful
