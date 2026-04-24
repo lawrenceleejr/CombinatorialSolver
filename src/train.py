@@ -133,8 +133,9 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
-    # Detect whether this is the new flat joint model or the old factored model.
-    has_factored_architecture = hasattr(model, "isr_head")
+    # Detect whether this is the old factored architecture (legacy) or the
+    # current joint-flat architecture.
+    has_factored_architecture = hasattr(model, "isr_head") and hasattr(model, "grouping_summary_proj")
     if model.has_isr:
         if has_factored_architecture:
             print(f"Architecture: factored (ISR {model.num_jets}-way + grouping {model.num_groupings}-way)")

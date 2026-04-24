@@ -217,6 +217,7 @@ class JetAssignmentTransformer(nn.Module):
         # 4 physics-derived features appended to raw 4-vector: log_pT, η, sin_φ, cos_φ
         self._n_derived = 4
         self.input_proj = nn.Linear(input_dim + self._n_derived, d_model)
+        self.register_buffer("jet_eye_mask", torch.eye(num_jets, dtype=torch.bool))
 
         # Physics-informed per-head pairwise attention biases.
         # All initialised to 0 so the model starts with isotropic attention and
@@ -381,9 +382,7 @@ class JetAssignmentTransformer(nn.Module):
         )
         log_m_ij = torch.log(m2_ij.clamp(min=1e-8)) * 0.5  # log(m_ij)
         # Zero diagonal: self-pair mass is singular for near-massless jets.
-        eye = torch.eye(
-            self.num_jets, device=four_momenta.device, dtype=torch.bool
-        ).unsqueeze(0)
+        eye = self.jet_eye_mask.to(device=four_momenta.device).unsqueeze(0)
         return log_m_ij.masked_fill(eye, 0.0)
 
     def _augment_jet_features(self, four_momenta: torch.Tensor) -> torch.Tensor:
@@ -695,6 +694,8 @@ class JetAssignmentTransformer(nn.Module):
         isr_aux_logits = None
         if self.has_isr:
             isr_aux_logits = self.isr_aux_head(jet_emb).squeeze(-1)  # (batch, J)
+            # self.isr_indices contains values in [0, J-1], so this is a safe
+            # projection from per-jet ISR evidence to per-assignment evidence.
             logits = logits + self.isr_aux_logit_scale * isr_aux_logits[:, self.isr_indices]
 
         # 10. Adversarial mass prediction (gradient reversed for decorrelation)
