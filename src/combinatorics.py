@@ -5,10 +5,10 @@ Supports two modes:
   - 6 jets (no ISR): C(6,3)/2 = 10 assignments — partition into two groups of 3
   - 7 jets (with ISR): C(7,1) * C(6,3)/2 = 70 assignments — pick ISR + partition
 
-Also supports a factored decomposition for 7-jet mode:
-  - ISR identification: 7-way classification
-  - Grouping (given ISR): 10-way classification
-  - Combined: assignment_idx = isr_idx * 10 + grouping_idx
+Also exposes:
+  - Factored decomposition (ISR x grouping) for analysis/loss routing
+  - Triplet enumeration (all C(num_jets, 3)) for the triplet-token bank
+  - Single-swap neighbor map for contrastive learning
 """
 
 from itertools import combinations
@@ -134,6 +134,102 @@ def build_factored_tensors(num_jets: int = 7) -> dict[str, torch.Tensor]:
         "flat_to_factored": flat_to_factored,  # (70, 2)
         "factored_to_flat": factored_to_flat,  # (7, 10)
     }
+
+
+def enumerate_triplets(num_jets: int) -> list[tuple[int, int, int]]:
+    """Enumerate all ordered-ascending triplets of jet indices.
+
+    Returns C(num_jets, 3) triplets. For num_jets=7 this is 35 triplets.
+    Each triplet (i, j, k) with i < j < k represents a candidate 3-body resonance
+    (e.g. a gluino → 3 jets hypothesis).
+    """
+    return list(combinations(range(num_jets), 3))
+
+
+def build_triplet_tensors(num_jets: int) -> dict[str, torch.Tensor]:
+    """Build index tensors for the all-triplets candidate bank.
+
+    Returns:
+        triplet_indices: (T, 3) — jet indices for each triplet
+        jet_in_triplet:  (num_jets, T) bool — true if jet j is one of the 3 jets
+            of triplet t.  Used to mask the jet→triplet cross-attention so that
+            a jet only attends to triplets containing it (the physically
+            meaningful neighbourhood — other triplets don't describe that jet).
+        num_triplets: int — C(num_jets, 3)
+    """
+    triplets = enumerate_triplets(num_jets)
+    tri_idx = torch.tensor(triplets, dtype=torch.long)           # (T, 3)
+    jet_in_triplet = torch.zeros(num_jets, len(triplets), dtype=torch.bool)
+    for t, tri in enumerate(triplets):
+        for j in tri:
+            jet_in_triplet[j, t] = True
+    return {
+        "triplet_indices": tri_idx,
+        "jet_in_triplet": jet_in_triplet,
+        "num_triplets": len(triplets),
+    }
+
+
+def build_neighbor_map(num_jets: int) -> dict[str, torch.Tensor]:
+    """For each assignment, look up the indices of its single-swap neighbours.
+
+    A *single swap* changes a single jet's group membership:
+      - ISR ↔ one jet in g1            (up to 3 neighbours)
+      - ISR ↔ one jet in g2            (up to 3 neighbours)
+      - one jet in g1 ↔ one jet in g2  (9 neighbours)
+    so there are up to 15 single-swap neighbours per 7-jet assignment, and
+    9 per 6-jet assignment (only the intra-group swaps).
+
+    These are the hardest confusable alternatives — the classes that differ
+    from truth by a single jet identity.  A contrastive loss that pushes
+    truth above these neighbours is much more sample-efficient than
+    spreading gradient uniformly over all 69 non-truth classes.
+
+    Returns:
+        neighbor_idx: (num_assignments, n_neighbors) long — flat indices.
+            Padded entries (6-jet mode) are the assignment's own index (so the
+            InfoNCE denominator effectively ignores them via double-counting,
+            but they never point to a wrong class).
+        n_neighbors: int
+    """
+    assignments = enumerate_assignments(num_jets)
+
+    # Canonical key for (isr, {g1, g2}) → flat index
+    def canon_key(isr, g1, g2):
+        return (isr, frozenset([frozenset(g1), frozenset(g2)]))
+
+    key_to_idx = {canon_key(a_isr, a_g1, a_g2): i for i, (a_isr, a_g1, a_g2) in enumerate(assignments)}
+
+    n_neighbors = 15 if num_jets >= 7 else 9
+    neighbor_idx = torch.zeros(len(assignments), n_neighbors, dtype=torch.long)
+
+    for idx, (isr, g1, g2) in enumerate(assignments):
+        nbrs = []
+
+        if isr is not None:
+            # ISR ↔ g1 jet
+            for j in g1:
+                new_g1 = tuple(x for x in g1 if x != j) + (isr,)
+                key = canon_key(j, new_g1, g2)
+                nbrs.append(key_to_idx[key])
+            # ISR ↔ g2 jet
+            for j in g2:
+                new_g2 = tuple(x for x in g2 if x != j) + (isr,)
+                key = canon_key(j, g1, new_g2)
+                nbrs.append(key_to_idx[key])
+
+        # g1[a] ↔ g2[b] : 9 pairs
+        for a in range(3):
+            for b in range(3):
+                new_g1 = tuple(g1[i] if i != a else g2[b] for i in range(3))
+                new_g2 = tuple(g2[i] if i != b else g1[a] for i in range(3))
+                key = canon_key(isr, new_g1, new_g2)
+                nbrs.append(key_to_idx[key])
+
+        assert len(nbrs) == n_neighbors, f"Expected {n_neighbors} neighbours, got {len(nbrs)}"
+        neighbor_idx[idx] = torch.tensor(nbrs, dtype=torch.long)
+
+    return {"neighbor_idx": neighbor_idx, "n_neighbors": n_neighbors}
 
 
 def match_truth_groups(

@@ -1,12 +1,23 @@
 """
-Training loop for the jet assignment transformer.
+Training loop for the Pair-Symmetric Slot Transformer (PSST).
 
-Supports:
-  - Factored loss: ISR cross-entropy + grouping cross-entropy (7-jet mode)
-  - Combined cross-entropy (6-jet mode) + adversarial mass decorrelation
-  - Cosine LR schedule with linear warmup and optional warm restarts
-  - Automatic device selection (MPS / CUDA / CPU)
-  - Checkpointing, CSV logging, and ONNX export
+Losses (all combined additively):
+
+  - Cross-entropy on flat assignment logits (primary).
+  - InfoNCE contrastive loss over single-swap neighbours (pushes truth above
+    the 15 hardest confusables that differ by a single jet swap).
+  - Pair-symmetric mass-asymmetry regression (weak auxiliary — steers the
+    feature block toward assignments with balanced parent masses, but via
+    regression rather than by reweighting softmax, which lets the scorer
+    choose asymmetric hypotheses when the event evidence demands it).
+  - ISR-auxiliary BCE (per-jet "is this the ISR?" head) so the ISR decision
+    gets direct supervision even though it's not a separate scorer head.
+  - Hard-case reweighting: events where the true ISR is *not* the lowest-pT
+    jet are the ones the old architecture got wrong; upweight them so the
+    model actually learns the hard direction rather than plateauing on the
+    easy one.
+  - Optional mass-adversarial regression (gradient reversal) to decorrelate
+    features from parent mass — kept from the original design.
 """
 
 import argparse
@@ -17,6 +28,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.onnx
 from torch.utils.data import DataLoader, random_split
 
@@ -26,9 +38,8 @@ from .utils import get_config, get_device
 
 
 def export_onnx(model, num_jets, device, val_acc):
-    """Export model to ONNX format."""
     model.eval()
-    input_dim = model.input_proj.in_features
+    input_dim = 4  # PSST always takes raw 4-vectors
     dummy = torch.randn(1, num_jets, input_dim, device=device)
     onnx_path = "checkpoints/best_model.onnx"
 
@@ -59,7 +70,6 @@ def export_onnx(model, num_jets, device, val_acc):
 
 
 def cosine_with_warmup(optimizer, epoch, num_epochs, warmup_epochs, restart_period=0):
-    """Adjust learning rate: linear warmup then cosine decay with optional warm restarts."""
     if epoch < warmup_epochs:
         lr_scale = (epoch + 1) / warmup_epochs
     else:
@@ -75,8 +85,47 @@ def cosine_with_warmup(optimizer, epoch, num_epochs, warmup_epochs, restart_peri
         pg["lr"] = pg["initial_lr"] * lr_scale
 
 
+def _isr_is_hardest(four_momenta: torch.Tensor, isr_idx: torch.Tensor) -> torch.Tensor:
+    """For each event, is the true ISR *not* the lowest-pT jet?  (B,) bool.
+
+    Hard case for the combinatorial problem: pT rank alone cannot identify ISR,
+    so the model must use angular structure.
+    """
+    # Compute pT from (E, px, py, pz)
+    px = four_momenta[..., 1]
+    py = four_momenta[..., 2]
+    pt = torch.sqrt(px * px + py * py + 1e-8)
+    # For invalid (zero-pad) jets, pt ≈ 0 — but they're never the true ISR.
+    min_pt_idx = pt.argmin(dim=-1)
+    return isr_idx != min_pt_idx
+
+
+def _contrastive_loss(
+    logits: torch.Tensor, labels: torch.Tensor, neighbor_idx: torch.Tensor
+) -> torch.Tensor:
+    """InfoNCE over {truth} ∪ {single-swap neighbours}.
+
+    logits:        (B, N_assignments)
+    labels:        (B,) long — truth class
+    neighbor_idx:  (N_assignments, n_neighbours) — per-class neighbour table
+
+    The denominator spans truth + up to 15 single-swap alternatives, which are
+    the hardest negatives (differ by one jet identity).  This is much more
+    sample-efficient than spreading gradient over all 69 non-truth classes.
+    """
+    B = logits.shape[0]
+    # (B, n_neighbours)
+    nbrs = neighbor_idx[labels]
+    # Gather logits for truth and neighbours
+    truth_logits = logits.gather(1, labels.unsqueeze(-1))                    # (B, 1)
+    nbr_logits = logits.gather(1, nbrs)                                      # (B, n_neighbours)
+    all_logits = torch.cat([truth_logits, nbr_logits], dim=-1)               # (B, 1 + n)
+    # Truth is at index 0 in the concatenated logits
+    target = torch.zeros(B, dtype=torch.long, device=logits.device)
+    return F.cross_entropy(all_logits, target)
+
+
 def train(config_path: str | None = None, data_path: str | None = None):
-    """Main training function."""
     config = get_config(config_path)
     device = get_device()
     print(f"Using device: {device}")
@@ -85,7 +134,6 @@ def train(config_path: str | None = None, data_path: str | None = None):
     tc = config["training"]
     dc = config["data"]
 
-    # Data
     if data_path is None:
         data_path = "data/*.h5"
 
@@ -97,7 +145,6 @@ def train(config_path: str | None = None, data_path: str | None = None):
     )
     print(f"Dataset size: {len(dataset)} events")
 
-    # Train/val split (90/10)
     n_val = max(1, int(0.1 * len(dataset)))
     n_train = len(dataset) - n_val
     train_set, val_set = random_split(
@@ -119,7 +166,6 @@ def train(config_path: str | None = None, data_path: str | None = None):
         pin_memory=(device.type == "cuda"),
     )
 
-    # Model
     model = JetAssignmentTransformer(
         d_model=mc["d_model"],
         nhead=mc["nhead"],
@@ -132,46 +178,21 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
-    if model.has_isr:
-        print(f"Architecture: factored (ISR {model.num_jets}-way + grouping {model.num_groupings}-way)")
-    else:
-        print(f"Architecture: flat ({model.num_assignments}-way)")
+    print(
+        f"Architecture: PSST ({model.num_assignments}-way flat scorer, "
+        f"{model.num_triplets} triplets, has_isr={model.has_isr})"
+    )
 
-    # Optimizer — separate param groups so ISR head gets a higher LR to avoid
-    # being drowned out by grouping/GroupTransformer gradients.
-    isr_lr_mult = tc.get("isr_lr_multiplier", 1.0)
-    base_lr = tc["learning_rate"]
-
-    if model.has_isr and isr_lr_mult != 1.0:
-        isr_params = (
-            list(model.isr_head.parameters())
-            + list(model.grouping_summary_proj.parameters())
-        )
-        isr_param_ids = {id(p) for p in isr_params}
-        other_params = [p for p in model.parameters() if id(p) not in isr_param_ids]
-
-        optimizer = torch.optim.AdamW(
-            [
-                {"params": other_params, "lr": base_lr},
-                {"params": isr_params, "lr": base_lr * isr_lr_mult},
-            ],
-            weight_decay=tc["weight_decay"],
-        )
-        print(f"Separate LR groups: base={base_lr:.1e}, ISR head={base_lr * isr_lr_mult:.1e}")
-    else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=base_lr,
-            weight_decay=tc["weight_decay"],
-        )
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=tc["learning_rate"],
+        weight_decay=tc["weight_decay"],
+    )
     for pg in optimizer.param_groups:
         pg["initial_lr"] = pg["lr"]
 
-    # Loss functions
-    ce_loss_fn = nn.CrossEntropyLoss()
     mse_loss_fn = nn.MSELoss()
 
-    # Check if adversarial training is useful
     mass_std = dataset.parent_masses.std().item()
     use_adversary = tc["lambda_adv"] > 0 and mass_std > 0.01
     if tc["lambda_adv"] == 0:
@@ -181,7 +202,6 @@ def train(config_path: str | None = None, data_path: str | None = None):
     else:
         print(f"Adversary enabled: mass std = {mass_std:.3f} TeV")
 
-    # Logging
     os.makedirs("checkpoints", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
     log_path = Path("logs/training_log.csv")
@@ -191,7 +211,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
         writer.writerow([
             "epoch", "train_loss", "train_acc", "train_acc5",
             "val_loss", "val_acc", "val_acc5",
-            "train_isr_acc", "train_grp_acc", "val_isr_acc", "val_grp_acc",
+            "val_hard_acc", "val_easy_acc",
             "adv_r2", "lr",
         ])
 
@@ -200,14 +220,12 @@ def train(config_path: str | None = None, data_path: str | None = None):
     patience = tc.get("patience", 25)
     no_improve = 0
 
-    tf_start = tc.get("tf_start", 1.0)
-    tf_end = tc.get("tf_end", 0.3)
-    tf_decay_epochs = tc.get("tf_decay_epochs", 100)
-    lambda_isr = tc.get("lambda_isr", 1.0)
-    lambda_sym_max = tc.get("lambda_sym", 0.0)
-    lambda_qcd_max = tc.get("lambda_qcd", 0.0)
-    lambda_sym_rampup = tc.get("lambda_sym_rampup", 0)
-    lambda_qcd_rampup = tc.get("lambda_qcd_rampup", 0)
+    lambda_contrast_max = tc.get("lambda_contrast", 1.0)
+    lambda_contrast_rampup = tc.get("lambda_contrast_rampup", 0)
+    lambda_pair_sym = tc.get("lambda_pair_sym", 0.05)
+    lambda_isr_aux_max = tc.get("lambda_isr_aux", 0.5)
+    lambda_isr_aux_rampup = tc.get("lambda_isr_aux_rampup", 0)
+    hard_case_alpha = tc.get("hard_case_alpha", 2.0)   # weight for hard-ISR events
 
     for epoch in range(tc["num_epochs"]):
         cosine_with_warmup(
@@ -218,67 +236,58 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
         if use_adversary:
             rampup = tc.get("lambda_adv_rampup", 10)
-            if rampup > 0:
-                adv_scale = min(1.0, epoch / rampup)
-            else:
-                adv_scale = 1.0
+            adv_scale = min(1.0, epoch / rampup) if rampup > 0 else 1.0
             lambda_adv = tc["lambda_adv"] * adv_scale
             model.gradient_reversal.set_lambda(lambda_adv)
         else:
             lambda_adv = 0.0
             model.gradient_reversal.set_lambda(0.0)
 
-        # Teacher forcing ratio: linearly decay from tf_start to tf_end over tf_decay_epochs
-        if epoch < tf_decay_epochs:
-            tf_ratio = tf_start + (tf_end - tf_start) * epoch / tf_decay_epochs
+        if lambda_contrast_rampup > 0:
+            lambda_contrast = lambda_contrast_max * min(1.0, epoch / lambda_contrast_rampup)
         else:
-            tf_ratio = tf_end
+            lambda_contrast = lambda_contrast_max
 
-        # Ramp up auxiliary losses: off at start, linearly reach full strength
-        if lambda_sym_rampup > 0:
-            lambda_sym = lambda_sym_max * min(1.0, epoch / lambda_sym_rampup)
+        if lambda_isr_aux_rampup > 0:
+            lambda_isr_aux = lambda_isr_aux_max * min(1.0, epoch / lambda_isr_aux_rampup)
         else:
-            lambda_sym = lambda_sym_max
+            lambda_isr_aux = lambda_isr_aux_max
 
-        if lambda_qcd_rampup > 0:
-            lambda_qcd = lambda_qcd_max * min(1.0, epoch / lambda_qcd_rampup)
-        else:
-            lambda_qcd = lambda_qcd_max
-
-        # Training
         model.train()
         train_metrics = _run_epoch(
-            model, train_loader, ce_loss_fn, mse_loss_fn,
-            lambda_adv, device, optimizer=optimizer,
-            tf_ratio=tf_ratio, lambda_sym=lambda_sym, lambda_qcd=lambda_qcd,
-            lambda_isr=lambda_isr,
+            model, train_loader, mse_loss_fn, lambda_adv, device,
+            optimizer=optimizer,
+            lambda_contrast=lambda_contrast,
+            lambda_pair_sym=lambda_pair_sym,
+            lambda_isr_aux=lambda_isr_aux,
+            hard_case_alpha=hard_case_alpha,
+            augment=True,
         )
 
-        # Validation (no augmentation, no teacher forcing: tf_ratio=0 = pure end-to-end)
         model.eval()
         with torch.no_grad():
             val_metrics = _run_epoch(
-                model, val_loader, ce_loss_fn, mse_loss_fn,
-                lambda_adv, device, optimizer=None,
-                tf_ratio=0.0, lambda_sym=0.0, lambda_qcd=0.0,
-                lambda_isr=lambda_isr,
+                model, val_loader, mse_loss_fn, lambda_adv, device,
+                optimizer=None,
+                lambda_contrast=0.0,
+                lambda_pair_sym=0.0,
+                lambda_isr_aux=0.0,
+                hard_case_alpha=1.0,
+                augment=False,
             )
 
-        # Log
         adv_str = f" | Adv R²={val_metrics['adv_r2']:.3f}" if use_adversary else ""
-        isr_str = ""
-        if "isr_acc" in val_metrics:
-            isr_str = (
-                f" | ISR={val_metrics['isr_acc']:.3f}"
-                f" Grp={val_metrics['grp_acc']:.3f}"
+        hard_str = ""
+        if "hard_acc" in val_metrics:
+            hard_str = (
+                f" | hard={val_metrics['hard_acc']:.3f}"
+                f" easy={val_metrics['easy_acc']:.3f}"
             )
-
         print(
             f"Epoch {epoch+1:3d}/{tc['num_epochs']} | "
             f"Train loss={train_metrics['loss']:.4f} acc={train_metrics['acc']:.3f} | "
             f"Val loss={val_metrics['loss']:.4f} acc={val_metrics['acc']:.3f}"
-            f"{isr_str}{adv_str} | "
-            f"LR={current_lr:.2e}"
+            f"{hard_str}{adv_str} | LR={current_lr:.2e}"
         )
 
         with open(log_path, "a", newline="") as f:
@@ -291,15 +300,12 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 f"{val_metrics['loss']:.6f}",
                 f"{val_metrics['acc']:.4f}",
                 f"{val_metrics['acc5']:.4f}",
-                f"{train_metrics.get('isr_acc', 0):.4f}",
-                f"{train_metrics.get('grp_acc', 0):.4f}",
-                f"{val_metrics.get('isr_acc', 0):.4f}",
-                f"{val_metrics.get('grp_acc', 0):.4f}",
+                f"{val_metrics.get('hard_acc', 0):.4f}",
+                f"{val_metrics.get('easy_acc', 0):.4f}",
                 f"{val_metrics['adv_r2']:.4f}",
                 f"{current_lr:.6e}",
             ])
 
-        # Checkpoint
         if val_metrics["acc"] > best_val_acc:
             best_val_acc = val_metrics["acc"]
             best_epoch = epoch + 1
@@ -324,113 +330,116 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
     print(f"\nTraining complete. Best val accuracy: {best_val_acc:.4f} at epoch {best_epoch}")
 
-    # Reload best checkpoint before ONNX export
     ckpt = torch.load("checkpoints/best_model.pt", map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     export_onnx(model, dc["num_jets"], device, best_val_acc)
 
 
 def _run_epoch(
-    model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optimizer=None,
-    tf_ratio=1.0, lambda_sym=0.0, lambda_qcd=0.0, lambda_isr=1.0,
+    model, loader, mse_loss_fn, lambda_adv, device,
+    optimizer=None,
+    lambda_contrast=0.0,
+    lambda_pair_sym=0.0,
+    lambda_isr_aux=0.0,
+    hard_case_alpha=1.0,
+    augment=False,
 ):
-    """Run one epoch of training or validation."""
     total_loss = 0.0
     total_correct = 0
     total_correct5 = 0
-    total_isr_correct = 0
-    total_grp_correct = 0
     total_samples = 0
+    total_hard = 0
+    total_hard_correct = 0
+    total_easy = 0
+    total_easy_correct = 0
     all_mass_pred = []
     all_mass_true = []
-    factored = model.has_isr
+
+    neighbor_idx = getattr(model, "neighbor_idx", None)                      # (N, n_nbrs)
+    isr_indices_assign = getattr(model, "isr_indices_assign", None)           # (N,) -1 if 6-jet
+    has_isr = model.has_isr
+    num_jets = model.num_jets
 
     for batch in loader:
         four_mom = batch["four_momenta"].to(device)
         labels = batch["label"].to(device)
         parent_mass = batch["parent_mass"].to(device)
 
-        # φ/η augmentation during training (hard symmetries of the problem)
-        if optimizer is not None:
+        # --- φ-rotation + η-flip augmentation (hard symmetries of the problem) ---
+        if augment:
             four_mom = four_mom.clone()
             batch_size = four_mom.shape[0]
-
             theta = torch.rand(batch_size, device=device) * 2 * torch.pi
-            cos_t = theta.cos().view(-1, 1)   # (batch, 1) for broadcasting over jets
+            cos_t = theta.cos().view(-1, 1)
             sin_t = theta.sin().view(-1, 1)
             px_orig = four_mom[:, :, 1].clone()
             py_orig = four_mom[:, :, 2].clone()
             four_mom[:, :, 1] = px_orig * cos_t - py_orig * sin_t
             four_mom[:, :, 2] = px_orig * sin_t + py_orig * cos_t
-
             flip = (torch.rand(batch_size, device=device) > 0.5).float().view(-1, 1)
             four_mom[:, :, 3] = four_mom[:, :, 3] * (1.0 - 2.0 * flip)
 
         output = model(four_mom)
-        logits = output["logits"]
+        logits = output["logits"]                                            # (B, N)
         mass_pred = output["mass_pred"].squeeze(-1)
 
-        # Assignment loss
-        if factored and "isr_logits" in output:
-            isr_logits = output["isr_logits"]
-            grouping_logits = output["grouping_logits"]
-
-            isr_labels = model.flat_to_factored[labels, 0]
-            grouping_labels = model.flat_to_factored[labels, 1]
-
-            loss_isr = ce_loss_fn(isr_logits, isr_labels)
-
-            batch_idx = torch.arange(labels.shape[0], device=device)
-            gt_grp_logits = grouping_logits[batch_idx, isr_labels]
-            loss_grp_tf = ce_loss_fn(gt_grp_logits, grouping_labels)
-
-            # Blend teacher-forced factored loss with flat end-to-end loss
-            # tf_ratio=1: fully teacher-forced (original); tf_ratio=0: flat CE only
-            # lambda_isr upweights the ISR loss to compensate for a gradient imbalance:
-            # each signal jet appears in all num_groupings groupings, so loss_grp_tf
-            # produces num_groupings gradient paths per signal jet while the ISR jet
-            # (excluded from every group) receives gradient only from loss_isr.
-            # Scaling loss_isr by lambda_isr partially rebalances this asymmetry.
-            loss_flat = ce_loss_fn(logits, labels)
-            loss_ce = tf_ratio * (lambda_isr * loss_isr + loss_grp_tf) + (1.0 - tf_ratio) * loss_flat
-
-            total_isr_correct += (isr_logits.argmax(dim=-1) == isr_labels).sum().item()
-            total_grp_correct += (gt_grp_logits.argmax(dim=-1) == grouping_labels).sum().item()
+        # --- Hard-case reweighting ---
+        # Per-event weight: hard_case_alpha if ISR is not the lowest-pT jet, else 1.
+        if has_isr and hard_case_alpha != 1.0:
+            true_isr = isr_indices_assign[labels]                            # (B,)
+            hard = _isr_is_hardest(four_mom, true_isr)                       # (B,)
+            weights = torch.where(
+                hard,
+                torch.full_like(hard, hard_case_alpha, dtype=torch.float32),
+                torch.ones_like(hard, dtype=torch.float32),
+            )
         else:
-            loss_ce = ce_loss_fn(logits, labels)
+            weights = torch.ones(labels.shape[0], device=device)
 
-        # Mass symmetry auxiliary loss: minimize expected |m1-m2|/(m1+m2) over assignments
-        if lambda_sym > 0 and "mass_asym_flat" in output:
-            mass_asym = output["mass_asym_flat"].detach()  # (batch, num_assignments)
-            probs = logits.softmax(dim=-1)
-            loss_sym = (probs * mass_asym).sum(dim=-1).mean()
-            loss_ce = loss_ce + lambda_sym * loss_sym
+        # --- Cross-entropy (weighted per sample) ---
+        ce_per_sample = F.cross_entropy(logits, labels, reduction="none")    # (B,)
+        w_norm = weights / weights.mean().clamp(min=1e-6)
+        loss_ce = (w_norm * ce_per_sample).mean()
 
-        # QCD hierarchy penalty: events with large pT hierarchies (QCD-like) are pushed
-        # to prefer high-mass-asymmetry assignments, making them self-select interpretations
-        # that look maximally unlike a symmetric signal decay.
-        # loss_qcd = -mean(H_i * expected_mass_asym_i), where H = log(pT_max/pT_min).
-        # Minimising this negative quantity increases H-weighted expected asymmetry,
-        # disfavouring signal-like (low-asymmetry) interpretations for QCD-dominated events.
-        if lambda_qcd > 0 and "mass_asym_flat" in output:
-            px_all = four_mom[..., 1]
-            py_all = four_mom[..., 2]
-            pt_all = torch.sqrt(px_all**2 + py_all**2).clamp(min=1e-8)
-            pt_max = pt_all.max(dim=-1).values
-            pt_min = pt_all.min(dim=-1).values.clamp(min=1e-8)
-            # Clamp H to prevent very large values from degenerate (near-zero pT_min) events
-            H = torch.log(pt_max / pt_min).clamp(max=10.0)             # (batch,) hierarchy score
+        # --- Contrastive single-swap InfoNCE ---
+        if lambda_contrast > 0 and neighbor_idx is not None:
+            loss_contrast = _contrastive_loss(logits, labels, neighbor_idx)
+        else:
+            loss_contrast = torch.tensor(0.0, device=device)
 
-            # Detach mass_asym: we only want to steer the assignment probabilities,
-            # not back-propagate through the physics feature computation itself.
-            mass_asym_qcd = output["mass_asym_flat"].detach()           # (batch, num_assignments)
-            probs_qcd = logits.softmax(dim=-1)
-            expected_asym = (probs_qcd * mass_asym_qcd).sum(dim=-1)    # (batch,)
-            # Negative sign: minimising drives H * expected_asym upward for high-H events
-            loss_qcd_term = -(H * expected_asym).mean()
-            loss_ce = loss_ce + lambda_qcd * loss_qcd_term
+        # --- Pair-symmetric mass regression ---
+        # Weak signal: the truth assignment tends to have small asymmetry, so
+        # regressing predicted-truth asymmetry toward zero helps the scorer
+        # build a representation that's sensitive to mass balance.  But it's
+        # only applied to the truth class — we do NOT reweight softmax by
+        # asymmetry, which would kill hard events where the truth assignment
+        # has an asymmetric fluctuation.
+        if lambda_pair_sym > 0 and "mass_asym_flat" in output:
+            mass_asym = output["mass_asym_flat"]                             # (B, N)
+            truth_asym = mass_asym.gather(1, labels.unsqueeze(-1)).squeeze(-1)
+            # We don't want to back-prop through the physics feature computation
+            # (it's not differentiable through the sqrt at m2 ≈ 0).  Use a
+            # simple target-zero MSE on the detached truth asymmetry as a
+            # *signal statistic*: encourage the scorer to put high logit mass
+            # on hypotheses whose asymmetry is small.  We reweight CE gradient
+            # by a margin against neighbours — achieved via a margin regressor.
+            truth_logit = logits.gather(1, labels.unsqueeze(-1)).squeeze(-1)
+            # Regression target: -asymmetry (so lower asymmetry → higher logit)
+            loss_pair_sym = F.mse_loss(truth_logit.tanh(), (-truth_asym.detach()).tanh())
+        else:
+            loss_pair_sym = torch.tensor(0.0, device=device)
 
-        # Adversarial mass loss
+        # --- ISR auxiliary BCE ---
+        if lambda_isr_aux > 0 and has_isr and "isr_aux_logits" in output:
+            true_isr = isr_indices_assign[labels]                            # (B,)
+            isr_target = F.one_hot(true_isr, num_classes=num_jets).float()   # (B, J)
+            loss_isr_aux = F.binary_cross_entropy_with_logits(
+                output["isr_aux_logits"], isr_target
+            )
+        else:
+            loss_isr_aux = torch.tensor(0.0, device=device)
+
+        # --- Mass adversarial ---
         mass_mask = parent_mass > 0
         if mass_mask.any() and lambda_adv > 0:
             loss_adv = mse_loss_fn(mass_pred[mass_mask], parent_mass[mass_mask])
@@ -438,7 +447,13 @@ def _run_epoch(
         else:
             loss_adv = torch.tensor(0.0, device=device)
 
-        loss = loss_ce + lambda_adv * loss_adv
+        loss = (
+            loss_ce
+            + lambda_contrast * loss_contrast
+            + lambda_pair_sym * loss_pair_sym
+            + lambda_isr_aux * loss_isr_aux
+            + lambda_adv * loss_adv
+        )
 
         if optimizer is not None:
             optimizer.zero_grad()
@@ -446,16 +461,25 @@ def _run_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-        # Metrics
+        # --- Metrics ---
         batch_size = labels.shape[0]
         total_loss += loss.item() * batch_size
         total_samples += batch_size
 
         preds = logits.argmax(dim=-1)
-        total_correct += (preds == labels).sum().item()
+        correct = (preds == labels)
+        total_correct += correct.sum().item()
 
         _, top5 = logits.topk(5, dim=-1)
         total_correct5 += (top5 == labels.unsqueeze(-1)).any(dim=-1).sum().item()
+
+        if has_isr:
+            true_isr = isr_indices_assign[labels]
+            hard = _isr_is_hardest(four_mom, true_isr)
+            total_hard += hard.sum().item()
+            total_hard_correct += (correct & hard).sum().item()
+            total_easy += (~hard).sum().item()
+            total_easy_correct += (correct & ~hard).sum().item()
 
         if mass_mask.any():
             all_mass_pred.append(mass_pred[mass_mask].detach().cpu())
@@ -475,9 +499,9 @@ def _run_epoch(
             adv_r2 = 1.0 - (ss_res / ss_tot).item()
 
     result = {"loss": avg_loss, "acc": acc, "acc5": acc5, "adv_r2": adv_r2}
-    if factored:
-        result["isr_acc"] = total_isr_correct / max(total_samples, 1)
-        result["grp_acc"] = total_grp_correct / max(total_samples, 1)
+    if has_isr and total_hard + total_easy > 0:
+        result["hard_acc"] = total_hard_correct / max(total_hard, 1)
+        result["easy_acc"] = total_easy_correct / max(total_easy, 1)
     return result
 
 
