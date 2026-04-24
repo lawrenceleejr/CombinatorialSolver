@@ -132,8 +132,10 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
+    # Detect whether this is the new flat joint model or the old factored model.
+    has_factored_architecture = hasattr(model, "isr_head")
     if model.has_isr:
-        if hasattr(model, "isr_head"):
+        if has_factored_architecture:
             print(f"Architecture: factored (ISR {model.num_jets}-way + grouping {model.num_groupings}-way)")
         else:
             print(f"Architecture: joint flat ({model.num_assignments}-way, no factored ISR head)")
@@ -141,13 +143,12 @@ def train(config_path: str | None = None, data_path: str | None = None):
         print(f"Architecture: flat ({model.num_assignments}-way)")
 
     # Optimizer — use a single parameter group for the new flat architecture.
-    # The isr_lr_multiplier config key is retained for backward compatibility
-    # but is only applied when the model still has a separate isr_head
-    # (the prior factored architecture).
+    # isr_lr_multiplier is only applied for the old factored architecture that
+    # still has a separate isr_head; the new joint model uses a single group.
     isr_lr_mult = tc.get("isr_lr_multiplier", 1.0)
     base_lr = tc["learning_rate"]
 
-    if model.has_isr and isr_lr_mult != 1.0 and hasattr(model, "isr_head"):
+    if model.has_isr and isr_lr_mult != 1.0 and has_factored_architecture:
         isr_params = (
             list(model.isr_head.parameters())
             + list(model.grouping_summary_proj.parameters())

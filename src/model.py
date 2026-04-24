@@ -133,6 +133,9 @@ class JetAssignmentTransformer(nn.Module):
         d_model: int = 128,
         nhead: int = 8,
         num_layers: int = 4,
+        # dim_feedforward increased from 256 to 512 and dropout from 0.1 to 0.2
+        # vs the original factored model: the new unified scorer MLP combines ISR,
+        # grouping and physics into a single pass so needs higher capacity.
         dim_feedforward: int = 512,
         dropout: float = 0.2,
         num_jets: int = 7,
@@ -206,11 +209,11 @@ class JetAssignmentTransformer(nn.Module):
 
         # Unified assignment scorer.
         # Input for each assignment:
-        #   pair_sum  (d_model) — symmetric centroid of both groups
-        #   pair_diff (d_model) — |g1−g2|, near-0 for kinematically equal groups
-        #   isr_emb   (d_model) — ISR candidate jet embedding
-        #   global_emb (d_model) — event-level mean pool
-        #   physics   (n_group_physics=24) — mass, ECF, Dalitz, ΔR features
+        #   pair_sum      (d_model) — symmetric centroid of both groups
+        #   pair_abs_diff (d_model) — |g1−g2|, near-0 for kinematically equal groups
+        #   isr_emb       (d_model) — ISR candidate jet embedding
+        #   global_emb    (d_model) — event-level mean pool
+        #   physics       (n_group_physics=24) — mass, ECF, Dalitz, ΔR features
         scorer_in_dim = 4 * d_model + self.n_group_physics
         self.assignment_scorer = nn.Sequential(
             nn.Linear(scorer_in_dim, 2 * d_model),
@@ -504,11 +507,11 @@ class JetAssignmentTransformer(nn.Module):
         ).reshape(batch_size, N, self.d_model)
 
         # 4. Symmetric pair features (invariant to swapping the two gluino groups).
-        #    pair_sum:  centroid — both groups contribute equally.
-        #    pair_diff: |g1−g2| → approaches 0 when groups have equal kinematics,
-        #               providing a direct measure of the gluino mass equality signal.
-        pair_sum  = g1_rep + g2_rep            # (batch, N, d_model)
-        pair_diff = (g1_rep - g2_rep).abs()    # (batch, N, d_model)
+        #    pair_sum:      centroid — both groups contribute equally.
+        #    pair_abs_diff: |g1−g2| → approaches 0 when groups have equal kinematics,
+        #                   providing a direct measure of the gluino mass equality signal.
+        pair_sum      = g1_rep + g2_rep            # (batch, N, d_model)
+        pair_abs_diff = (g1_rep - g2_rep).abs()    # (batch, N, d_model)
 
         # 5. ISR jet embedding for each assignment.
         #    For 7-jet mode: look up the specific ISR candidate's embedding.
@@ -530,7 +533,7 @@ class JetAssignmentTransformer(nn.Module):
 
         # 8. Score each assignment with the unified MLP.
         scorer_input = torch.cat(
-            [pair_sum, pair_diff, isr_emb, global_expanded, physics_normed],
+            [pair_sum, pair_abs_diff, isr_emb, global_expanded, physics_normed],
             dim=-1,
         )  # (batch, N, 4*d_model + n_group_physics)
         logits = self.assignment_scorer(scorer_input).squeeze(-1)  # (batch, N)
