@@ -212,6 +212,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
     tf_end = tc.get("tf_end", 0.3)
     tf_decay_epochs = tc.get("tf_decay_epochs", 100)
     lambda_isr = tc.get("lambda_isr", 1.0)
+    lambda_isr_direct_max = tc.get("lambda_isr_direct", 0.0)
     lambda_sym_max = tc.get("lambda_sym", 0.0)
     lambda_qcd_max = tc.get("lambda_qcd", 0.0)
     lambda_sym_rampup = tc.get("lambda_sym_rampup", 0)
@@ -223,6 +224,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
     # Ramp-up periods for new losses
     lambda_isr_aux_rampup = tc.get("lambda_isr_aux_rampup", 10)
     lambda_infonce_rampup = tc.get("lambda_infonce_rampup", 10)
+    lambda_isr_direct_rampup = tc.get("lambda_isr_direct_rampup", 10)
 
     for epoch in range(tc["num_epochs"]):
         cosine_with_warmup(
@@ -270,6 +272,11 @@ def train(config_path: str | None = None, data_path: str | None = None):
         else:
             lambda_infonce = lambda_infonce_max
 
+        if lambda_isr_direct_rampup > 0:
+            lambda_isr_direct = lambda_isr_direct_max * min(1.0, epoch / lambda_isr_direct_rampup)
+        else:
+            lambda_isr_direct = lambda_isr_direct_max
+
         # Training
         model.train()
         train_metrics = _run_epoch(
@@ -278,7 +285,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
             tf_ratio=tf_ratio, lambda_sym=lambda_sym, lambda_qcd=lambda_qcd,
             lambda_isr=lambda_isr,
             lambda_isr_aux=lambda_isr_aux, lambda_infonce=lambda_infonce,
-            lambda_hard=lambda_hard, label_smoothing=label_smoothing,
+            lambda_isr_direct=lambda_isr_direct, lambda_hard=lambda_hard, label_smoothing=label_smoothing,
         )
 
         # Validation (no augmentation, no auxiliary losses)
@@ -290,7 +297,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 tf_ratio=0.0, lambda_sym=0.0, lambda_qcd=0.0,
                 lambda_isr=lambda_isr,
                 lambda_isr_aux=0.0, lambda_infonce=0.0,
-                lambda_hard=0.0, label_smoothing=label_smoothing,
+                lambda_isr_direct=0.0, lambda_hard=0.0, label_smoothing=label_smoothing,
             )
 
         # Log
@@ -441,7 +448,8 @@ def permute_jets_and_remap_labels(four_mom, labels, model, device):
 def _run_epoch(
     model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optimizer=None,
     tf_ratio=1.0, lambda_sym=0.0, lambda_qcd=0.0, lambda_isr=1.0,
-    lambda_isr_aux=0.0, lambda_infonce=0.0, lambda_hard=0.0, label_smoothing=0.0,
+    lambda_isr_aux=0.0, lambda_infonce=0.0, lambda_isr_direct=0.0, lambda_hard=0.0,
+    label_smoothing=0.0,
 ):
     """Run one epoch of training or validation."""
     total_loss = 0.0
@@ -489,6 +497,18 @@ def _run_epoch(
         output = model(four_mom)
         logits = output["logits"]
         mass_pred = output["mass_pred"].squeeze(-1)
+        isr_labels = None
+        event_weight = None
+        is_hard = None
+        if factored:
+            with torch.no_grad():
+                isr_labels = model.flat_to_factored[labels, 0]
+                px_j = four_mom[..., 1]
+                py_j = four_mom[..., 2]
+                pt_j = torch.sqrt(px_j ** 2 + py_j ** 2 + 1e-8)
+                min_pt_pos = pt_j.argmin(dim=1)                  # (batch,)
+                is_hard = (isr_labels != min_pt_pos).float()     # 1 if hard case
+                event_weight = 1.0 + lambda_hard * is_hard       # (batch,)
 
         # ── Assignment loss ────────────────────────────────────────────────────
         # Legacy factored path (old architecture with separate isr_logits).
@@ -521,15 +541,6 @@ def _run_epoch(
             # case.  Upweighting these events directs gradient toward learning the
             # genuine kinematic discriminants.
             if factored and lambda_hard > 0:
-                with torch.no_grad():
-                    px_j = four_mom[..., 1]
-                    py_j = four_mom[..., 2]
-                    pt_j = torch.sqrt(px_j ** 2 + py_j ** 2 + 1e-8)
-                    min_pt_pos = pt_j.argmin(dim=1)                  # (batch,)
-                    isr_pos = model.isr_indices[labels]              # (batch,)
-                    is_hard = (isr_pos != min_pt_pos).float()        # 1 if hard case
-                    event_weight = 1.0 + lambda_hard * is_hard       # (batch,)
-
                 loss_ce_per = F.cross_entropy(
                     logits, labels, reduction="none", label_smoothing=label_smoothing
                 )
@@ -546,6 +557,30 @@ def _run_epoch(
             grouping_labels = model.flat_to_factored[labels, 1]
             total_isr_correct += (model.flat_to_factored[flat_pred, 0] == isr_labels).sum().item()
             total_grp_correct += (model.flat_to_factored[flat_pred, 1] == grouping_labels).sum().item()
+
+        # ── Direct ISR supervision from marginalized assignment logits ──────────
+        # Collapse flat logits to a 7-way ISR problem by taking the best grouping
+        # logit per ISR candidate, then apply CE against true ISR index.
+        # This targets the observed failure mode where assignment CE improves while
+        # ISR identification remains stuck near 0.5.
+        if (
+            factored
+            and lambda_isr_direct > 0
+            and hasattr(model, "factored_to_flat")
+            and "isr_logits" not in output
+        ):
+            logits_fac = logits[:, model.factored_to_flat.reshape(-1)].reshape(
+                batch_size, model.num_jets, model.num_groupings
+            )
+            isr_logits_direct = logits_fac.max(dim=2).values  # (batch, 7)
+            if lambda_hard > 0:
+                loss_isr_direct_per = F.cross_entropy(
+                    isr_logits_direct, isr_labels, reduction="none"
+                )
+                loss_isr_direct = (loss_isr_direct_per * event_weight).mean()
+            else:
+                loss_isr_direct = F.cross_entropy(isr_logits_direct, isr_labels)
+            loss_ce = loss_ce + lambda_isr_direct * loss_isr_direct
 
         # ── InfoNCE on single-swap neighbours ─────────────────────────────────
         # For each event, we compute two focused CE losses using the flat logits:

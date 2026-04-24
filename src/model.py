@@ -319,6 +319,9 @@ class JetAssignmentTransformer(nn.Module):
         # (ISR not the softest jet) without depending on the assignment head.
         if self.has_isr:
             self.isr_aux_head = nn.Linear(d_model, 1)
+            # Learnable calibration for injecting ISR auxiliary evidence directly
+            # into assignment logits via assignment->ISR index projection.
+            self.isr_aux_logit_scale = nn.Parameter(torch.tensor(1.0))
 
         # Adversarial mass decorrelation head (gradient reversal)
         self.gradient_reversal = GradientReversalLayer()
@@ -685,7 +688,16 @@ class JetAssignmentTransformer(nn.Module):
         )  # (batch, N, 5*d_model + n_group_physics)
         logits = self.assignment_scorer(scorer_input).squeeze(-1)  # (batch, N)
 
-        # 9. Adversarial mass prediction (gradient reversed for decorrelation)
+        # 9. Inject ISR auxiliary evidence into assignment logits.
+        #    isr_aux_logits: per-jet ISR score (batch, J)
+        #    projected to per-assignment ISR score (batch, N) by indexing each
+        #    assignment's ISR candidate and added as a calibrated bias term.
+        isr_aux_logits = None
+        if self.has_isr:
+            isr_aux_logits = self.isr_aux_head(jet_emb).squeeze(-1)  # (batch, J)
+            logits = logits + self.isr_aux_logit_scale * isr_aux_logits[:, self.isr_indices]
+
+        # 10. Adversarial mass prediction (gradient reversed for decorrelation)
         mass_pred = self.predict_mass(jet_emb)
 
         result = {
@@ -694,11 +706,11 @@ class JetAssignmentTransformer(nn.Module):
             "mass_pred": mass_pred,
         }
 
-        # 10. ISR auxiliary logits: per-jet binary ISR score.
+        # 11. ISR auxiliary logits: per-jet binary ISR score.
         #     Provides direct ISR supervision targeting the hard case
         #     (ISR not the softest jet in the event).
         if self.has_isr:
-            result["isr_aux_logits"] = self.isr_aux_head(jet_emb).squeeze(-1)  # (batch, J)
+            result["isr_aux_logits"] = isr_aux_logits
 
         return result
 

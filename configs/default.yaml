@@ -32,6 +32,12 @@ training:
   # Focuses gradient on the most confusable wrong assignments.
   lambda_infonce: 0.5
   lambda_infonce_rampup: 10
+  # Direct ISR CE from marginalized flat logits (7-way over ISR candidates):
+  # for each ISR, take best grouping score then supervise ISR directly.
+  # This addresses the failure mode where assignment accuracy rises but ISR
+  # accuracy stalls near 0.5.
+  lambda_isr_direct: 1.0
+  lambda_isr_direct_rampup: 10
   # Hard-case reweighting: upweight events where ISR is not the lowest-pT jet.
   # The model has a shortcut "last slot = lowest pT = ISR" that works ~50% of
   # the time; this extra weight steers it toward kinematic discriminants instead.
