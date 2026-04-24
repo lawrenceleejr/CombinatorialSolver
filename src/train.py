@@ -133,16 +133,21 @@ def train(config_path: str | None = None, data_path: str | None = None):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
     if model.has_isr:
-        print(f"Architecture: factored (ISR {model.num_jets}-way + grouping {model.num_groupings}-way)")
+        if hasattr(model, "isr_head"):
+            print(f"Architecture: factored (ISR {model.num_jets}-way + grouping {model.num_groupings}-way)")
+        else:
+            print(f"Architecture: joint flat ({model.num_assignments}-way, no factored ISR head)")
     else:
         print(f"Architecture: flat ({model.num_assignments}-way)")
 
-    # Optimizer — separate param groups so ISR head gets a higher LR to avoid
-    # being drowned out by grouping/GroupTransformer gradients.
+    # Optimizer — use a single parameter group for the new flat architecture.
+    # The isr_lr_multiplier config key is retained for backward compatibility
+    # but is only applied when the model still has a separate isr_head
+    # (the prior factored architecture).
     isr_lr_mult = tc.get("isr_lr_multiplier", 1.0)
     base_lr = tc["learning_rate"]
 
-    if model.has_isr and isr_lr_mult != 1.0:
+    if model.has_isr and isr_lr_mult != 1.0 and hasattr(model, "isr_head"):
         isr_params = (
             list(model.isr_head.parameters())
             + list(model.grouping_summary_proj.parameters())
@@ -408,6 +413,16 @@ def _run_epoch(
         else:
             loss_ce = ce_loss_fn(logits, labels)
             eval_logits = logits  # flat mode: raw logits are already the correct score
+
+        # For the new flat architecture (factored=True but no isr_logits), derive
+        # ISR and grouping accuracy from the flat predicted assignment.  This keeps
+        # epoch logs consistent regardless of which model variant is used.
+        if factored and "isr_logits" not in output:
+            flat_pred = eval_logits.argmax(dim=-1)
+            isr_labels = model.flat_to_factored[labels, 0]
+            grouping_labels = model.flat_to_factored[labels, 1]
+            total_isr_correct += (model.flat_to_factored[flat_pred, 0] == isr_labels).sum().item()
+            total_grp_correct += (model.flat_to_factored[flat_pred, 1] == grouping_labels).sum().item()
 
         # Mass symmetry auxiliary loss: minimize expected |m1-m2|/(m1+m2) over assignments
         if lambda_sym > 0 and "mass_asym_flat" in output:
