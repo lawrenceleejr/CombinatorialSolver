@@ -220,7 +220,6 @@ def train(config_path: str | None = None, data_path: str | None = None):
     lambda_isr_aux_max  = tc.get("lambda_isr_aux", 0.0)
     lambda_infonce_max  = tc.get("lambda_infonce", 0.0)
     lambda_hard         = tc.get("lambda_hard", 0.0)
-    label_smoothing_val = tc.get("label_smoothing", 0.0)
     # Ramp-up periods for new losses
     lambda_isr_aux_rampup = tc.get("lambda_isr_aux_rampup", 10)
     lambda_infonce_rampup = tc.get("lambda_infonce_rampup", 10)
@@ -279,7 +278,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
             tf_ratio=tf_ratio, lambda_sym=lambda_sym, lambda_qcd=lambda_qcd,
             lambda_isr=lambda_isr,
             lambda_isr_aux=lambda_isr_aux, lambda_infonce=lambda_infonce,
-            lambda_hard=lambda_hard, label_smoothing=label_smoothing_val,
+            lambda_hard=lambda_hard, label_smoothing=label_smoothing,
         )
 
         # Validation (no augmentation, no auxiliary losses)
@@ -291,7 +290,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 tf_ratio=0.0, lambda_sym=0.0, lambda_qcd=0.0,
                 lambda_isr=lambda_isr,
                 lambda_isr_aux=0.0, lambda_infonce=0.0,
-                lambda_hard=0.0, label_smoothing=label_smoothing_val,
+                lambda_hard=0.0, label_smoothing=label_smoothing,
             )
 
         # Log

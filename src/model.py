@@ -184,8 +184,9 @@ class JetAssignmentTransformer(nn.Module):
          attention biases; no position embedding.
       2. GroupTransformer applied to all candidate 3-jet groups in parallel.
       3. Per-assignment symmetric pair features:
-           pair_sum  = g1_rep + g2_rep     (swap-invariant centroid)
-           pair_diff = |g1_rep − g2_rep|   (→ 0 for kinematically equal groups)
+           pair_sum     = g1 + g2             (swap-invariant centroid)
+           pair_prod    = g1 * g2             (elementwise cross term)
+           pair_sqdiff  = (g1 − g2)²         (→ 0 for kinematically equal groups)
       4. ISR embedding: jet_emb[isr_idx] for each assignment — evaluated jointly
          with the pair quality, not as a separate sequential decision.
       5. Unified MLP scorer → N-way logits.
@@ -261,9 +262,9 @@ class JetAssignmentTransformer(nn.Module):
         )
         self.register_buffer("triplet_attn_mask", triplet_attn_mask)  # (J, T)
 
-        _TRIPLET_NHEAD = min(4, max(1, d_model // 32))
+        triplet_nhead = min(4, max(1, d_model // 32))
         self.triplet_cross_attn = TripletCrossAttentionLayer(
-            d_model=d_model, nhead=_TRIPLET_NHEAD, dropout=dropout
+            d_model=d_model, nhead=triplet_nhead, dropout=dropout
         )
 
         # Shared mini-Transformer for intra-group attention pooling.
