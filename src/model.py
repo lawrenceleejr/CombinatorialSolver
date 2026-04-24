@@ -5,32 +5,47 @@ Architecture:
   1. Input augmentation: append physics-derived features (log_pT, η, sin_φ, cos_φ)
      to raw (E, px, py, pz), giving an 8-dimensional per-jet representation.
   2. Linear projection of the 8-D augmented features to d_model.
-  3. Transformer encoder with self-attention over jet tokens and physics-informed
-     attention biases (pT hierarchy and ΔR proximity, both per-head learnable).
-     No position embedding — jets are permutation-invariant; pT rank is already
-     encoded via the log_pT augmented feature and pt_bias_weight.
-  4. GroupTransformer: mini-Transformer applied to each candidate 3-jet group
+  3. Transformer encoder with self-attention over all jet tokens and three
+     physics-derived per-head pairwise attention biases:
+       - log(pT_i / pT_j)  — momentum hierarchy
+       - ΔR_ij             — angular proximity (jets from same parton cluster)
+       - log(m_ij)         — pairwise invariant mass scale
+     All three biases are scaled by learnable per-head scalar weights
+     (initialised to 0) and applied at every Transformer layer.
+  4. TripletCrossAttentionLayer: jet tokens cross-attend to the C(J,3) triplet
+     bank (35 triplets for J=7), restricted so each jet only sees the
+     C(J-1,2)=15 triplets that contain it.  Gives the jet encoder direct access
+     to 3-body invariant mass structure without enumerating all assignments first.
+  5. GroupTransformer: mini-Transformer applied to each candidate 3-jet group
      to produce a permutation-equivariant group representation.
-  5. Unified flat assignment scoring (N-way, N=70 for 7-jet or N=10 for 6-jet):
-     For each assignment, the scorer sees:
-       pair_sum  = g1_rep + g2_rep       (symmetric: swap g1↔g2 invariant)
-       pair_diff = |g1_rep − g2_rep|     (symmetric; → 0 when groups are equal)
-       isr_emb   = jet_emb[isr_idx]      (ISR candidate in assignment context)
-       global_emb = mean(jet_emb)         (event-level summary)
-       physics   = 24-dim features        (mass, ECF, Dalitz, ΔR)
-     This replaces the prior factored P(ISR) × P(grouping|ISR) decomposition,
-     eliminating the chicken-and-egg dependency and the teacher-forcing
-     train/inference mismatch that limited accuracy to ~42%.
-  6. Adversarial mass decorrelation head (gradient reversal).
-  7. Physics features per assignment:
+  6. Unified flat assignment scoring (N-way, N=70 for 7-jet or N=10 for 6-jet):
+     For each assignment, the scorer sees three symmetric pair features,
+       pair_sum  = g1 + g2         (swap g1↔g2 invariant centroid)
+       pair_prod = g1 * g2         (elementwise product; second-order cross term)
+       pair_sqdiff = (g1-g2)²     (→ 0 when groups have equal kinematics)
+     plus isr_emb, global_emb, and 24 physics features (mass/ECF/Dalitz/ΔR).
+     This is the full second-order symmetric decomposition (a+b, a·b, (a-b)²).
+  7. ISR auxiliary head: per-jet binary logit for direct ISR identification
+     supervision, providing a training signal that specifically targets the
+     hard case (ISR not the softest jet).
+  8. Adversarial mass decorrelation head (gradient reversal).
+  9. Physics features per assignment:
      - 6 inter-group: mass_sum, mass_asym, mass_ratio, m1, m2, ΔR(G1,G2)
      - 9 intra-group per group: pT hierarchy, Lund kT, ECF₂, ECF₃, D₂, Dalitz masses
      Total n_group_physics = 24
+
+Training augmentations applied per-event:
+  - φ rotation (azimuthal symmetry — exact)
+  - η flip (parity — exact)
+  - Random jet order permutation with label remapping — breaks the pT-rank
+    positional shortcut ("last jet = lowest pT = likely ISR") forcing the model
+    to use relative kinematic features rather than slot position.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from itertools import combinations
 
 from .combinatorics import build_assignment_tensors, build_factored_tensors
 from .utils import compute_invariant_mass
@@ -97,6 +112,55 @@ class GroupTransformer(nn.Module):
         return self.encoder(x).mean(dim=1)
 
 
+class TripletCrossAttentionLayer(nn.Module):
+    """Cross-attention from jet tokens to the C(J,3) 3-jet triplet bank.
+
+    Enriches each jet's representation with explicit 3-body invariant mass
+    structure without having to enumerate all 70 assignments first.
+
+    The attention is *jet-restricted*: each jet query can only attend to the
+    C(J-1,2) triplets that contain it (15 of 35 for J=7).  This prevents
+    cross-contamination between disjoint jet sets and focuses the model on
+    physically relevant 3-body combinations — exactly those that could belong
+    to the gluino decay the jet participates in.
+    """
+
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.1):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model),
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        jet_emb: torch.Tensor,
+        triplet_emb: torch.Tensor,
+        attn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            jet_emb:    (batch, J, d_model) — jet token queries
+            triplet_emb:(batch, T, d_model) — triplet keys/values; T = C(J,3)
+            attn_mask:  (J, T) additive float mask — float('-inf') for non-member
+                        positions (broadcast over batch and heads)
+
+        Returns:
+            (batch, J, d_model) enriched jet embeddings
+        """
+        out, _ = self.cross_attn(jet_emb, triplet_emb, triplet_emb, attn_mask=attn_mask)
+        jet_emb = self.norm1(jet_emb + out)
+        jet_emb = self.norm2(jet_emb + self.ff(jet_emb))
+        return jet_emb
+
+
 class JetAssignmentTransformer(nn.Module):
     """Joint-assignment Transformer for gluino pair production.
 
@@ -153,17 +217,13 @@ class JetAssignmentTransformer(nn.Module):
         self._n_derived = 4
         self.input_proj = nn.Linear(input_dim + self._n_derived, d_model)
 
-        # Physics-informed attention biases (per-head, init=0 → no effect at start)
-        self.pt_bias_weight = nn.Parameter(torch.zeros(nhead))
-        # ΔR bias: jets from the same parton shower cluster in angular space.
-        self.dr_bias_weight = nn.Parameter(torch.zeros(nhead))
-
-        # No position embedding: jets are permutation-invariant.
-        # pT rank is already encoded via the augmented log_pT feature and the
-        # learnable pt_bias_weight attention bias.  A position embedding encodes
-        # pT-rank as an absolute prior that biases the model toward identifying
-        # the last (lowest-pT) jet as ISR — exactly wrong for the hard case
-        # where ISR is not the softest jet in the event.
+        # Physics-informed per-head pairwise attention biases.
+        # All initialised to 0 so the model starts with isotropic attention and
+        # gradually learns which physical quantities to use.
+        # Applied at every Transformer layer via the mask argument.
+        self.pt_bias_weight   = nn.Parameter(torch.zeros(nhead))  # log(pT_i/pT_j)
+        self.dr_bias_weight   = nn.Parameter(torch.zeros(nhead))  # ΔR_ij
+        self.mass_bias_weight = nn.Parameter(torch.zeros(nhead))  # log(m_ij)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -176,6 +236,34 @@ class JetAssignmentTransformer(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer,
             num_layers=num_layers,
+        )
+
+        # Triplet cross-attention bank.
+        # All C(num_jets, 3) triplets are enumerated as a buffer; each jet
+        # attends only to the C(num_jets-1, 2) triplets containing it
+        # (jet-restricted mask).
+        triplet_idx_list = list(combinations(range(num_jets), 3))
+        n_triplets = len(triplet_idx_list)
+        self.register_buffer(
+            "triplet_indices",
+            torch.tensor(triplet_idx_list, dtype=torch.long),  # (T, 3)
+        )
+        # Build jet-restricted additive attention mask: (J, T)
+        # 0.0 for triplets containing jet j, -inf for all others.
+        membership = torch.zeros(num_jets, n_triplets, dtype=torch.bool)
+        for t_idx, triplet in enumerate(triplet_idx_list):
+            for j in triplet:
+                membership[j, t_idx] = True
+        triplet_attn_mask = torch.where(
+            membership,
+            torch.zeros(num_jets, n_triplets),
+            torch.full((num_jets, n_triplets), float("-inf")),
+        )
+        self.register_buffer("triplet_attn_mask", triplet_attn_mask)  # (J, T)
+
+        _TRIPLET_NHEAD = min(4, max(1, d_model // 32))
+        self.triplet_cross_attn = TripletCrossAttentionLayer(
+            d_model=d_model, nhead=_TRIPLET_NHEAD, dropout=dropout
         )
 
         # Shared mini-Transformer for intra-group attention pooling.
@@ -202,19 +290,19 @@ class JetAssignmentTransformer(nn.Module):
         if self.has_isr:
             ft = build_factored_tensors(num_jets)
             # flat_to_factored: maps flat assignment idx → (isr_idx, grouping_idx)
-            # Used only for ISR/grouping accuracy monitoring, not for the loss.
+            # Used for ISR/grouping accuracy monitoring and InfoNCE loss.
             self.register_buffer("flat_to_factored", ft["flat_to_factored"])  # (N, 2)
-            self.register_buffer("factored_to_flat", ft["factored_to_flat"])  # (7, 10)
+            self.register_buffer("factored_to_flat", ft["factored_to_flat"])  # (J, 10)
             self.num_groupings = ft["num_groupings"]
 
         # Unified assignment scorer.
-        # Input for each assignment:
-        #   pair_sum      (d_model) — symmetric centroid of both groups
-        #   pair_abs_diff (d_model) — |g1−g2|, near-0 for kinematically equal groups
-        #   isr_emb       (d_model) — ISR candidate jet embedding
-        #   global_emb    (d_model) — event-level mean pool
-        #   physics       (n_group_physics=24) — mass, ECF, Dalitz, ΔR features
-        scorer_in_dim = 4 * d_model + self.n_group_physics
+        # Full second-order symmetric pooling of the two group representations:
+        #   pair_sum     (d_model) — g1+g2, swap-invariant centroid
+        #   pair_prod    (d_model) — g1*g2 elementwise, encodes second-order cross term
+        #   pair_sqdiff  (d_model) — (g1-g2)², → 0 for kinematically equal groups
+        # Together (a+b, a·b, (a-b)²) span the full symmetric second-order space.
+        # Combined with isr_emb, global_emb and 24 physics features.
+        scorer_in_dim = 5 * d_model + self.n_group_physics
         self.assignment_scorer = nn.Sequential(
             nn.Linear(scorer_in_dim, 2 * d_model),
             nn.GELU(),
@@ -224,6 +312,12 @@ class JetAssignmentTransformer(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(d_model, 1),
         )
+
+        # ISR auxiliary head: per-jet binary logit for direct ISR identification.
+        # Provides a training signal that specifically targets the hard case
+        # (ISR not the softest jet) without depending on the assignment head.
+        if self.has_isr:
+            self.isr_aux_head = nn.Linear(d_model, 1)
 
         # Adversarial mass decorrelation head (gradient reversal)
         self.gradient_reversal = GradientReversalLayer()
@@ -260,6 +354,34 @@ class JetAssignmentTransformer(nn.Module):
         dphi = torch.acos(cos_dphi)
         return torch.sqrt(deta**2 + dphi**2)
 
+    def _compute_mass_bias(self, four_momenta: torch.Tensor) -> torch.Tensor:
+        """Pairwise log invariant mass matrix: log(m_ij). Returns (batch, J, J).
+
+        m_ij = invariant mass of the pair (jet_i + jet_j).  Signal-jet pairs
+        from the same gluino decay cluster at the gluino sub-mass scale, while
+        ISR-signal or ISR-ISR pairs have different (often larger) invariant
+        masses.  This bias helps attention heads encode the 2-body mass
+        structure that complements the 3-body information from the triplet bank.
+
+        Diagonal is zeroed to avoid singular values for near-massless jets.
+        """
+        p = four_momenta[:, :, :4]   # (batch, J, 4)
+        pi = p.unsqueeze(2)           # (batch, J, 1, 4)
+        pj = p.unsqueeze(1)           # (batch, 1, J, 4)
+        pij = pi + pj                 # (batch, J, J, 4)
+        m2_ij = (
+            pij[..., 0] ** 2
+            - pij[..., 1] ** 2
+            - pij[..., 2] ** 2
+            - pij[..., 3] ** 2
+        )
+        log_m_ij = torch.log(m2_ij.clamp(min=1e-8)) * 0.5  # log(m_ij)
+        # Zero diagonal: self-pair mass is singular for near-massless jets.
+        eye = torch.eye(
+            self.num_jets, device=four_momenta.device, dtype=torch.bool
+        ).unsqueeze(0)
+        return log_m_ij.masked_fill(eye, 0.0)
+
     def _augment_jet_features(self, four_momenta: torch.Tensor) -> torch.Tensor:
         """Append physics-derived features to raw 4-vectors.
 
@@ -287,18 +409,38 @@ class JetAssignmentTransformer(nn.Module):
         return dphi - 2 * torch.pi * torch.round(dphi / (2 * torch.pi))
 
     def encode_jets(self, four_momenta: torch.Tensor) -> torch.Tensor:
+        """Encode all jets with physics-informed attention biases and triplet cross-attention.
+
+        Steps:
+          1. Augment raw 4-vectors with derived features → project to d_model.
+          2. Main Transformer encoder with three pairwise biases
+             (log-pT-ratio, ΔR, log-m_ij) applied at every layer.
+          3. Build triplet bank: mean of each C(J,3) triplet embedding.
+          4. TripletCrossAttentionLayer: jets attend to their member triplets
+             (jet-restricted), enriching each jet with 3-body mass information.
+        """
         x = self.input_proj(self._augment_jet_features(four_momenta))
-        # No position embedding added here — see __init__ for rationale.
 
         batch_size = four_momenta.shape[0]
-        pt_bias = self._compute_pt_bias(four_momenta)
-        dr_bias = self._compute_deltaR_bias(four_momenta)
+        pt_bias   = self._compute_pt_bias(four_momenta)
+        dr_bias   = self._compute_deltaR_bias(four_momenta)
+        mass_bias = self._compute_mass_bias(four_momenta)
         attn_bias = (
-            pt_bias.unsqueeze(1) * self.pt_bias_weight.view(1, self.nhead, 1, 1)
+            pt_bias.unsqueeze(1)   * self.pt_bias_weight.view(1, self.nhead, 1, 1)
             + dr_bias.unsqueeze(1) * self.dr_bias_weight.view(1, self.nhead, 1, 1)
+            + mass_bias.unsqueeze(1) * self.mass_bias_weight.view(1, self.nhead, 1, 1)
         ).reshape(batch_size * self.nhead, self.num_jets, self.num_jets)
 
-        return self.transformer_encoder(x, mask=attn_bias)
+        # Main encoder: biases are applied at every layer (PyTorch distributes
+        # the mask argument to each TransformerEncoderLayer automatically).
+        x = self.transformer_encoder(x, mask=attn_bias)
+
+        # Triplet cross-attention: enrich jet embeddings with 3-body structure.
+        # triplet_emb[b, t] = mean of the 3 jet embeddings in triplet t.
+        triplet_emb = x[:, self.triplet_indices, :].mean(dim=2)  # (batch, T, d_model)
+        x = self.triplet_cross_attn(x, triplet_emb, self.triplet_attn_mask)
+
+        return x
 
     @staticmethod
     def _intra_group_features(jets_4vec: torch.Tensor) -> torch.Tensor:
@@ -482,11 +624,13 @@ class JetAssignmentTransformer(nn.Module):
           - ``mass_asym_flat``: (batch, N) |m1−m2|/(m1+m2) per assignment.
             Used by the optional mass-symmetry auxiliary loss.
           - ``mass_pred``: (batch, 1) adversarial mass prediction.
+          - ``isr_aux_logits`` (7-jet only): (batch, J) per-jet ISR binary logit.
+            Used by the ISR-aux BCE loss to provide direct ISR supervision.
         """
         batch_size = four_momenta.shape[0]
         N = self.num_assignments
 
-        # 1. Encode all jets: (batch, J, d_model)
+        # 1. Encode all jets with triplet cross-attention: (batch, J, d_model)
         jet_emb = self.encode_jets(four_momenta)
 
         # 2. Global event embedding: mean pool over jets → (batch, d_model)
@@ -506,12 +650,14 @@ class JetAssignmentTransformer(nn.Module):
             g2_jets_emb.reshape(batch_size * N, 3, self.d_model)
         ).reshape(batch_size, N, self.d_model)
 
-        # 4. Symmetric pair features (invariant to swapping the two gluino groups).
-        #    pair_sum:      centroid — both groups contribute equally.
-        #    pair_abs_diff: |g1−g2| → approaches 0 when groups have equal kinematics,
-        #                   providing a direct measure of the gluino mass equality signal.
-        pair_sum      = g1_rep + g2_rep            # (batch, N, d_model)
-        pair_abs_diff = (g1_rep - g2_rep).abs()    # (batch, N, d_model)
+        # 4. Full second-order symmetric pair features (swap g1↔g2 invariant).
+        #    (a+b, a·b, (a-b)²) spans the complete symmetric second-order space:
+        #      pair_sum:     centroid — both groups contribute equally
+        #      pair_prod:    elementwise product — cross-term
+        #      pair_sqdiff:  (g1−g2)² element-wise → 0 for kinematically equal groups
+        pair_sum     = g1_rep + g2_rep             # (batch, N, d_model)
+        pair_prod    = g1_rep * g2_rep             # (batch, N, d_model)
+        pair_sqdiff  = (g1_rep - g2_rep) ** 2     # (batch, N, d_model)
 
         # 5. ISR jet embedding for each assignment.
         #    For 7-jet mode: look up the specific ISR candidate's embedding.
@@ -533,19 +679,27 @@ class JetAssignmentTransformer(nn.Module):
 
         # 8. Score each assignment with the unified MLP.
         scorer_input = torch.cat(
-            [pair_sum, pair_abs_diff, isr_emb, global_expanded, physics_normed],
+            [pair_sum, pair_prod, pair_sqdiff, isr_emb, global_expanded, physics_normed],
             dim=-1,
-        )  # (batch, N, 4*d_model + n_group_physics)
+        )  # (batch, N, 5*d_model + n_group_physics)
         logits = self.assignment_scorer(scorer_input).squeeze(-1)  # (batch, N)
 
         # 9. Adversarial mass prediction (gradient reversed for decorrelation)
         mass_pred = self.predict_mass(jet_emb)
 
-        return {
+        result = {
             "logits": logits,
             "mass_asym_flat": mass_asym_flat,
             "mass_pred": mass_pred,
         }
+
+        # 10. ISR auxiliary logits: per-jet binary ISR score.
+        #     Provides direct ISR supervision targeting the hard case
+        #     (ISR not the softest jet in the event).
+        if self.has_isr:
+            result["isr_aux_logits"] = self.isr_aux_head(jet_emb).squeeze(-1)  # (batch, J)
+
+        return result
 
 
 class MassAsymmetryClassicalSolver(nn.Module):

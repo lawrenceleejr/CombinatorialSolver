@@ -15,17 +15,27 @@ training:
   patience: 40
   lambda_adv: 0.0
   lambda_adv_rampup: 50
-  # Mass-symmetry auxiliary loss: expected |m1-m2|/(m1+m2) over the assignment
-  # probability distribution.  Raised from 0.05 to 0.2 because in the new flat
-  # architecture mass equality is the primary physics signal — the pair_diff
-  # embedding feature already encodes this, but an explicit loss term guides the
-  # model faster toward symmetric solutions.
+  # Mass-symmetry auxiliary loss
   lambda_sym: 0.2
   lambda_sym_rampup: 20
   lambda_qcd: 0.1
   lambda_qcd_rampup: 20
-  # Label smoothing for CrossEntropyLoss — prevents overconfidence (entropy collapse).
+  # Label smoothing for CrossEntropyLoss — prevents overconfidence
   label_smoothing: 0.1
+  # ISR auxiliary BCE loss: per-jet binary ISR identification.
+  # Provides direct gradient for the hard case (ISR not the softest jet).
+  lambda_isr_aux: 0.5
+  lambda_isr_aux_rampup: 10
+  # InfoNCE on single-swap neighbours:
+  #   grouping InfoNCE (10-way CE, correct-ISR groupings) +
+  #   ISR InfoNCE (7-way CE, best-grouping per ISR).
+  # Focuses gradient on the most confusable wrong assignments.
+  lambda_infonce: 0.5
+  lambda_infonce_rampup: 10
+  # Hard-case reweighting: upweight events where ISR is not the lowest-pT jet.
+  # The model has a shortcut "last slot = lowest pT = ISR" that works ~50% of
+  # the time; this extra weight steers it toward kinematic discriminants instead.
+  lambda_hard: 2.0
 
 data:
   normalize_by_ht: true

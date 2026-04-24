@@ -17,6 +17,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.onnx
 from torch.utils.data import DataLoader, random_split
 
@@ -215,6 +216,14 @@ def train(config_path: str | None = None, data_path: str | None = None):
     lambda_qcd_max = tc.get("lambda_qcd", 0.0)
     lambda_sym_rampup = tc.get("lambda_sym_rampup", 0)
     lambda_qcd_rampup = tc.get("lambda_qcd_rampup", 0)
+    # New auxiliary loss weights (default to 0 for backward compatibility)
+    lambda_isr_aux_max  = tc.get("lambda_isr_aux", 0.0)
+    lambda_infonce_max  = tc.get("lambda_infonce", 0.0)
+    lambda_hard         = tc.get("lambda_hard", 0.0)
+    label_smoothing_val = tc.get("label_smoothing", 0.0)
+    # Ramp-up periods for new losses
+    lambda_isr_aux_rampup = tc.get("lambda_isr_aux_rampup", 10)
+    lambda_infonce_rampup = tc.get("lambda_infonce_rampup", 10)
 
     for epoch in range(tc["num_epochs"]):
         cosine_with_warmup(
@@ -252,6 +261,16 @@ def train(config_path: str | None = None, data_path: str | None = None):
         else:
             lambda_qcd = lambda_qcd_max
 
+        if lambda_isr_aux_rampup > 0:
+            lambda_isr_aux = lambda_isr_aux_max * min(1.0, epoch / lambda_isr_aux_rampup)
+        else:
+            lambda_isr_aux = lambda_isr_aux_max
+
+        if lambda_infonce_rampup > 0:
+            lambda_infonce = lambda_infonce_max * min(1.0, epoch / lambda_infonce_rampup)
+        else:
+            lambda_infonce = lambda_infonce_max
+
         # Training
         model.train()
         train_metrics = _run_epoch(
@@ -259,9 +278,11 @@ def train(config_path: str | None = None, data_path: str | None = None):
             lambda_adv, device, optimizer=optimizer,
             tf_ratio=tf_ratio, lambda_sym=lambda_sym, lambda_qcd=lambda_qcd,
             lambda_isr=lambda_isr,
+            lambda_isr_aux=lambda_isr_aux, lambda_infonce=lambda_infonce,
+            lambda_hard=lambda_hard, label_smoothing=label_smoothing_val,
         )
 
-        # Validation (no augmentation, no teacher forcing: tf_ratio=0 = pure end-to-end)
+        # Validation (no augmentation, no auxiliary losses)
         model.eval()
         with torch.no_grad():
             val_metrics = _run_epoch(
@@ -269,6 +290,8 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 lambda_adv, device, optimizer=None,
                 tf_ratio=0.0, lambda_sym=0.0, lambda_qcd=0.0,
                 lambda_isr=lambda_isr,
+                lambda_isr_aux=0.0, lambda_infonce=0.0,
+                lambda_hard=0.0, label_smoothing=label_smoothing_val,
             )
 
         # Log
@@ -337,9 +360,89 @@ def train(config_path: str | None = None, data_path: str | None = None):
     export_onnx(model, dc["num_jets"], device, best_val_acc)
 
 
+def permute_jets_and_remap_labels(four_mom, labels, model, device):
+    """Randomly shuffle jet order per event and remap assignment labels accordingly.
+
+    Jets are pT-sorted by the dataset, which gives the model a positional shortcut:
+    "last jet (index 6) = lowest pT = likely ISR."  Randomly permuting the jet
+    order during training forces the model to use kinematic features (relative
+    pT ratios, ΔR, pairwise masses) rather than slot position to identify the
+    ISR jet and signal groupings.
+
+    Zero-padded ISR slots (when no ISR jet exists in the event) get mixed into
+    random positions, so the model must learn to identify them by their all-zero
+    feature vector rather than by being last.
+
+    Args:
+        four_mom: (batch, J, 4) input four-momenta (pT-sorted)
+        labels:   (batch,) assignment label indices (in original sorted order)
+        model:    JetAssignmentTransformer — provides isr_indices, group1/2_indices
+        device:   torch device
+
+    Returns:
+        four_mom_perm: (batch, J, 4) permuted four-momenta
+        labels_perm:   (batch,) remapped labels consistent with permuted ordering
+    """
+    batch_size, num_jets = four_mom.shape[:2]
+
+    # Vectorised random permutation: argsort of uniform noise gives uniform perms.
+    # perms[b, new_pos] = old_pos  →  four_mom_perm[b, new_pos] = four_mom[b, old_pos]
+    perms = torch.rand(batch_size, num_jets, device=device).argsort(dim=1)
+
+    # Permute four-momenta
+    perm_expand = perms.unsqueeze(-1).expand(-1, -1, four_mom.shape[2])
+    four_mom_perm = torch.gather(four_mom, 1, perm_expand)
+
+    # Compute inverse permutations: inv_perms[b, old_pos] = new_pos
+    inv_perms = torch.zeros_like(perms)
+    inv_perms.scatter_(
+        1, perms,
+        torch.arange(num_jets, device=device).unsqueeze(0).expand(batch_size, -1),
+    )
+
+    # Original ISR and group jet positions (in the old pT-sorted ordering).
+    # model.isr_indices[label] = ISR jet index for that assignment (-1 for 6-jet mode).
+    isr_old = model.isr_indices[labels]          # (batch,)
+    g1_old  = model.group1_indices[labels, :]    # (batch, 3)
+    g2_old  = model.group2_indices[labels, :]    # (batch, 3)
+
+    # Apply inverse permutation to get new jet positions.
+    # For 6-jet mode (isr_old == -1): clamp to 0 for valid gather, restore -1 after.
+    isr_valid = isr_old.clamp(min=0).unsqueeze(1)
+    isr_new = inv_perms.gather(1, isr_valid).squeeze(1)
+    isr_new = torch.where(isr_old < 0, isr_old, isr_new)  # restore -1 for 6-jet
+
+    g1_new = inv_perms.gather(1, g1_old.long())   # (batch, 3)
+    g2_new = inv_perms.gather(1, g2_old.long())   # (batch, 3)
+
+    # Sort within each group to get canonical form (ascending jet index).
+    g1_new_s, _ = g1_new.sort(dim=1)   # (batch, 3)
+    g2_new_s, _ = g2_new.sort(dim=1)   # (batch, 3)
+
+    # Find the new flat assignment label by matching (isr_new, g1_new, g2_new)
+    # against all N canonical assignments.  We check both orderings of the two
+    # groups since canonical form may have swapped them (g1 < g2 lexicographically).
+    all_isr = model.isr_indices.unsqueeze(0)    # (1, N)
+    all_g1  = model.group1_indices.unsqueeze(0) # (1, N, 3)
+    all_g2  = model.group2_indices.unsqueeze(0) # (1, N, 3)
+
+    isr_match = isr_new.unsqueeze(1) == all_isr                          # (batch, N)
+    g1s_g1 = (g1_new_s.unsqueeze(1) == all_g1).all(dim=2)               # (batch, N)
+    g2s_g2 = (g2_new_s.unsqueeze(1) == all_g2).all(dim=2)               # (batch, N)
+    g1s_g2 = (g1_new_s.unsqueeze(1) == all_g2).all(dim=2)               # (batch, N)
+    g2s_g1 = (g2_new_s.unsqueeze(1) == all_g1).all(dim=2)               # (batch, N)
+
+    grp_match  = (g1s_g1 & g2s_g2) | (g1s_g2 & g2s_g1)                 # (batch, N)
+    full_match = isr_match & grp_match                                   # (batch, N)
+
+    labels_perm = full_match.long().argmax(dim=1)   # (batch,)
+    return four_mom_perm, labels_perm
+
+
 def _run_epoch(
     model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optimizer=None,
     tf_ratio=1.0, lambda_sym=0.0, lambda_qcd=0.0, lambda_isr=1.0,
+    lambda_isr_aux=0.0, lambda_infonce=0.0, lambda_hard=0.0, label_smoothing=0.0,
 ):
     """Run one epoch of training or validation."""
     total_loss = 0.0
@@ -356,14 +459,15 @@ def _run_epoch(
         four_mom = batch["four_momenta"].to(device)
         labels = batch["label"].to(device)
         parent_mass = batch["parent_mass"].to(device)
+        batch_size = labels.shape[0]
 
-        # φ/η augmentation during training (hard symmetries of the problem)
+        # Training-time augmentations
         if optimizer is not None:
             four_mom = four_mom.clone()
-            batch_size = four_mom.shape[0]
 
+            # φ rotation (azimuthal symmetry — exact) and η flip (parity — exact)
             theta = torch.rand(batch_size, device=device) * 2 * torch.pi
-            cos_t = theta.cos().view(-1, 1)   # (batch, 1) for broadcasting over jets
+            cos_t = theta.cos().view(-1, 1)
             sin_t = theta.sin().view(-1, 1)
             px_orig = four_mom[:, :, 1].clone()
             py_orig = four_mom[:, :, 2].clone()
@@ -373,11 +477,22 @@ def _run_epoch(
             flip = (torch.rand(batch_size, device=device) > 0.5).float().view(-1, 1)
             four_mom[:, :, 3] = four_mom[:, :, 3] * (1.0 - 2.0 * flip)
 
+            # Random jet order permutation — breaks the pT-rank positional shortcut.
+            # The dataset sorts jets by descending pT so "last slot = lowest pT = ISR"
+            # is a cheap heuristic.  Shuffling forces the model to use kinematic
+            # relationships (pT ratios, ΔR, m_ij) rather than position.
+            # Labels are remapped to remain consistent with the shuffled ordering.
+            if factored:
+                four_mom, labels = permute_jets_and_remap_labels(
+                    four_mom, labels, model, device
+                )
+
         output = model(four_mom)
         logits = output["logits"]
         mass_pred = output["mass_pred"].squeeze(-1)
 
-        # Assignment loss
+        # ── Assignment loss ────────────────────────────────────────────────────
+        # Legacy factored path (old architecture with separate isr_logits).
         if factored and "isr_logits" in output:
             isr_logits = output["isr_logits"]
             grouping_logits = output["grouping_logits"]
@@ -391,39 +506,93 @@ def _run_epoch(
             gt_grp_logits = grouping_logits[batch_idx, isr_labels]
             loss_grp_tf = ce_loss_fn(gt_grp_logits, grouping_labels)
 
-            # Blend teacher-forced factored loss with flat end-to-end loss
-            # tf_ratio=1: fully teacher-forced (original); tf_ratio=0: flat CE only
-            # lambda_isr upweights the ISR loss to compensate for a gradient imbalance:
-            # each signal jet appears in all num_groupings groupings, so loss_grp_tf
-            # produces num_groupings gradient paths per signal jet while the ISR jet
-            # (excluded from every group) receives gradient only from loss_isr.
-            # Scaling loss_isr by lambda_isr partially rebalances this asymmetry.
             loss_flat = ce_loss_fn(logits, labels)
             loss_ce = tf_ratio * (lambda_isr * loss_isr + loss_grp_tf) + (1.0 - tf_ratio) * loss_flat
 
-            # Use partition-function-corrected logits for accuracy metrics.
-            # logits_eval[j,k] = log P(isr=j) + log P(grp=k|isr=j) gives the
-            # true MAP assignment without the grouping-partition-function bias
-            # present in the raw sum argmax.  The ISR head already incorporates
-            # grouping quality through its input features, so using the raw sum
-            # would double-count that signal.
             eval_logits = output.get("logits_eval", logits)
             flat_pred = eval_logits.argmax(dim=-1)
             total_isr_correct += (model.flat_to_factored[flat_pred, 0] == isr_labels).sum().item()
             total_grp_correct += (model.flat_to_factored[flat_pred, 1] == grouping_labels).sum().item()
         else:
-            loss_ce = ce_loss_fn(logits, labels)
-            eval_logits = logits  # flat mode: raw logits are already the correct score
+            # Flat joint model: single N-way CE, with optional hard-case weighting.
+            #
+            # Hard-case reweighting: events where the ISR jet is NOT the lowest-pT
+            # jet get upweighted.  The model has an easy shortcut ("last jet =
+            # lowest pT = ISR") that works ~50% of the time but fails on the hard
+            # case.  Upweighting these events directs gradient toward learning the
+            # genuine kinematic discriminants.
+            if factored and lambda_hard > 0:
+                with torch.no_grad():
+                    px_j = four_mom[..., 1]
+                    py_j = four_mom[..., 2]
+                    pt_j = torch.sqrt(px_j ** 2 + py_j ** 2 + 1e-8)
+                    min_pt_pos = pt_j.argmin(dim=1)                  # (batch,)
+                    isr_pos = model.isr_indices[labels]              # (batch,)
+                    is_hard = (isr_pos != min_pt_pos).float()        # 1 if hard case
+                    event_weight = 1.0 + lambda_hard * is_hard       # (batch,)
 
-        # For the new flat architecture (factored=True but no isr_logits), derive
-        # ISR and grouping accuracy from the flat predicted assignment.  This keeps
-        # epoch logs consistent regardless of which model variant is used.
+                loss_ce_per = F.cross_entropy(
+                    logits, labels, reduction="none", label_smoothing=label_smoothing
+                )
+                loss_ce = (loss_ce_per * event_weight).mean()
+            else:
+                loss_ce = ce_loss_fn(logits, labels)
+
+            eval_logits = logits
+
+        # ISR and grouping accuracy from flat predictions (flat model path).
         if factored and "isr_logits" not in output:
             flat_pred = eval_logits.argmax(dim=-1)
             isr_labels = model.flat_to_factored[labels, 0]
             grouping_labels = model.flat_to_factored[labels, 1]
             total_isr_correct += (model.flat_to_factored[flat_pred, 0] == isr_labels).sum().item()
             total_grp_correct += (model.flat_to_factored[flat_pred, 1] == grouping_labels).sum().item()
+
+        # ── InfoNCE on single-swap neighbours ─────────────────────────────────
+        # For each event, we compute two focused CE losses using the flat logits:
+        #   1. Grouping InfoNCE (10-way): given the *correct* ISR choice, which of
+        #      the 10 groupings is right?  Sharpens grouping gradients without the
+        #      confounding ISR ambiguity.
+        #   2. ISR InfoNCE (7-way): given the best grouping *per* ISR choice (max
+        #      logit over 10 groupings), which ISR is right?  Sharpens the ISR
+        #      gradient without the confounding grouping ambiguity.
+        # Together these act as InfoNCE over the "single-swap" neighbourhood
+        # (assignments differing by one decision from the correct one).
+        if factored and lambda_infonce > 0 and hasattr(model, "factored_to_flat"):
+            if "isr_logits" not in output:
+                isr_labels_f = model.flat_to_factored[labels, 0]    # (batch,)
+                grp_labels_f = model.flat_to_factored[labels, 1]    # (batch,)
+
+                # 1. Grouping InfoNCE: 10-way CE over all groupings for correct ISR
+                grp_flat_idxs = model.factored_to_flat[isr_labels_f, :]  # (batch, 10)
+                grp_logits_nc = logits.gather(1, grp_flat_idxs)           # (batch, 10)
+                loss_infonce_grp = F.cross_entropy(grp_logits_nc, grp_labels_f)
+
+                # 2. ISR InfoNCE: 7-way CE using max logit per ISR choice
+                # factored_to_flat: (J, 10) of flat indices
+                # logits[:, factored_to_flat]: (batch, J*10) → reshape (batch, J, 10)
+                logits_fac = logits[:, model.factored_to_flat.reshape(-1)].reshape(
+                    batch_size, model.num_jets, model.num_groupings
+                )
+                isr_logits_nc = logits_fac.max(dim=2).values  # (batch, J)
+                loss_infonce_isr = F.cross_entropy(isr_logits_nc, isr_labels_f)
+
+                loss_ce = loss_ce + lambda_infonce * (loss_infonce_grp + loss_infonce_isr)
+
+        # ── ISR auxiliary BCE loss ─────────────────────────────────────────────
+        # Per-jet binary ISR classification.  Directly supervises the ISR head
+        # with a one-hot binary target — the one jet that is the ISR gets label 1.
+        # This loss provides a strong, clean gradient for the hard-case (high-pT ISR)
+        # events that the main flat CE may not learn from quickly.
+        if factored and lambda_isr_aux > 0 and "isr_aux_logits" in output:
+            isr_labels_aux = model.flat_to_factored[labels, 0]        # (batch,)
+            isr_binary = F.one_hot(
+                isr_labels_aux, num_classes=model.num_jets
+            ).float()                                                  # (batch, J)
+            loss_isr_aux = F.binary_cross_entropy_with_logits(
+                output["isr_aux_logits"], isr_binary
+            )
+            loss_ce = loss_ce + lambda_isr_aux * loss_isr_aux
 
         # Mass symmetry auxiliary loss: minimize expected |m1-m2|/(m1+m2) over assignments
         if lambda_sym > 0 and "mass_asym_flat" in output:
