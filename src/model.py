@@ -663,7 +663,7 @@ class MassAsymmetryClassicalSolver(nn.Module):
         num_jets: Number of input jets (6 or 7).
     """
     # LHC proton-proton center-of-mass energy for the requested 13 TeV context.
-    COM_ENERGY_GEV = 13000.0
+    COM_ENERGY_GEV_VALUE = 13000.0
     # Normalized kinematic-feasibility threshold (E_total / sqrt(s) <= 1).
     ENERGY_FRACTION_BASELINE = 1.0
     # Unit offset keeps opening-angle scaling active even at low energy fraction.
@@ -740,6 +740,7 @@ class MassAsymmetryClassicalSolver(nn.Module):
         intra2 = JetAssignmentTransformer.intra_group_features(g2_jets)
 
         # pT hierarchy penalty (prefer less hierarchical candidate parents)
+        # intra_group_features indices: 0=max_pt_ratio, 1=pt_cv.
         pt_hierarchy = (
             0.5 * ((intra1[..., 0] - 1.0) + (intra2[..., 0] - 1.0))
             + 0.5 * (intra1[..., 1] + intra2[..., 1])
@@ -762,6 +763,7 @@ class MassAsymmetryClassicalSolver(nn.Module):
         )
 
         # Dalitz-like inter-group consistency
+        # intra_group_features indices: 7=dalitz_max_ratio, 8=dalitz_min_ratio.
         dalitz_penalty = (
             torch.abs(intra1[..., 7] - intra2[..., 7])
             + torch.abs(intra1[..., 8] - intra2[..., 8])
@@ -770,8 +772,10 @@ class MassAsymmetryClassicalSolver(nn.Module):
         # Opening-angle/pT consistency with explicit sqrt(s)=13 TeV scale
         pt_balance = torch.abs(pt1 - pt2) / (pt1 + pt2).clamp(min=1e-8)
         dphi_norm = torch.abs(dphi) / torch.pi
-        opening_pt_consistency = torch.abs((self.ENERGY_FRACTION_BASELINE - pt_balance) - dphi_norm)
-        energy_fraction = (g1_sum[..., 0] + g2_sum[..., 0]) / self.COM_ENERGY_GEV
+        # Balanced parent pT (low pt_balance) should align with back-to-back opening (high dphi_norm).
+        opening_pt_target = self.ENERGY_FRACTION_BASELINE - pt_balance
+        opening_pt_consistency = torch.abs(opening_pt_target - dphi_norm)
+        energy_fraction = (g1_sum[..., 0] + g2_sum[..., 0]) / self.COM_ENERGY_GEV_VALUE
         energy_overflow = torch.relu(energy_fraction - self.ENERGY_FRACTION_BASELINE)
         kine13_penalty = (
             opening_pt_consistency
