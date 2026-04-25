@@ -652,6 +652,15 @@ class MassAsymmetryClassicalSolver(nn.Module):
     Args:
         num_jets: Number of input jets (6 or 7).
     """
+    SQRT_S_TEV13_GEV = 13000.0
+    SECONDARY_WEIGHTS = {
+        "asymmetry": 0.45,
+        "pt_hierarchy": 0.20,
+        "angular": 0.15,
+        "dalitz": 0.10,
+        "kine13": 0.10,
+    }
+    SECONDARY_TIEBREAK_SCALE = 1.0e-3
 
     def __init__(self, num_jets: int = 7):
         super().__init__()
@@ -740,20 +749,19 @@ class MassAsymmetryClassicalSolver(nn.Module):
         pt_balance = torch.abs(pt1 - pt2) / (pt1 + pt2).clamp(min=1e-8)
         dphi_norm = torch.abs(dphi) / torch.pi
         opening_pt_consistency = torch.abs((1.0 - pt_balance) - dphi_norm)
-        sqrt_s_tev13_gev = 13000.0
-        energy_fraction = (g1_sum[..., 0] + g2_sum[..., 0]) / sqrt_s_tev13_gev
+        energy_fraction = (g1_sum[..., 0] + g2_sum[..., 0]) / self.SQRT_S_TEV13_GEV
         energy_overflow = torch.relu(energy_fraction - 1.0)
         kine13_penalty = opening_pt_consistency * (1.0 + energy_fraction.clamp(min=0.0)) + energy_overflow
 
         secondary_penalty = (
-            0.45 * asymmetry
-            + 0.20 * pt_hierarchy
-            + 0.15 * angular_penalty
-            + 0.10 * dalitz_penalty
-            + 0.10 * kine13_penalty
+            self.SECONDARY_WEIGHTS["asymmetry"] * asymmetry
+            + self.SECONDARY_WEIGHTS["pt_hierarchy"] * pt_hierarchy
+            + self.SECONDARY_WEIGHTS["angular"] * angular_penalty
+            + self.SECONDARY_WEIGHTS["dalitz"] * dalitz_penalty
+            + self.SECONDARY_WEIGHTS["kine13"] * kine13_penalty
         )
 
         # Lexicographic-style score: primary mass difference first, then refinement.
-        staged_score = mass_diff + 1.0e-3 * secondary_penalty
+        staged_score = mass_diff + self.SECONDARY_TIEBREAK_SCALE * secondary_penalty
         logits = -staged_score
         return {"logits": logits}
