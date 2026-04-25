@@ -160,12 +160,18 @@ def compute_pair_bias_features(four_momenta: torch.Tensor, valid_mask: torch.Ten
 
 
 def compute_jet_features(four_momenta: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
-    """Per-jet features, shape (B, J, 11).
+    """Per-jet features, shape (B, J, 10).
 
     The model's input projection sees these in addition to the raw 4-vector
     so that all kinematic invariants the scorer cares about are available
     from the first layer.  None of the features carries positional identity —
     they depend only on the jet's own kinematics and its neighbourhood.
+
+    pT rank is deliberately NOT included as a feature: it gives the model a
+    direct shortcut to "ISR == lowest-pT jet" that dominates training and
+    locks the model out of the hard case (ISR is not the lowest-pT jet).
+    Absolute pT is still available via log_pt; the model can learn rank
+    structure from raw pT if it actually needs it.
 
     Channels:
         0  log pT
@@ -173,25 +179,19 @@ def compute_jet_features(four_momenta: torch.Tensor, valid_mask: torch.Tensor) -
         2  sin φ
         3  cos φ
         4  log(m / pT + ε)            (jet mass softness)
-        5  pT rank / J                 (hierarchy *as a feature*, not as a slot)
-        6  valid mask                  (1 for real jet, 0 for zero-pad)
-        7  log(min ΔR to other valid jets + ε)
-        8  log(kT to nearest valid neighbour + ε)
-        9  log(m_nn / HT + ε)          (nearest-neighbour pair mass)
-       10  |Δφ(jet, -recoil)|          (how much does this jet look like ISR
-                                        pointing opposite to the rest?)
+        5  valid mask                  (1 for real jet, 0 for zero-pad)
+        6  log(min ΔR to other valid jets + ε)
+        7  log(kT to nearest valid neighbour + ε)
+        8  log(m_nn / HT + ε)          (nearest-neighbour pair mass)
+        9  |Δφ(jet, -recoil)|          (recoil-alignment angle — has correlation
+                                        with ISR but is not a 1:1 shortcut the
+                                        way pT rank is)
     """
     _, _, _, _, pt, eta, phi, m = _extract_kinematics(four_momenta)
     B, J = pt.shape
 
     log_pt = torch.log(pt + 1e-6)
     log_m_over_pt = torch.log(m / pt + 1e-6)
-
-    # pT rank normalised to [0, 1]; invalid jets get rank J-1 (largest) but
-    # this is multiplied by valid_mask when composed into the feature set.
-    pt_masked = pt.masked_fill(~valid_mask, -1.0)
-    rank = pt_masked.argsort(dim=-1, descending=True).argsort(dim=-1).float()
-    pt_rank_frac = rank / max(J - 1, 1)
 
     # Nearest-neighbour geometry, ignoring self and invalid jets.
     deta = eta.unsqueeze(-1) - eta.unsqueeze(-2)
@@ -235,7 +235,6 @@ def compute_jet_features(four_momenta: torch.Tensor, valid_mask: torch.Tensor) -
             torch.sin(phi),
             torch.cos(phi),
             log_m_over_pt,
-            pt_rank_frac,
             valid_mask.float(),
             log_min_dr,
             log_kt,
@@ -245,10 +244,10 @@ def compute_jet_features(four_momenta: torch.Tensor, valid_mask: torch.Tensor) -
         dim=-1,
     )
 
-    # Zero-out features for invalid jets (keep channel 6 = mask untouched).
+    # Zero-out features for invalid jets (keep channel 5 = mask untouched).
     mask_f = valid_mask.float().unsqueeze(-1)
     feats_zeroed = feats * mask_f
-    feats_zeroed[..., 6] = valid_mask.float()
+    feats_zeroed[..., 5] = valid_mask.float()
     return feats_zeroed
 
 
@@ -560,7 +559,7 @@ class JetAssignmentTransformer(nn.Module):
         self.nhead = nhead
         self.num_jets = num_jets
         self.has_isr = num_jets >= 7
-        self.n_jet_feats = 11
+        self.n_jet_feats = 10
         # input_dim is retained for backward-compat with train.py/evaluate.py;
         # this architecture always reads 4-vectors plus its own derived features.
         self.raw_4vec_dim = 4
