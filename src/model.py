@@ -670,6 +670,8 @@ class MassAsymmetryClassicalSolver(nn.Module):
     OPENING_SCALE_OFFSET = 1.0
     # Small ΔR contribution to angular penalty (secondary to Δφ back-to-backness).
     DELTA_R_WEIGHT = 0.1
+    # Indices match intra_group_features return order:
+    # [max_pt_ratio, pt_cv, min_z, max_kt, ecf2, ecf3, d2, dalitz_max_ratio, dalitz_min_ratio]
     MAX_PT_RATIO_IDX = 0
     PT_CV_IDX = 1
     DALITZ_MAX_RATIO_IDX = 7
@@ -782,8 +784,9 @@ class MassAsymmetryClassicalSolver(nn.Module):
         pt_balance = torch.abs(pt1 - pt2) / (pt1 + pt2).clamp(min=1e-8)
         dphi_norm = torch.abs(dphi) / torch.pi
         # Balanced parent pT (low pt_balance) should align with back-to-back opening (high dphi_norm).
-        opening_pt_target = self.ENERGY_FRACTION_BASELINE - pt_balance
-        opening_pt_consistency = torch.abs(opening_pt_target - dphi_norm)
+        # Expected normalized opening increases as pT balance improves (pt_balance -> 0).
+        expected_dphi_norm = self.ENERGY_FRACTION_BASELINE - pt_balance
+        opening_pt_consistency = torch.abs(expected_dphi_norm - dphi_norm)
         energy_fraction = (g1_sum[..., 0] + g2_sum[..., 0]) / self.COM_ENERGY_GEV
         energy_overflow = torch.relu(energy_fraction - self.ENERGY_FRACTION_BASELINE)
         kine13_penalty = (
@@ -800,7 +803,9 @@ class MassAsymmetryClassicalSolver(nn.Module):
             + self.SECONDARY_WEIGHTS["kine13"] * kine13_penalty
         )
 
+        # Hard physicality guard: assignments above sqrt(s)=13 TeV get a GeV-scale penalty.
+        physicality_penalty = energy_overflow * self.COM_ENERGY_GEV
         # Lexicographic-style score: primary mass difference first, then refinement.
-        staged_score = mass_diff + self.SECONDARY_TIEBREAK_SCALE * secondary_penalty
+        staged_score = mass_diff + physicality_penalty + self.SECONDARY_TIEBREAK_SCALE * secondary_penalty
         logits = -staged_score
         return {"logits": logits}
