@@ -633,17 +633,20 @@ class JetAssignmentTransformer(nn.Module):
 
 
 class MassAsymmetryClassicalSolver(nn.Module):
-    """Classical jet assignment solver that minimises mass asymmetry.
+    """Classical jet assignment solver with mass-difference-first ranking.
 
     For every event all combinatorial assignments are enumerated (same set
     as used by the ML model).  The invariant masses of the two candidate
-    groups are computed for each assignment and the one with the smallest
-    relative mass asymmetry
+    groups are computed for each assignment and scored in two stages:
 
-        A = |m1 - m2| / (m1 + m2)
+      1) Primary classical objective: minimise absolute mass difference
+           D = |m1 - m2|
+      2) Secondary refinements: use additional physics-inspired features
+         (pT hierarchy, angular geometry, Dalitz-like balance, and opening-
+         angle/pT consistency scaled to sqrt(s)=13 TeV) as a small tie-breaker
 
-    is selected.  Logits are returned as the *negative* asymmetry so that
-    ``argmax(logits)`` gives the best (minimum-asymmetry) assignment —
+    Logits are returned as the negative staged score so that ``argmax(logits)``
+    gives the best assignment —
     matching the inference interface of :class:`JetAssignmentTransformer`.
 
     Args:
@@ -660,7 +663,7 @@ class MassAsymmetryClassicalSolver(nn.Module):
         self.num_assignments = at["num_assignments"]
 
     def forward(self, four_momenta: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Compute negative mass-asymmetry scores for all assignments.
+        """Compute staged classical scores for all assignments.
 
         Args:
             four_momenta: (batch, num_jets, 4) tensor with (E, px, py, pz).
@@ -670,7 +673,8 @@ class MassAsymmetryClassicalSolver(nn.Module):
 
         Returns:
             dict with ``logits`` of shape (batch, num_assignments).
-            ``logits.argmax(dim=-1)`` gives the minimum-asymmetry assignment.
+            ``logits.argmax(dim=-1)`` gives the assignment with minimum
+            primary mass difference and best secondary physics tie-break.
         """
         batch_size = four_momenta.shape[0]
         na = self.num_assignments
@@ -694,9 +698,62 @@ class MassAsymmetryClassicalSolver(nn.Module):
         m1 = compute_invariant_mass(g1_sum)
         m2 = compute_invariant_mass(g2_sum)
 
-        # Relative mass asymmetry; clamp denominator to avoid division by zero
+        # Primary objective: minimize absolute parent mass difference.
+        mass_diff = torch.abs(m1 - m2)
+
+        # Secondary refinements
+        # Relative mass asymmetry (classical normalization)
         asymmetry = torch.abs(m1 - m2) / (m1 + m2).clamp(min=1e-8)
 
-        # Negative asymmetry as logits: argmax selects minimum asymmetry
-        logits = -asymmetry
+        # Intra-group QCD-sensitive features (reuse model feature definitions)
+        g1_jets = torch.gather(fm_expanded, 2, g1_idx)
+        g2_jets = torch.gather(fm_expanded, 2, g2_idx)
+        intra1 = JetAssignmentTransformer._intra_group_features(g1_jets)
+        intra2 = JetAssignmentTransformer._intra_group_features(g2_jets)
+
+        # pT hierarchy penalty (prefer less hierarchical candidate parents)
+        pt_hierarchy = (
+            0.5 * ((intra1[..., 0] - 1.0) + (intra2[..., 0] - 1.0))
+            + 0.5 * (intra1[..., 1] + intra2[..., 1])
+        )
+
+        # Angular relationships between reconstructed parent candidates
+        px1, py1, pz1 = g1_sum[..., 1], g1_sum[..., 2], g1_sum[..., 3]
+        px2, py2, pz2 = g2_sum[..., 1], g2_sum[..., 2], g2_sum[..., 3]
+        pt1 = torch.sqrt(px1**2 + py1**2).clamp(min=1e-8)
+        pt2 = torch.sqrt(px2**2 + py2**2).clamp(min=1e-8)
+        eta1 = torch.asinh(pz1 / pt1)
+        eta2 = torch.asinh(pz2 / pt2)
+        phi1 = torch.atan2(py1, px1)
+        phi2 = torch.atan2(py2, px2)
+        dphi = JetAssignmentTransformer._wrap_dphi(phi1 - phi2)
+        delta_r = torch.sqrt((eta1 - eta2) ** 2 + dphi**2 + 1e-8)
+        angular_penalty = torch.abs(torch.pi - torch.abs(dphi)) / torch.pi + 0.1 * delta_r
+
+        # Dalitz-like inter-group consistency
+        dalitz_penalty = (
+            torch.abs(intra1[..., 7] - intra2[..., 7])
+            + torch.abs(intra1[..., 8] - intra2[..., 8])
+        )
+
+        # Opening-angle/pT consistency with explicit sqrt(s)=13 TeV scale
+        pt_balance = torch.abs(pt1 - pt2) / (pt1 + pt2).clamp(min=1e-8)
+        dphi_norm = torch.abs(dphi) / torch.pi
+        opening_pt_consistency = torch.abs((1.0 - pt_balance) - dphi_norm)
+        sqrt_s_tev13_gev = 13000.0
+        energy_fraction = (g1_sum[..., 0] + g2_sum[..., 0]) / sqrt_s_tev13_gev
+        energy_overflow = torch.relu(energy_fraction - 1.0)
+        kine13_penalty = opening_pt_consistency * (1.0 + energy_fraction.clamp(min=0.0)) + energy_overflow
+
+        secondary_penalty = (
+            0.45 * asymmetry
+            + 0.20 * pt_hierarchy
+            + 0.15 * angular_penalty
+            + 0.10 * dalitz_penalty
+            + 0.10 * kine13_penalty
+        )
+
+        # Lexicographic-style score: primary mass difference first, then refinement.
+        staged_score = mass_diff + 1.0e-3 * secondary_penalty
+        logits = -staged_score
         return {"logits": logits}

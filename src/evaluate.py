@@ -34,7 +34,8 @@ def evaluate(
         data_path: Path to HDF5 test data (glob pattern).
         output_dir: Directory for output files.
         config_path: Optional config override.
-        include_classical: Also run the classical mass-asymmetry solver and
+        include_classical: Also run the staged classical solver (mass-
+            difference-first with physics tie-breaks) and
             save its results alongside the ML model results.
     """
     device = get_device()
@@ -122,7 +123,7 @@ def evaluate(
     print(f"[ML]      Top-1 accuracy: {accuracy:.4f} ({correct}/{n_events})")
     print(f"[ML]      Top-{topk} accuracy: {acc5:.4f}")
 
-    # --- Classical mass-asymmetry solver ---
+    # --- Staged classical solver ---
     all_classical_preds = None
     if include_classical:
         classical_solver = MassAsymmetryClassicalSolver(num_jets=dc["num_jets"])
@@ -283,7 +284,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no-classical",
         action="store_true",
-        help="Skip the classical mass-asymmetry solver comparison",
+        help="Skip the staged classical solver comparison",
     )
     args = parser.parse_args()
     evaluate(args.checkpoint, args.data, args.output, args.config, not args.no_classical)
