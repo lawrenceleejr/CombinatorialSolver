@@ -30,8 +30,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.onnx
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 
+from .combinatorics import build_assignment_tensors
 from .dataset import JetAssignmentDataset
 from .model import JetAssignmentTransformer
 from .utils import get_config, get_device
@@ -158,6 +159,41 @@ def train(config_path: str | None = None, data_path: str | None = None):
         num_workers=0,
         pin_memory=(device.type == "cuda"),
     )
+
+    # Hard-only curriculum warmup loader.  For the first
+    # `hard_only_warmup_epochs` epochs the model trains only on events where
+    # ISR is NOT the lowest-pT jet, removing the shortcut entirely from the
+    # data so it can never be a local optimum.  Then the full training set
+    # comes back online (with hard_case_alpha still upweighting hard cases).
+    has_isr = dc["num_jets"] >= 7
+    hard_only_warmup_epochs = tc.get("hard_only_warmup_epochs", 0) if has_isr else 0
+    hard_train_loader = None
+    if hard_only_warmup_epochs > 0:
+        at = build_assignment_tensors(dc["num_jets"])
+        isr_indices_assign = at["isr_indices"]                    # (N_assignments,)
+
+        train_indices = list(train_set.indices)
+        train_labels = dataset.labels[train_indices]              # (N_train,)
+        train_fm = dataset.four_momenta[train_indices]            # (N_train, J, 4)
+
+        train_isr = isr_indices_assign[train_labels]              # (N_train,)
+        pt = (train_fm[..., 1] ** 2 + train_fm[..., 2] ** 2).sqrt()
+        min_pt_idx = pt.argmin(dim=-1)                            # (N_train,)
+        hard_mask = (train_isr != min_pt_idx).tolist()
+        hard_indices = [train_indices[i] for i, h in enumerate(hard_mask) if h]
+
+        hard_train_set = Subset(dataset, hard_indices)
+        hard_train_loader = DataLoader(
+            hard_train_set,
+            batch_size=tc["batch_size"],
+            shuffle=True,
+            num_workers=0,
+            pin_memory=(device.type == "cuda"),
+        )
+        print(
+            f"Hard-only warmup: {len(hard_train_set):,}/{len(train_set):,} hard events "
+            f"for the first {hard_only_warmup_epochs} epochs"
+        )
     val_loader = DataLoader(
         val_set,
         batch_size=tc["batch_size"],
@@ -253,9 +289,19 @@ def train(config_path: str | None = None, data_path: str | None = None):
         else:
             lambda_isr_aux = lambda_isr_aux_max
 
+        # Curriculum: hard-only loader during warmup, full loader after.
+        if hard_train_loader is not None and epoch < hard_only_warmup_epochs:
+            active_loader = hard_train_loader
+            phase = "hard-only"
+        else:
+            active_loader = train_loader
+            phase = "full"
+            if hard_train_loader is not None and epoch == hard_only_warmup_epochs:
+                print(f"  -> Switching to full training set (epoch {epoch + 1})")
+
         model.train()
         train_metrics = _run_epoch(
-            model, train_loader, mse_loss_fn, lambda_adv, device,
+            model, active_loader, mse_loss_fn, lambda_adv, device,
             optimizer=optimizer,
             lambda_contrast=lambda_contrast,
             lambda_pair_sym=lambda_pair_sym,
@@ -283,8 +329,9 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 f" | hard={val_metrics['hard_acc']:.3f}"
                 f" easy={val_metrics['easy_acc']:.3f}"
             )
+        phase_str = f" [{phase}]" if hard_train_loader is not None else ""
         print(
-            f"Epoch {epoch+1:3d}/{tc['num_epochs']} | "
+            f"Epoch {epoch+1:3d}/{tc['num_epochs']}{phase_str} | "
             f"Train loss={train_metrics['loss']:.4f} acc={train_metrics['acc']:.3f} | "
             f"Val loss={val_metrics['loss']:.4f} acc={val_metrics['acc']:.3f}"
             f"{hard_str}{adv_str} | LR={current_lr:.2e}"

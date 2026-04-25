@@ -14,12 +14,16 @@ training:
   restart_period: 0
   patience: 40
 
+  # Hard-only curriculum warmup.  For the first N epochs train ONLY on events
+  # where ISR is not the lowest-pT jet — the shortcut "ISR == lowest-pT" is
+  # wrong on every event, so it can't be a local optimum.  After warmup the
+  # full distribution returns and hard_case_alpha continues upweighting hard
+  # events.  Set to 0 to disable.
+  hard_only_warmup_epochs: 30
+
   # Cross-entropy weight on "hard" events (true ISR is not the lowest-pT jet).
-  # Easy events (ISR == softest jet) are trivially solvable by pT-rank; upweighting
-  # the hard cases forces the model to rely on angular structure rather than
-  # plateauing at the easy-case ceiling.  At alpha=2 the model still found the
-  # pT-rank shortcut (~91% easy / ~5% hard); 8.0 makes hard events dominate
-  # the gradient strongly enough to break out of that local minimum.
+  # Used for full-distribution training (after the curriculum warmup) to keep
+  # the angular features dominant.
   hard_case_alpha: 8.0
 
   # Contrastive single-swap InfoNCE: pushes truth above the 15 single-swap
