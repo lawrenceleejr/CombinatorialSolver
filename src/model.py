@@ -237,9 +237,14 @@ class JetAssignmentTransformer(nn.Module):
         return log_pt.unsqueeze(-1) - log_pt.unsqueeze(-2)
 
     @staticmethod
-    def _wrap_dphi(dphi: torch.Tensor) -> torch.Tensor:
+    def wrap_dphi(dphi: torch.Tensor) -> torch.Tensor:
         """Wrap Δφ into [-π, π]."""
         return dphi - 2 * torch.pi * torch.round(dphi / (2 * torch.pi))
+
+    @staticmethod
+    def _wrap_dphi(dphi: torch.Tensor) -> torch.Tensor:
+        """Backward-compatible alias for wrap_dphi."""
+        return JetAssignmentTransformer.wrap_dphi(dphi)
 
     def encode_jets(self, four_momenta: torch.Tensor) -> torch.Tensor:
         x = self.input_proj(four_momenta)
@@ -320,7 +325,7 @@ class JetAssignmentTransformer(nn.Module):
         return self._mass_features(g1_4vec, g2_4vec, g1_jets, g2_jets)
 
     @staticmethod
-    def _intra_group_features(jets_4vec: torch.Tensor) -> torch.Tensor:
+    def intra_group_features(jets_4vec: torch.Tensor) -> torch.Tensor:
         """Compute 9 QCD-discriminating features from a 3-jet candidate group.
 
         Features capture pT hierarchy, Lund-plane splittings, energy correlation
@@ -369,7 +374,7 @@ class JetAssignmentTransformer(nn.Module):
             z_ij = pt_soft / (pt_i + pt_j).clamp(min=1e-8)
 
             deta = eta[..., i] - eta[..., j]
-            dphi = JetAssignmentTransformer._wrap_dphi(phi[..., i] - phi[..., j])
+            dphi = JetAssignmentTransformer.wrap_dphi(phi[..., i] - phi[..., j])
             dr = torch.sqrt(deta**2 + dphi**2 + 1e-8)
 
             z_lund_list.append(z_ij)
@@ -424,6 +429,11 @@ class JetAssignmentTransformer(nn.Module):
         )                                                               # (..., 9)
 
     @staticmethod
+    def _intra_group_features(jets_4vec: torch.Tensor) -> torch.Tensor:
+        """Backward-compatible alias for intra_group_features."""
+        return JetAssignmentTransformer.intra_group_features(jets_4vec)
+
+    @staticmethod
     def _mass_features(
         g1_4vec: torch.Tensor,
         g2_4vec: torch.Tensor,
@@ -457,14 +467,14 @@ class JetAssignmentTransformer(nn.Module):
 
         eta1, phi1 = eta_phi(g1_4vec)
         eta2, phi2 = eta_phi(g2_4vec)
-        dphi = JetAssignmentTransformer._wrap_dphi(phi1 - phi2)
+        dphi = JetAssignmentTransformer.wrap_dphi(phi1 - phi2)
         delta_r = torch.sqrt((eta1 - eta2) ** 2 + dphi**2)
 
         inter = torch.stack([mass_sum, mass_asym, mass_ratio, m1, m2, delta_r], dim=-1)
 
         if g1_jets is not None and g2_jets is not None:
-            intra1 = JetAssignmentTransformer._intra_group_features(g1_jets)
-            intra2 = JetAssignmentTransformer._intra_group_features(g2_jets)
+            intra1 = JetAssignmentTransformer.intra_group_features(g1_jets)
+            intra2 = JetAssignmentTransformer.intra_group_features(g2_jets)
             return torch.cat([inter, intra1, intra2], dim=-1)   # (..., 24)
 
         return inter                                             # (..., 6)
@@ -652,7 +662,9 @@ class MassAsymmetryClassicalSolver(nn.Module):
     Args:
         num_jets: Number of input jets (6 or 7).
     """
-    SQRT_S_TEV13_GEV = 13000.0
+    COM_ENERGY_GEV = 13000.0
+    ENERGY_FRACTION_BASELINE = 1.0
+    OPENING_SCALE_OFFSET = 1.0
     SECONDARY_WEIGHTS = {
         "asymmetry": 0.45,
         "pt_hierarchy": 0.20,
@@ -717,8 +729,8 @@ class MassAsymmetryClassicalSolver(nn.Module):
         # Intra-group QCD-sensitive features (reuse model feature definitions)
         g1_jets = torch.gather(fm_expanded, 2, g1_idx)
         g2_jets = torch.gather(fm_expanded, 2, g2_idx)
-        intra1 = JetAssignmentTransformer._intra_group_features(g1_jets)
-        intra2 = JetAssignmentTransformer._intra_group_features(g2_jets)
+        intra1 = JetAssignmentTransformer.intra_group_features(g1_jets)
+        intra2 = JetAssignmentTransformer.intra_group_features(g2_jets)
 
         # pT hierarchy penalty (prefer less hierarchical candidate parents)
         pt_hierarchy = (
@@ -735,7 +747,7 @@ class MassAsymmetryClassicalSolver(nn.Module):
         eta2 = torch.asinh(pz2 / pt2)
         phi1 = torch.atan2(py1, px1)
         phi2 = torch.atan2(py2, px2)
-        dphi = JetAssignmentTransformer._wrap_dphi(phi1 - phi2)
+        dphi = JetAssignmentTransformer.wrap_dphi(phi1 - phi2)
         delta_r = torch.sqrt((eta1 - eta2) ** 2 + dphi**2 + 1e-8)
         angular_penalty = torch.abs(torch.pi - torch.abs(dphi)) / torch.pi + 0.1 * delta_r
 
@@ -748,10 +760,14 @@ class MassAsymmetryClassicalSolver(nn.Module):
         # Opening-angle/pT consistency with explicit sqrt(s)=13 TeV scale
         pt_balance = torch.abs(pt1 - pt2) / (pt1 + pt2).clamp(min=1e-8)
         dphi_norm = torch.abs(dphi) / torch.pi
-        opening_pt_consistency = torch.abs((1.0 - pt_balance) - dphi_norm)
-        energy_fraction = (g1_sum[..., 0] + g2_sum[..., 0]) / self.SQRT_S_TEV13_GEV
-        energy_overflow = torch.relu(energy_fraction - 1.0)
-        kine13_penalty = opening_pt_consistency * (1.0 + energy_fraction.clamp(min=0.0)) + energy_overflow
+        opening_pt_consistency = torch.abs((self.ENERGY_FRACTION_BASELINE - pt_balance) - dphi_norm)
+        energy_fraction = (g1_sum[..., 0] + g2_sum[..., 0]) / self.COM_ENERGY_GEV
+        energy_overflow = torch.relu(energy_fraction - self.ENERGY_FRACTION_BASELINE)
+        kine13_penalty = (
+            opening_pt_consistency
+            * (self.OPENING_SCALE_OFFSET + energy_fraction.clamp(min=0.0))
+            + energy_overflow
+        )
 
         secondary_penalty = (
             self.SECONDARY_WEIGHTS["asymmetry"] * asymmetry
