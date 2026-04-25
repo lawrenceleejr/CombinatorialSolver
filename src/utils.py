@@ -41,6 +41,9 @@ def default_config() -> dict:
             "warmup_epochs": 5,
             "lambda_adv": 1.0,
             "lambda_adv_rampup": 10,
+            "lambda_distill": 2.0,
+            "lambda_distill_epochs": 20,
+            "distill_temperature": 4.0,
         },
         "data": {
             "normalize_by_ht": True,

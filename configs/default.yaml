@@ -29,6 +29,13 @@ training:
   lambda_sym_rampup: 20
   lambda_qcd: 0.1
   lambda_qcd_rampup: 20
+  # Distillation from the classical mass-asymmetry solver.
+  # At epoch 0 this loss pushes the NN toward the argmin-|m1-m2| solution; it
+  # decays linearly to zero by epoch lambda_distill_epochs so that the labelled
+  # cross-entropy signal takes over from there.
+  lambda_distill: 2.0
+  lambda_distill_epochs: 20
+  distill_temperature: 4.0
 
 data:
   normalize_by_ht: true

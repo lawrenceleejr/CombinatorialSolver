@@ -17,6 +17,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.onnx
 from torch.utils.data import DataLoader, random_split
 
@@ -208,6 +209,16 @@ def train(config_path: str | None = None, data_path: str | None = None):
     lambda_qcd_max = tc.get("lambda_qcd", 0.0)
     lambda_sym_rampup = tc.get("lambda_sym_rampup", 0)
     lambda_qcd_rampup = tc.get("lambda_qcd_rampup", 0)
+    lambda_distill_max = tc.get("lambda_distill", 2.0)
+    lambda_distill_epochs = tc.get("lambda_distill_epochs", 20)
+    distill_temperature = tc.get("distill_temperature", 4.0)
+    if lambda_distill_max > 0 and lambda_distill_epochs > 0:
+        print(
+            f"Classical distillation: lambda={lambda_distill_max}, "
+            f"decay_epochs={lambda_distill_epochs}, T={distill_temperature}"
+        )
+    else:
+        print("Classical distillation disabled")
 
     for epoch in range(tc["num_epochs"]):
         cosine_with_warmup(
@@ -245,6 +256,14 @@ def train(config_path: str | None = None, data_path: str | None = None):
         else:
             lambda_qcd = lambda_qcd_max
 
+        # Distillation from classical solver: linearly decay to zero over lambda_distill_epochs
+        if lambda_distill_epochs > 0:
+            lambda_distill = lambda_distill_max * max(
+                0.0, 1.0 - epoch / lambda_distill_epochs
+            )
+        else:
+            lambda_distill = 0.0
+
         # Training
         model.train()
         train_metrics = _run_epoch(
@@ -252,6 +271,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
             lambda_adv, device, optimizer=optimizer,
             tf_ratio=tf_ratio, lambda_sym=lambda_sym, lambda_qcd=lambda_qcd,
             lambda_isr=lambda_isr,
+            lambda_distill=lambda_distill, distill_temperature=distill_temperature,
         )
 
         # Validation (no augmentation, no teacher forcing: tf_ratio=0 = pure end-to-end)
@@ -262,6 +282,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 lambda_adv, device, optimizer=None,
                 tf_ratio=0.0, lambda_sym=0.0, lambda_qcd=0.0,
                 lambda_isr=lambda_isr,
+                lambda_distill=0.0, distill_temperature=distill_temperature,
             )
 
         # Log
@@ -333,6 +354,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
 def _run_epoch(
     model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optimizer=None,
     tf_ratio=1.0, lambda_sym=0.0, lambda_qcd=0.0, lambda_isr=1.0,
+    lambda_distill=0.0, distill_temperature=4.0,
 ):
     """Run one epoch of training or validation."""
     total_loss = 0.0
@@ -398,6 +420,21 @@ def _run_epoch(
             total_grp_correct += (gt_grp_logits.argmax(dim=-1) == grouping_labels).sum().item()
         else:
             loss_ce = ce_loss_fn(logits, labels)
+
+        # Classical distillation loss: pull NN logits toward the classical
+        # mass-asymmetry solver (argmin |m1-m2|/(m1+m2) = argmax -mass_asym).
+        # mass_asym_flat is scale-invariant so it is unaffected by HT normalisation.
+        # The T² factor restores gradient magnitudes after temperature scaling
+        # (Hinton et al. 2015).  This loss decays to zero by lambda_distill_epochs.
+        if lambda_distill > 0 and "mass_asym_flat" in output:
+            T = distill_temperature
+            teacher_logits = -output["mass_asym_flat"].detach()  # (batch, num_assignments)
+            teacher_probs = F.softmax(teacher_logits / T, dim=-1)
+            student_log_probs = F.log_softmax(logits / T, dim=-1)
+            loss_distill = T ** 2 * F.kl_div(
+                student_log_probs, teacher_probs, reduction="batchmean"
+            )
+            loss_ce = loss_ce + lambda_distill * loss_distill
 
         # Mass symmetry auxiliary loss: minimize expected |m1-m2|/(m1+m2) over assignments
         if lambda_sym > 0 and "mass_asym_flat" in output:
