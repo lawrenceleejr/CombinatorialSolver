@@ -640,8 +640,15 @@ class JetAssignmentTransformer(nn.Module):
         # --- Assignment feature block ---
         # Per-hypothesis:  [g1+g2, g1*g2, (g1-g2)^2, isr_emb] = 4 * d_model
         # + physics:       6 inter + 9 g1 + 9 g2 + 5 ISR-system = 29 dims
+        #
+        # NOTE: no LayerNorm on the physics features.  LN normalises across
+        # the 29 features per hypothesis, which destroys cross-hypothesis
+        # comparisons of any single feature (e.g. mass_asym across the 70
+        # hypotheses).  The classical solver works precisely by comparing one
+        # raw feature across hypotheses; we keep the features raw so the MLP
+        # can do the same.  Features are already log/ratio quantities in
+        # roughly O(1) range, so the score_mlp's first Linear can rescale.
         self.n_assign_physics = 6 + 9 + 9 + 5
-        self.physics_norm = nn.LayerNorm(self.n_assign_physics)
 
         self.score_mlp = nn.Sequential(
             nn.Linear(4 * d_model + self.n_assign_physics, 2 * d_model),
@@ -652,6 +659,19 @@ class JetAssignmentTransformer(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(d_model, 1),
         )
+        # Zero-init the final Linear so score_mlp outputs 0 at step 0.
+        # Combined with the residual classical logit below, the model literally
+        # IS the classical mass-asymmetry solver at initialization, and the
+        # score_mlp learns corrections to that baseline rather than starting
+        # from random and competing with it.
+        nn.init.zeros_(self.score_mlp[-1].weight)
+        nn.init.zeros_(self.score_mlp[-1].bias)
+
+        # --- Residual classical logit ---
+        # logits = score_mlp(...) - alpha * mass_asym, alpha learnable.  Init
+        # alpha=5 (learnable); the model can grow it if mass_asym deserves
+        # more weight, or shrink it if other features carry the signal.
+        self.classical_alpha = nn.Parameter(torch.tensor(5.0))
 
         # --- Optional ISR auxiliary head (BCE, per-jet "is this the ISR?") ---
         self.isr_aux_head = nn.Sequential(
@@ -849,11 +869,16 @@ class JetAssignmentTransformer(nn.Module):
         # Store asymmetry as the second inter feature so mass_asym_flat is easy.
         mass_asym_flat = inter[..., 1]                                       # (B, N)
 
+        # Raw (un-normalised) physics features — see __init__ for why no LayerNorm.
         physics = torch.cat([inter, intra_sum, intra_absdiff, isr_sys], dim=-1)   # (B, N, 29)
-        physics = self.physics_norm(physics)
 
         feats = torch.cat([sym_sum, sym_prod, sym_sqd, isr_emb, physics], dim=-1)
-        logits = self.score_mlp(feats).squeeze(-1)                           # (B, N)
+        score = self.score_mlp(feats).squeeze(-1)                            # (B, N)
+
+        # Residual classical logit: -alpha * asymmetry.  At init, alpha=5 and
+        # the score_mlp output is small, so the model behaves like the
+        # classical mass-asymmetry solver.
+        logits = score - self.classical_alpha * mass_asym_flat
 
         return logits, mass_asym_flat
 
