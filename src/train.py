@@ -222,16 +222,18 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
     # -------------------------------------------------------------------------
     # Two-phase training setup.
-    #   Phase 1: distillation-only loss, ISR head frozen.  The model learns to
-    #            replicate the classical argmin-mass-asymmetry heuristic before
-    #            any labelled (CE) or ISR signal is introduced.
+    #   Phase 1: grouping head trained with mass-asymmetry pseudolabels, ISR head
+    #            frozen.  For each possible ISR choice the grouping with the lowest
+    #            mass asymmetry is used as a CE pseudolabel.  This directly teaches
+    #            the grouping scorer the classical heuristic without involving the
+    #            frozen ISR head in the loss signal.
     #   Phase 2: full loss (CE + ISR + sym + qcd + decayed distillation).  ISR
     #            head is unfrozen.  Distillation decays from lambda_distill_max
     #            over lambda_distill_epochs measured from the Phase 2 start epoch.
-    # Phase 1 is only active when phase1_patience > 0 and distillation is on.
+    # Phase 1 is only active when phase1_patience > 0.
     # -------------------------------------------------------------------------
     phase1_patience = tc.get("phase1_patience", 0)
-    phase1_active = phase1_patience > 0 and lambda_distill_max > 0
+    phase1_active = phase1_patience > 0
     training_phase = 1  # 1 or 2
     phase1_best_acc = 0.0
     phase1_no_improve = 0
@@ -249,12 +251,13 @@ def train(config_path: str | None = None, data_path: str | None = None):
             for p in _isr_freeze_params:
                 p.requires_grad_(False)
             print(
-                f"Phase 1: ISR head frozen. Training with distillation loss only "
+                f"Phase 1: ISR head frozen. Training grouping head with "
+                f"mass-asymmetry pseudolabels "
                 f"(patience={phase1_patience} epochs before Phase 2)."
             )
         else:
             print(
-                f"Phase 1: Training with distillation loss only "
+                f"Phase 1: Training with mass-asymmetry pseudolabels "
                 f"(patience={phase1_patience} epochs before Phase 2)."
             )
 
@@ -499,21 +502,42 @@ def _run_epoch(
 
         if phase1_only and optimizer is not None:
             # ---------------------------------------------------------------
-            # Phase 1 training: distillation loss only.
-            # No CE, no ISR, no sym/qcd, no adversary.  The model is taught
-            # to rank assignments by mass asymmetry before it is allowed to
-            # use any labelled signal or ISR information.
+            # Phase 1 training: teach the grouping head to minimise mass
+            # asymmetry using per-ISR-block pseudolabels.
+            #
+            # Why not KL distillation?  mass_asym ∈ [0, 1], so with T=4 the
+            # teacher softmax(-mass_asym / T) spans values in exp(-0.25)…1
+            # — a ratio of only ~1.28 across 70 classes.  The resulting KL
+            # divergence is ≈ 0, giving essentially zero gradient regardless
+            # of temperature or lambda_distill.
+            #
+            # Instead we use a direct CE loss:
+            #   7-jet (ISR): for each of the 7 ISR-block choices, find the
+            #     grouping with the lowest mass asymmetry and train grouping_
+            #     logits with CE against that per-block pseudolabel.  This
+            #     completely bypasses the frozen (random) ISR head.
+            #   6-jet (flat): the flat assignment with the lowest mass asym is
+            #     used as the pseudolabel for the flat CE loss.
             # ---------------------------------------------------------------
-            if lambda_distill > 0 and "mass_asym_flat" in output:
-                T = distill_temperature
-                teacher_logits = -output["mass_asym_flat"].detach()
-                teacher_probs = F.softmax(teacher_logits / T, dim=-1)
-                student_log_probs = F.log_softmax(logits / T, dim=-1)
-                loss = T ** 2 * F.kl_div(
-                    student_log_probs, teacher_probs, reduction="batchmean"
-                ) * lambda_distill
+            if "mass_asym_flat" in output:
+                if factored and "grouping_logits" in output:
+                    # Per-ISR-block pseudolabels.
+                    # factored_to_flat[j, k] = flat index for (isr=j, grp=k).
+                    # Gather mass_asym into (batch, num_jets, num_groupings).
+                    f2flat = model.factored_to_flat           # (num_jets, 10)
+                    mass_asym_per_block = output["mass_asym_flat"][:, f2flat]  # (B, J, 10)
+                    pseudo_grp = mass_asym_per_block.argmin(dim=-1)            # (B, J)
+                    grp_logits = output["grouping_logits"]    # (B, J, 10)
+                    loss = ce_loss_fn(
+                        grp_logits.reshape(-1, model.num_groupings),
+                        pseudo_grp.reshape(-1),
+                    )
+                else:
+                    # 6-jet flat mode: argmin across all 10 assignments
+                    pseudo_label = output["mass_asym_flat"].argmin(dim=-1)
+                    loss = ce_loss_fn(logits, pseudo_label)
             else:
-                # Fallback: plain CE (distillation misconfigured)
+                # Fallback (mass_asym_flat not available)
                 loss = ce_loss_fn(logits, labels)
             loss_adv = torch.tensor(0.0, device=device)
 

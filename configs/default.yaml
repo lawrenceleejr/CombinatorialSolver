@@ -38,13 +38,18 @@ training:
   lambda_distill_epochs: 20
   distill_temperature: 4.0
   # Two-phase training:
-  #   Phase 1 — distillation only (no CE / ISR / sym / qcd losses); ISR head frozen.
-  #             The model learns to replicate the classical argmin-mass-asymmetry
-  #             heuristic.  Phase 1 ends when val accuracy stops improving for
-  #             phase1_patience epochs.
+  #   Phase 1 — grouping head trained with mass-asymmetry pseudolabels; ISR head frozen.
+  #             For each possible ISR choice, the grouping with the lowest mass
+  #             asymmetry is used as a CE pseudolabel.  This bypasses the frozen
+  #             ISR head and gives a direct gradient to the grouping scorer without
+  #             any temperature-sensitivity.  (The KL-distillation approach was
+  #             abandoned because mass_asym ∈ [0,1] with T=4 makes the teacher
+  #             distribution nearly uniform, yielding ~zero gradient.)
+  #             Phase 1 ends when val grp_acc stops improving for phase1_patience epochs.
   #   Phase 2 — full supervised training (CE + ISR + sym + qcd) begins; ISR head
-  #             is unfrozen.  Distillation decays from its max over
-  #             lambda_distill_epochs measured from the Phase 2 start epoch.
+  #             is unfrozen.  Distillation (KL toward classical solver) decays from
+  #             lambda_distill_max over lambda_distill_epochs measured from the
+  #             Phase 2 start epoch.
   #   Set phase1_patience: 0 to disable two-phase training (legacy behaviour).
   phase1_patience: 15
 
