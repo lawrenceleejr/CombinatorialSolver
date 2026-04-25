@@ -2,35 +2,49 @@ model:
   d_model: 128
   nhead: 8
   num_layers: 4
-  dim_feedforward: 256
-  dropout: 0.1
+  dim_feedforward: 512
+  dropout: 0.2
 
 training:
   batch_size: 256
   learning_rate: 3.0e-4
-  isr_lr_multiplier: 3.0
-  weight_decay: 1.0e-4
+  weight_decay: 5.0e-4
   num_epochs: 200
   warmup_epochs: 5
-  restart_period: 0
+  # Cosine scheduler warm-restart period (epochs). 0 disables restarts.
+  restart_period: 50
   patience: 40
   lambda_adv: 0.0
   lambda_adv_rampup: 50
-  tf_start: 1.0
-  tf_end: 0.3
-  tf_decay_epochs: 100
-  # Upweights the ISR classification loss relative to the teacher-forced grouping loss.
-  # Root cause: signal jets receive gradient from loss_grp_tf via all 10 groupings (10
-  # gradient paths per signal jet), while the ISR jet receives gradient only from loss_isr
-  # (1 path).  Setting lambda_isr=3 partially compensates for this imbalance without
-  # over-dominating the grouping signal.  Tune upward (e.g. 5-10) if ISR still plateaus.
-  lambda_isr: 3.0
-  lambda_sym: 0.05
+  # Mass-symmetry auxiliary loss
+  lambda_sym: 0.2
   lambda_sym_rampup: 20
   lambda_qcd: 0.1
   lambda_qcd_rampup: 20
+  # Label smoothing for CrossEntropyLoss — prevents overconfidence
+  label_smoothing: 0.1
+  # ISR auxiliary BCE loss: per-jet binary ISR identification.
+  # Provides direct gradient for the hard case (ISR not the softest jet).
+  lambda_isr_aux: 0.5
+  lambda_isr_aux_rampup: 10
+  # InfoNCE on single-swap neighbours:
+  #   grouping InfoNCE (10-way CE, correct-ISR groupings) +
+  #   ISR InfoNCE (7-way CE, best-grouping per ISR).
+  # Focuses gradient on the most confusable wrong assignments.
+  lambda_infonce: 0.5
+  lambda_infonce_rampup: 10
+  # Direct ISR CE from marginalized flat logits (7-way over ISR candidates):
+  # for each ISR, take best grouping score then supervise ISR directly.
+  # This addresses the failure mode where assignment accuracy rises but ISR
+  # accuracy stalls near 0.5.
+  lambda_isr_direct: 1.0
+  lambda_isr_direct_rampup: 10
+  # Hard-case reweighting: upweight events where ISR is not the lowest-pT jet.
+  # The model has a shortcut "last slot = lowest pT = ISR" that works ~50% of
+  # the time; this extra weight steers it toward kinematic discriminants instead.
+  lambda_hard: 2.0
 
 data:
   normalize_by_ht: true
   num_jets: 7
-  pt_smear_frac: 0.0
+  pt_smear_frac: 0.05
