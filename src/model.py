@@ -663,13 +663,17 @@ class MassAsymmetryClassicalSolver(nn.Module):
         num_jets: Number of input jets (6 or 7).
     """
     # LHC proton-proton center-of-mass energy for the requested 13 TeV context.
-    COM_ENERGY_GEV_VALUE = 13000.0
-    # Normalized kinematic-feasibility threshold (E_total / sqrt(s) <= 1).
+    COM_ENERGY_GEV = 13000.0
+    # Theoretical maximum of E_total/sqrt(s): 1.0 when all COM energy is captured.
     ENERGY_FRACTION_BASELINE = 1.0
     # Unit offset keeps opening-angle scaling active even at low energy fraction.
     OPENING_SCALE_OFFSET = 1.0
     # Small ΔR contribution to angular penalty (secondary to Δφ back-to-backness).
     DELTA_R_WEIGHT = 0.1
+    MAX_PT_RATIO_IDX = 0
+    PT_CV_IDX = 1
+    DALITZ_MAX_RATIO_IDX = 7
+    DALITZ_MIN_RATIO_IDX = 8
     # Secondary-feature blend used only for tie-breaking after primary mass difference.
     SECONDARY_WEIGHTS = {
         "asymmetry": 0.45,
@@ -740,10 +744,12 @@ class MassAsymmetryClassicalSolver(nn.Module):
         intra2 = JetAssignmentTransformer.intra_group_features(g2_jets)
 
         # pT hierarchy penalty (prefer less hierarchical candidate parents)
-        # intra_group_features indices: 0=max_pt_ratio, 1=pt_cv.
         pt_hierarchy = (
-            0.5 * ((intra1[..., 0] - 1.0) + (intra2[..., 0] - 1.0))
-            + 0.5 * (intra1[..., 1] + intra2[..., 1])
+            0.5 * (
+                (intra1[..., self.MAX_PT_RATIO_IDX] - 1.0)
+                + (intra2[..., self.MAX_PT_RATIO_IDX] - 1.0)
+            )
+            + 0.5 * (intra1[..., self.PT_CV_IDX] + intra2[..., self.PT_CV_IDX])
         )
 
         # Angular relationships between reconstructed parent candidates
@@ -763,10 +769,13 @@ class MassAsymmetryClassicalSolver(nn.Module):
         )
 
         # Dalitz-like inter-group consistency
-        # intra_group_features indices: 7=dalitz_max_ratio, 8=dalitz_min_ratio.
         dalitz_penalty = (
-            torch.abs(intra1[..., 7] - intra2[..., 7])
-            + torch.abs(intra1[..., 8] - intra2[..., 8])
+            torch.abs(
+                intra1[..., self.DALITZ_MAX_RATIO_IDX] - intra2[..., self.DALITZ_MAX_RATIO_IDX]
+            )
+            + torch.abs(
+                intra1[..., self.DALITZ_MIN_RATIO_IDX] - intra2[..., self.DALITZ_MIN_RATIO_IDX]
+            )
         )
 
         # Opening-angle/pT consistency with explicit sqrt(s)=13 TeV scale
@@ -775,7 +784,7 @@ class MassAsymmetryClassicalSolver(nn.Module):
         # Balanced parent pT (low pt_balance) should align with back-to-back opening (high dphi_norm).
         opening_pt_target = self.ENERGY_FRACTION_BASELINE - pt_balance
         opening_pt_consistency = torch.abs(opening_pt_target - dphi_norm)
-        energy_fraction = (g1_sum[..., 0] + g2_sum[..., 0]) / self.COM_ENERGY_GEV_VALUE
+        energy_fraction = (g1_sum[..., 0] + g2_sum[..., 0]) / self.COM_ENERGY_GEV
         energy_overflow = torch.relu(energy_fraction - self.ENERGY_FRACTION_BASELINE)
         kine13_penalty = (
             opening_pt_consistency
