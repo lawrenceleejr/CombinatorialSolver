@@ -523,6 +523,11 @@ class JetAssignmentTransformer(nn.Module):
         sym_prod = g1_pooled * g2_pooled
 
         physics = self._group_physics_factored(four_momenta)  # (batch, n_combos, n_group_physics)
+
+        # Extract raw mass asymmetry BEFORE LayerNorm so that the across-assignment
+        # ranking (argmin mass_asym = classical best assignment) is preserved.
+        mass_asym_factored = physics[:, :, 1]  # (batch, n_combos)
+
         physics = self.physics_norm(physics)
 
         combined = torch.cat([sym_sum, sym_prod, physics], dim=-1)
@@ -537,9 +542,6 @@ class JetAssignmentTransformer(nn.Module):
         grp_weights = grouping_logits.softmax(dim=-1).unsqueeze(-1)     # (batch, J, 10, 1)
         grp_context = (grp_weights * combined_per_isr).sum(dim=2)       # (batch, J, 2*d+phys)
         grouping_summary = self.grouping_summary_proj(grp_context)      # (batch, J, d_model)
-
-        # Remap mass asymmetry (physics dim 1) to flat assignment ordering
-        mass_asym_factored = physics[:, :, 1]  # (batch, n_combos)
         source_idx = self.flat_to_factored[:, 0] * self.num_groupings + self.flat_to_factored[:, 1]
         mass_asym_flat = mass_asym_factored[:, source_idx]  # (batch, num_assignments)
 
@@ -607,10 +609,12 @@ class JetAssignmentTransformer(nn.Module):
         g2_4vec = g2_jets.sum(dim=2)
 
         physics = self._mass_features(g1_4vec, g2_4vec, g1_jets, g2_jets)
+        # Extract raw mass asymmetry BEFORE LayerNorm so that the across-assignment
+        # ranking (argmin mass_asym = classical best assignment) is preserved.
+        mass_asym_flat = physics[..., 1]             # index 1 = mass_asym
         physics = self.physics_norm(physics)
         combined = torch.cat([sym_sum, sym_prod, physics], dim=-1)
         logits = self.score_mlp(combined).squeeze(-1)
-        mass_asym_flat = physics[..., 1]             # index 1 = mass_asym
         return logits, mass_asym_flat
 
     def predict_mass(self, jet_embeddings: torch.Tensor) -> torch.Tensor:
