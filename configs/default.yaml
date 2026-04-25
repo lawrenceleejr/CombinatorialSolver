@@ -37,6 +37,16 @@ training:
   lambda_distill: 2.0
   lambda_distill_epochs: 20
   distill_temperature: 4.0
+  # Two-phase training:
+  #   Phase 1 — distillation only (no CE / ISR / sym / qcd losses); ISR head frozen.
+  #             The model learns to replicate the classical argmin-mass-asymmetry
+  #             heuristic.  Phase 1 ends when val accuracy stops improving for
+  #             phase1_patience epochs.
+  #   Phase 2 — full supervised training (CE + ISR + sym + qcd) begins; ISR head
+  #             is unfrozen.  Distillation decays from its max over
+  #             lambda_distill_epochs measured from the Phase 2 start epoch.
+  #   Set phase1_patience: 0 to disable two-phase training (legacy behaviour).
+  phase1_patience: 15
 
 data:
   normalize_by_ht: true

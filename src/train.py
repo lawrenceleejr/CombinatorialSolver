@@ -193,7 +193,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
             "epoch", "train_loss", "train_acc", "train_acc5",
             "val_loss", "val_acc", "val_acc5",
             "train_isr_acc", "train_grp_acc", "val_isr_acc", "val_grp_acc",
-            "adv_r2", "lr",
+            "adv_r2", "lr", "phase",
         ])
 
     best_val_acc = 0.0
@@ -220,6 +220,44 @@ def train(config_path: str | None = None, data_path: str | None = None):
     else:
         print("Classical distillation disabled")
 
+    # -------------------------------------------------------------------------
+    # Two-phase training setup.
+    #   Phase 1: distillation-only loss, ISR head frozen.  The model learns to
+    #            replicate the classical argmin-mass-asymmetry heuristic before
+    #            any labelled (CE) or ISR signal is introduced.
+    #   Phase 2: full loss (CE + ISR + sym + qcd + decayed distillation).  ISR
+    #            head is unfrozen.  Distillation decays from lambda_distill_max
+    #            over lambda_distill_epochs measured from the Phase 2 start epoch.
+    # Phase 1 is only active when phase1_patience > 0 and distillation is on.
+    # -------------------------------------------------------------------------
+    phase1_patience = tc.get("phase1_patience", 0)
+    phase1_active = phase1_patience > 0 and lambda_distill_max > 0
+    training_phase = 1  # 1 or 2
+    phase1_best_acc = 0.0
+    phase1_no_improve = 0
+    phase2_start_epoch = None   # absolute epoch index when Phase 2 begins
+
+    if phase1_active:
+        if model.has_isr:
+            # Freeze the ISR head and the projection that feeds it.
+            # The grouping scorer and main encoder continue to train,
+            # learning to score groupings by mass asymmetry.
+            _isr_freeze_params = (
+                list(model.isr_head.parameters())
+                + list(model.grouping_summary_proj.parameters())
+            )
+            for p in _isr_freeze_params:
+                p.requires_grad_(False)
+            print(
+                f"Phase 1: ISR head frozen. Training with distillation loss only "
+                f"(patience={phase1_patience} epochs before Phase 2)."
+            )
+        else:
+            print(
+                f"Phase 1: Training with distillation loss only "
+                f"(patience={phase1_patience} epochs before Phase 2)."
+            )
+
     for epoch in range(tc["num_epochs"]):
         cosine_with_warmup(
             optimizer, epoch, tc["num_epochs"], tc["warmup_epochs"],
@@ -227,10 +265,11 @@ def train(config_path: str | None = None, data_path: str | None = None):
         )
         current_lr = optimizer.param_groups[0]["lr"]
 
-        if use_adversary:
+        if use_adversary and training_phase == 2:
             rampup = tc.get("lambda_adv_rampup", 10)
+            phase2_epoch = epoch - (phase2_start_epoch or 0)
             if rampup > 0:
-                adv_scale = min(1.0, epoch / rampup)
+                adv_scale = min(1.0, phase2_epoch / rampup)
             else:
                 adv_scale = 1.0
             lambda_adv = tc["lambda_adv"] * adv_scale
@@ -239,30 +278,43 @@ def train(config_path: str | None = None, data_path: str | None = None):
             lambda_adv = 0.0
             model.gradient_reversal.set_lambda(0.0)
 
-        # Teacher forcing ratio: linearly decay from tf_start to tf_end over tf_decay_epochs
-        if epoch < tf_decay_epochs:
-            tf_ratio = tf_start + (tf_end - tf_start) * epoch / tf_decay_epochs
+        if training_phase == 1:
+            # Phase 1: full-strength distillation, no decay, no other losses
+            lambda_distill = lambda_distill_max
+            tf_ratio = 0.0          # irrelevant (CE loss is skipped)
+            lambda_sym = 0.0
+            lambda_qcd = 0.0
+            phase1_only_train = True
         else:
-            tf_ratio = tf_end
+            # Phase 2: teacher forcing, auxiliary losses, decaying distillation
+            phase2_epoch = epoch - phase2_start_epoch
 
-        # Ramp up auxiliary losses: off at start, linearly reach full strength
-        if lambda_sym_rampup > 0:
-            lambda_sym = lambda_sym_max * min(1.0, epoch / lambda_sym_rampup)
-        else:
-            lambda_sym = lambda_sym_max
+            # Teacher forcing ratio: linearly decay from tf_start to tf_end
+            if phase2_epoch < tf_decay_epochs:
+                tf_ratio = tf_start + (tf_end - tf_start) * phase2_epoch / tf_decay_epochs
+            else:
+                tf_ratio = tf_end
 
-        if lambda_qcd_rampup > 0:
-            lambda_qcd = lambda_qcd_max * min(1.0, epoch / lambda_qcd_rampup)
-        else:
-            lambda_qcd = lambda_qcd_max
+            # Ramp up auxiliary losses from Phase 2 start
+            if lambda_sym_rampup > 0:
+                lambda_sym = lambda_sym_max * min(1.0, phase2_epoch / lambda_sym_rampup)
+            else:
+                lambda_sym = lambda_sym_max
 
-        # Distillation from classical solver: linearly decay to zero over lambda_distill_epochs
-        if lambda_distill_epochs > 0:
-            lambda_distill = lambda_distill_max * max(
-                0.0, 1.0 - epoch / lambda_distill_epochs
-            )
-        else:
-            lambda_distill = 0.0
+            if lambda_qcd_rampup > 0:
+                lambda_qcd = lambda_qcd_max * min(1.0, phase2_epoch / lambda_qcd_rampup)
+            else:
+                lambda_qcd = lambda_qcd_max
+
+            # Distillation decays from max to zero over lambda_distill_epochs
+            if lambda_distill_epochs > 0:
+                lambda_distill = lambda_distill_max * max(
+                    0.0, 1.0 - phase2_epoch / lambda_distill_epochs
+                )
+            else:
+                lambda_distill = 0.0
+
+            phase1_only_train = False
 
         # Training
         model.train()
@@ -272,6 +324,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
             tf_ratio=tf_ratio, lambda_sym=lambda_sym, lambda_qcd=lambda_qcd,
             lambda_isr=lambda_isr,
             lambda_distill=lambda_distill, distill_temperature=distill_temperature,
+            phase1_only=phase1_only_train,
         )
 
         # Validation (no augmentation, no teacher forcing: tf_ratio=0 = pure end-to-end)
@@ -286,6 +339,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
             )
 
         # Log
+        phase_tag = f"[P{training_phase}]" if phase1_active else ""
         adv_str = f" | Adv R²={val_metrics['adv_r2']:.3f}" if use_adversary else ""
         isr_str = ""
         if "isr_acc" in val_metrics:
@@ -295,7 +349,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
             )
 
         print(
-            f"Epoch {epoch+1:3d}/{tc['num_epochs']} | "
+            f"Epoch {epoch+1:3d}/{tc['num_epochs']} {phase_tag} | "
             f"Train loss={train_metrics['loss']:.4f} acc={train_metrics['acc']:.3f} | "
             f"Val loss={val_metrics['loss']:.4f} acc={val_metrics['acc']:.3f}"
             f"{isr_str}{adv_str} | "
@@ -318,9 +372,42 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 f"{val_metrics.get('grp_acc', 0):.4f}",
                 f"{val_metrics['adv_r2']:.4f}",
                 f"{current_lr:.6e}",
+                training_phase,
             ])
 
-        # Checkpoint
+        # ---------------------------------------------------------------
+        # Phase 1 plateau detection → trigger Phase 2
+        # ---------------------------------------------------------------
+        if training_phase == 1 and phase1_active:
+            if val_metrics["acc"] > phase1_best_acc:
+                phase1_best_acc = val_metrics["acc"]
+                phase1_no_improve = 0
+            else:
+                phase1_no_improve += 1
+
+            if phase1_no_improve >= phase1_patience:
+                training_phase = 2
+                phase2_start_epoch = epoch + 1
+                print(
+                    f"\n*** Phase 1 plateau at epoch {epoch+1} "
+                    f"(best acc={phase1_best_acc:.4f}, "
+                    f"no improvement for {phase1_patience} epochs). "
+                    f"Entering Phase 2: full supervised training. ***\n"
+                )
+                if model.has_isr:
+                    for p in model.isr_head.parameters():
+                        p.requires_grad_(True)
+                    for p in model.grouping_summary_proj.parameters():
+                        p.requires_grad_(True)
+                    print("  ISR head unfrozen.")
+                # Reset the Phase 2 early-stopping counter independently.
+                no_improve = 0
+                best_val_acc = 0.0  # let Phase 2 build its own best checkpoint
+            # In Phase 1 we do not apply early stopping — only the plateau
+            # detector (phase1_no_improve) controls the transition.
+            continue
+
+        # Checkpoint (Phase 2 or single-phase)
         if val_metrics["acc"] > best_val_acc:
             best_val_acc = val_metrics["acc"]
             best_epoch = epoch + 1
@@ -354,9 +441,17 @@ def train(config_path: str | None = None, data_path: str | None = None):
 def _run_epoch(
     model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optimizer=None,
     tf_ratio=1.0, lambda_sym=0.0, lambda_qcd=0.0, lambda_isr=1.0,
-    lambda_distill=0.0, distill_temperature=4.0,
+    lambda_distill=0.0, distill_temperature=4.0, phase1_only=False,
 ):
-    """Run one epoch of training or validation."""
+    """Run one epoch of training or validation.
+
+    When *phase1_only* is True (Phase 1 training only), the loss is restricted
+    to the classical-distillation term.  All other auxiliary losses (CE, ISR,
+    sym, qcd, adversary) are skipped so that the model focuses exclusively on
+    replicating the argmin-mass-asymmetry heuristic.  Accuracy is still
+    measured the normal way (argmax logits vs ground-truth label) in both
+    phases so that the plateau detector works correctly.
+    """
     total_loss = 0.0
     total_correct = 0
     total_correct5 = 0
@@ -392,90 +487,125 @@ def _run_epoch(
         logits = output["logits"]
         mass_pred = output["mass_pred"].squeeze(-1)
 
-        # Assignment loss
-        if factored and "isr_logits" in output:
-            isr_logits = output["isr_logits"]
-            grouping_logits = output["grouping_logits"]
-
-            isr_labels = model.flat_to_factored[labels, 0]
-            grouping_labels = model.flat_to_factored[labels, 1]
-
-            loss_isr = ce_loss_fn(isr_logits, isr_labels)
-
-            batch_idx = torch.arange(labels.shape[0], device=device)
-            gt_grp_logits = grouping_logits[batch_idx, isr_labels]
-            loss_grp_tf = ce_loss_fn(gt_grp_logits, grouping_labels)
-
-            # Blend teacher-forced factored loss with flat end-to-end loss
-            # tf_ratio=1: fully teacher-forced (original); tf_ratio=0: flat CE only
-            # lambda_isr upweights the ISR loss to compensate for a gradient imbalance:
-            # each signal jet appears in all num_groupings groupings, so loss_grp_tf
-            # produces num_groupings gradient paths per signal jet while the ISR jet
-            # (excluded from every group) receives gradient only from loss_isr.
-            # Scaling loss_isr by lambda_isr partially rebalances this asymmetry.
-            loss_flat = ce_loss_fn(logits, labels)
-            loss_ce = tf_ratio * (lambda_isr * loss_isr + loss_grp_tf) + (1.0 - tf_ratio) * loss_flat
-
-            total_isr_correct += (isr_logits.argmax(dim=-1) == isr_labels).sum().item()
-            total_grp_correct += (gt_grp_logits.argmax(dim=-1) == grouping_labels).sum().item()
-        else:
-            loss_ce = ce_loss_fn(logits, labels)
-
-        # Classical distillation loss: pull NN logits toward the classical
-        # mass-asymmetry solver (argmin |m1-m2|/(m1+m2) = argmax -mass_asym).
-        # mass_asym_flat is scale-invariant so it is unaffected by HT normalisation.
-        # The T² factor restores gradient magnitudes after temperature scaling
-        # (Hinton et al. 2015).  This loss decays to zero by lambda_distill_epochs.
-        if lambda_distill > 0 and "mass_asym_flat" in output:
-            T = distill_temperature
-            teacher_logits = -output["mass_asym_flat"].detach()  # (batch, num_assignments)
-            teacher_probs = F.softmax(teacher_logits / T, dim=-1)
-            student_log_probs = F.log_softmax(logits / T, dim=-1)
-            loss_distill = T ** 2 * F.kl_div(
-                student_log_probs, teacher_probs, reduction="batchmean"
-            )
-            loss_ce = loss_ce + lambda_distill * loss_distill
-
-        # Mass symmetry auxiliary loss: minimize expected |m1-m2|/(m1+m2) over assignments
-        if lambda_sym > 0 and "mass_asym_flat" in output:
-            mass_asym = output["mass_asym_flat"].detach()  # (batch, num_assignments)
-            probs = logits.softmax(dim=-1)
-            loss_sym = (probs * mass_asym).sum(dim=-1).mean()
-            loss_ce = loss_ce + lambda_sym * loss_sym
-
-        # QCD hierarchy penalty: events with large pT hierarchies (QCD-like) are pushed
-        # to prefer high-mass-asymmetry assignments, making them self-select interpretations
-        # that look maximally unlike a symmetric signal decay.
-        # loss_qcd = -mean(H_i * expected_mass_asym_i), where H = log(pT_max/pT_min).
-        # Minimising this negative quantity increases H-weighted expected asymmetry,
-        # disfavouring signal-like (low-asymmetry) interpretations for QCD-dominated events.
-        if lambda_qcd > 0 and "mass_asym_flat" in output:
-            px_all = four_mom[..., 1]
-            py_all = four_mom[..., 2]
-            pt_all = torch.sqrt(px_all**2 + py_all**2).clamp(min=1e-8)
-            pt_max = pt_all.max(dim=-1).values
-            pt_min = pt_all.min(dim=-1).values.clamp(min=1e-8)
-            # Clamp H to prevent very large values from degenerate (near-zero pT_min) events
-            H = torch.log(pt_max / pt_min).clamp(max=10.0)             # (batch,) hierarchy score
-
-            # Detach mass_asym: we only want to steer the assignment probabilities,
-            # not back-propagate through the physics feature computation itself.
-            mass_asym_qcd = output["mass_asym_flat"].detach()           # (batch, num_assignments)
-            probs_qcd = logits.softmax(dim=-1)
-            expected_asym = (probs_qcd * mass_asym_qcd).sum(dim=-1)    # (batch,)
-            # Negative sign: minimising drives H * expected_asym upward for high-H events
-            loss_qcd_term = -(H * expected_asym).mean()
-            loss_ce = loss_ce + lambda_qcd * loss_qcd_term
-
-        # Adversarial mass loss
-        mass_mask = parent_mass > 0
-        if mass_mask.any() and lambda_adv > 0:
-            loss_adv = mse_loss_fn(mass_pred[mass_mask], parent_mass[mass_mask])
-            loss_adv = torch.clamp(loss_adv, max=10.0)
-        else:
+        if phase1_only and optimizer is not None:
+            # ---------------------------------------------------------------
+            # Phase 1 training: distillation loss only.
+            # No CE, no ISR, no sym/qcd, no adversary.  The model is taught
+            # to rank assignments by mass asymmetry before it is allowed to
+            # use any labelled signal or ISR information.
+            # ---------------------------------------------------------------
+            if lambda_distill > 0 and "mass_asym_flat" in output:
+                T = distill_temperature
+                teacher_logits = -output["mass_asym_flat"].detach()
+                teacher_probs = F.softmax(teacher_logits / T, dim=-1)
+                student_log_probs = F.log_softmax(logits / T, dim=-1)
+                loss = T ** 2 * F.kl_div(
+                    student_log_probs, teacher_probs, reduction="batchmean"
+                ) * lambda_distill
+            else:
+                # Fallback: plain CE (distillation misconfigured)
+                loss = ce_loss_fn(logits, labels)
             loss_adv = torch.tensor(0.0, device=device)
 
-        loss = loss_ce + lambda_adv * loss_adv
+            # Still track factored accuracy metrics for monitoring
+            if factored and "isr_logits" in output:
+                isr_logits = output["isr_logits"]
+                grouping_logits = output["grouping_logits"]
+                isr_labels = model.flat_to_factored[labels, 0]
+                batch_idx = torch.arange(labels.shape[0], device=device)
+                gt_grp_logits = grouping_logits[batch_idx, isr_labels]
+                grouping_labels = model.flat_to_factored[labels, 1]
+                total_isr_correct += (isr_logits.argmax(dim=-1) == isr_labels).sum().item()
+                total_grp_correct += (gt_grp_logits.argmax(dim=-1) == grouping_labels).sum().item()
+        else:
+            # ---------------------------------------------------------------
+            # Phase 2 (or legacy single-phase) training: full loss.
+            # ---------------------------------------------------------------
+
+            # Assignment loss
+            if factored and "isr_logits" in output:
+                isr_logits = output["isr_logits"]
+                grouping_logits = output["grouping_logits"]
+
+                isr_labels = model.flat_to_factored[labels, 0]
+                grouping_labels = model.flat_to_factored[labels, 1]
+
+                loss_isr = ce_loss_fn(isr_logits, isr_labels)
+
+                batch_idx = torch.arange(labels.shape[0], device=device)
+                gt_grp_logits = grouping_logits[batch_idx, isr_labels]
+                loss_grp_tf = ce_loss_fn(gt_grp_logits, grouping_labels)
+
+                # Blend teacher-forced factored loss with flat end-to-end loss
+                # tf_ratio=1: fully teacher-forced (original); tf_ratio=0: flat CE only
+                # lambda_isr upweights the ISR loss to compensate for a gradient imbalance:
+                # each signal jet appears in all num_groupings groupings, so loss_grp_tf
+                # produces num_groupings gradient paths per signal jet while the ISR jet
+                # (excluded from every group) receives gradient only from loss_isr.
+                # Scaling loss_isr by lambda_isr partially rebalances this asymmetry.
+                loss_flat = ce_loss_fn(logits, labels)
+                loss_ce = tf_ratio * (lambda_isr * loss_isr + loss_grp_tf) + (1.0 - tf_ratio) * loss_flat
+
+                total_isr_correct += (isr_logits.argmax(dim=-1) == isr_labels).sum().item()
+                total_grp_correct += (gt_grp_logits.argmax(dim=-1) == grouping_labels).sum().item()
+            else:
+                loss_ce = ce_loss_fn(logits, labels)
+
+            # Classical distillation loss: pull NN logits toward the classical
+            # mass-asymmetry solver (argmin |m1-m2|/(m1+m2) = argmax -mass_asym).
+            # mass_asym_flat is scale-invariant so it is unaffected by HT normalisation.
+            # The T² factor restores gradient magnitudes after temperature scaling
+            # (Hinton et al. 2015).  This loss decays to zero by lambda_distill_epochs
+            # (counted from the Phase 2 start epoch when two-phase training is active).
+            if lambda_distill > 0 and "mass_asym_flat" in output:
+                T = distill_temperature
+                teacher_logits = -output["mass_asym_flat"].detach()  # (batch, num_assignments)
+                teacher_probs = F.softmax(teacher_logits / T, dim=-1)
+                student_log_probs = F.log_softmax(logits / T, dim=-1)
+                loss_distill = T ** 2 * F.kl_div(
+                    student_log_probs, teacher_probs, reduction="batchmean"
+                )
+                loss_ce = loss_ce + lambda_distill * loss_distill
+
+            # Mass symmetry auxiliary loss: minimize expected |m1-m2|/(m1+m2) over assignments
+            if lambda_sym > 0 and "mass_asym_flat" in output:
+                mass_asym = output["mass_asym_flat"].detach()  # (batch, num_assignments)
+                probs = logits.softmax(dim=-1)
+                loss_sym = (probs * mass_asym).sum(dim=-1).mean()
+                loss_ce = loss_ce + lambda_sym * loss_sym
+
+            # QCD hierarchy penalty: events with large pT hierarchies (QCD-like) are pushed
+            # to prefer high-mass-asymmetry assignments, making them self-select interpretations
+            # that look maximally unlike a symmetric signal decay.
+            # loss_qcd = -mean(H_i * expected_mass_asym_i), where H = log(pT_max/pT_min).
+            # Minimising this negative quantity increases H-weighted expected asymmetry,
+            # disfavouring signal-like (low-asymmetry) interpretations for QCD-dominated events.
+            if lambda_qcd > 0 and "mass_asym_flat" in output:
+                px_all = four_mom[..., 1]
+                py_all = four_mom[..., 2]
+                pt_all = torch.sqrt(px_all**2 + py_all**2).clamp(min=1e-8)
+                pt_max = pt_all.max(dim=-1).values
+                pt_min = pt_all.min(dim=-1).values.clamp(min=1e-8)
+                # Clamp H to prevent very large values from degenerate (near-zero pT_min) events
+                H = torch.log(pt_max / pt_min).clamp(max=10.0)             # (batch,) hierarchy score
+
+                # Detach mass_asym: we only want to steer the assignment probabilities,
+                # not back-propagate through the physics feature computation itself.
+                mass_asym_qcd = output["mass_asym_flat"].detach()           # (batch, num_assignments)
+                probs_qcd = logits.softmax(dim=-1)
+                expected_asym = (probs_qcd * mass_asym_qcd).sum(dim=-1)    # (batch,)
+                # Negative sign: minimising drives H * expected_asym upward for high-H events
+                loss_qcd_term = -(H * expected_asym).mean()
+                loss_ce = loss_ce + lambda_qcd * loss_qcd_term
+
+            # Adversarial mass loss
+            mass_mask = parent_mass > 0
+            if mass_mask.any() and lambda_adv > 0:
+                loss_adv = mse_loss_fn(mass_pred[mass_mask], parent_mass[mass_mask])
+                loss_adv = torch.clamp(loss_adv, max=10.0)
+            else:
+                loss_adv = torch.tensor(0.0, device=device)
+            loss = loss_ce + lambda_adv * loss_adv
 
         if optimizer is not None:
             optimizer.zero_grad()
@@ -494,6 +624,7 @@ def _run_epoch(
         _, top5 = logits.topk(5, dim=-1)
         total_correct5 += (top5 == labels.unsqueeze(-1)).any(dim=-1).sum().item()
 
+        mass_mask = parent_mass > 0
         if mass_mask.any():
             all_mass_pred.append(mass_pred[mass_mask].detach().cpu())
             all_mass_true.append(parent_mass[mass_mask].detach().cpu())
