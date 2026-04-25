@@ -662,9 +662,15 @@ class MassAsymmetryClassicalSolver(nn.Module):
     Args:
         num_jets: Number of input jets (6 or 7).
     """
+    # LHC proton-proton center-of-mass energy for the requested 13 TeV context.
     COM_ENERGY_GEV = 13000.0
+    # Normalized kinematic-feasibility threshold (E_total / sqrt(s) <= 1).
     ENERGY_FRACTION_BASELINE = 1.0
+    # Unit offset keeps opening-angle scaling active even at low energy fraction.
     OPENING_SCALE_OFFSET = 1.0
+    # Small ΔR contribution to angular penalty (secondary to Δφ back-to-backness).
+    DELTA_R_WEIGHT = 0.1
+    # Secondary-feature blend used only for tie-breaking after primary mass difference.
     SECONDARY_WEIGHTS = {
         "asymmetry": 0.45,
         "pt_hierarchy": 0.20,
@@ -672,6 +678,7 @@ class MassAsymmetryClassicalSolver(nn.Module):
         "dalitz": 0.10,
         "kine13": 0.10,
     }
+    # Keeps secondary term lexicographic-like versus GeV-scale primary |m1-m2|.
     SECONDARY_TIEBREAK_SCALE = 1.0e-3
 
     def __init__(self, num_jets: int = 7):
@@ -749,7 +756,10 @@ class MassAsymmetryClassicalSolver(nn.Module):
         phi2 = torch.atan2(py2, px2)
         dphi = JetAssignmentTransformer.wrap_dphi(phi1 - phi2)
         delta_r = torch.sqrt((eta1 - eta2) ** 2 + dphi**2 + 1e-8)
-        angular_penalty = torch.abs(torch.pi - torch.abs(dphi)) / torch.pi + 0.1 * delta_r
+        angular_penalty = (
+            torch.abs(torch.pi - torch.abs(dphi)) / torch.pi
+            + self.DELTA_R_WEIGHT * delta_r
+        )
 
         # Dalitz-like inter-group consistency
         dalitz_penalty = (
