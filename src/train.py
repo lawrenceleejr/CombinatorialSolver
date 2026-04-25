@@ -379,8 +379,18 @@ def train(config_path: str | None = None, data_path: str | None = None):
         # Phase 1 plateau detection → trigger Phase 2
         # ---------------------------------------------------------------
         if training_phase == 1 and phase1_active:
-            if val_metrics["acc"] > phase1_best_acc:
-                phase1_best_acc = val_metrics["acc"]
+            # Use grouping accuracy (given truth ISR) as the Phase 1 plateau
+            # signal.  During Phase 1 the ISR head is frozen at random initial
+            # weights, so the *combined* assignment accuracy (acc) stays near
+            # 1/70 ≈ 1.4% regardless of how well the grouping scorer is
+            # learning — using acc would trigger Phase 2 prematurely after
+            # just a few epochs.  grp_acc measures "given the truth ISR, how
+            # often does the grouping head pick the right 3+3 split?", which
+            # is exactly what Phase 1 is training.  For 6-jet (no-ISR) models,
+            # grp_acc is not reported, so fall back to acc.
+            phase1_monitor = val_metrics.get("grp_acc", val_metrics["acc"])
+            if phase1_monitor > phase1_best_acc:
+                phase1_best_acc = phase1_monitor
                 phase1_no_improve = 0
             else:
                 phase1_no_improve += 1
@@ -390,7 +400,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 phase2_start_epoch = epoch + 1
                 print(
                     f"\n*** Phase 1 plateau at epoch {epoch+1} "
-                    f"(best acc={phase1_best_acc:.4f}, "
+                    f"(best grp_acc={phase1_best_acc:.4f}, "
                     f"no improvement for {phase1_patience} epochs). "
                     f"Entering Phase 2: full supervised training. ***\n"
                 )
