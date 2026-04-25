@@ -662,7 +662,7 @@ class MassAsymmetryClassicalSolver(nn.Module):
     Args:
         num_jets: Number of input jets (6 or 7).
     """
-    # LHC proton-proton center-of-mass energy for the requested 13 TeV context.
+    # LHC proton-proton center-of-mass energy in GeV (sqrt(s)=13 TeV = 13000 GeV).
     COM_ENERGY_GEV = 13000.0
     # Theoretical maximum of E_total/sqrt(s): 1.0 when all COM energy is captured.
     ENERGY_FRACTION_BASELINE = 1.0
@@ -803,7 +803,9 @@ class MassAsymmetryClassicalSolver(nn.Module):
             + self.SECONDARY_WEIGHTS["kine13"] * kine13_penalty
         )
 
-        # Hard physicality guard: assignments above sqrt(s)=13 TeV get a GeV-scale penalty.
+        # Hard physicality guard: convert overflow fraction back to GeV scale so it
+        # is comparable to the primary |m1-m2| term and can strongly reject unphysical
+        # interpretations even before tiny secondary tie-break terms are applied.
         physicality_penalty = energy_overflow * self.COM_ENERGY_GEV
         # Lexicographic-style score: primary mass difference first, then refinement.
         staged_score = mass_diff + physicality_penalty + self.SECONDARY_TIEBREAK_SCALE * secondary_penalty
