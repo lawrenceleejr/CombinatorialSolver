@@ -602,17 +602,25 @@ def _run_epoch(
             # Classical distillation loss: pull NN logits toward the classical
             # mass-asymmetry solver (argmin |m1-m2|/(m1+m2) = argmax -mass_asym).
             # mass_asym_flat is scale-invariant so it is unaffected by HT normalisation.
-            # The T² factor restores gradient magnitudes after temperature scaling
-            # (Hinton et al. 2015).  This loss decays to zero by lambda_distill_epochs
-            # (counted from the Phase 2 start epoch when two-phase training is active).
+            # No T² rescaling (Hinton et al. 2015): T² is only correct when teacher
+            # logits are NN outputs softened by T; here the teacher is -mass_asym
+            # (a bounded physics quantity), so T² would over-amplify the KL gradient.
+            # This loss decays to zero by lambda_distill_epochs (counted from the
+            # Phase 2 start epoch when two-phase training is active).
             if lambda_distill > 0 and "mass_asym_flat" in output:
                 T = distill_temperature
                 teacher_logits = -output["mass_asym_flat"].detach()  # (batch, num_assignments)
                 teacher_probs = F.softmax(teacher_logits / T, dim=-1)
                 student_log_probs = F.log_softmax(logits / T, dim=-1)
-                loss_distill = T ** 2 * F.kl_div(
-                    student_log_probs, teacher_probs, reduction="batchmean"
-                )
+                # NOTE: we intentionally omit Hinton's T² gradient-restoration factor.
+                # T² is only valid when both teacher and student are NN logits scaled
+                # by the same temperature T.  Here the teacher is -mass_asym ∈ [-1,0]
+                # (a bounded physics quantity, not a NN output).  With T=4 and
+                # lambda_distill=2, the T² factor would give an effective KL weight
+                # of 32, amplifying the gradient enough to oppose the CE signal
+                # (KL pushes student_prob toward uniform teacher ≈ 1/70) and cap
+                # the model at ~1.6% accuracy for the entire 20-epoch decay period.
+                loss_distill = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
                 loss_ce = loss_ce + lambda_distill * loss_distill
 
             # Mass symmetry auxiliary loss: minimize expected |m1-m2|/(m1+m2) over assignments

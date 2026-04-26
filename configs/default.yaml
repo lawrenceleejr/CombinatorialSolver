@@ -30,10 +30,13 @@ training:
   lambda_qcd: 0.1
   lambda_qcd_rampup: 20
   # Distillation from the classical mass-asymmetry solver.
-  # At epoch 0 this loss pulls the NN toward the argmin-|m1-m2|/(m1+m2) solution
-  # (i.e. the assignment with the smallest relative mass difference between the two
-  # candidate parent groups); it decays linearly to zero by epoch lambda_distill_epochs
-  # so that the labelled cross-entropy signal takes over from there.
+  # At Phase 2 epoch 0 this loss pulls the NN logits toward the assignment with
+  # the smallest |m1-m2|/(m1+m2).  It decays linearly to zero over
+  # lambda_distill_epochs so the labelled CE signal takes over.
+  # NOTE: the T² gradient-restoration factor (Hinton 2015) is NOT applied here
+  # because the teacher logits are -mass_asym ∈ [-1,0], not NN outputs.  T²
+  # would amplify the KL gradient by 16 (T=4), overpowering CE and capping
+  # accuracy near random for the full decay period.
   lambda_distill: 2.0
   lambda_distill_epochs: 20
   distill_temperature: 4.0
