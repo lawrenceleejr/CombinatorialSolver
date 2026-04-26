@@ -274,8 +274,12 @@ def train(config_path: str | None = None, data_path: str | None = None):
             restart_period=tc.get("restart_period", 0),
         )
 
-        # During Phase 1, clamp LR to a small fraction of each group's max LR
-        # so the pseudolabel CE loss doesn't diverge during warmup.
+        # During Phase 1, clamp LR to phase1_lr_fraction × initial_lr.
+        # Phase 1 uses a pure 10-class grouping-CE pseudolabel loss (no
+        # sym/qcd/adversary/distillation terms), which is stable at the full
+        # cosine LR. phase1_max_lr_fraction defaults to 1.0 (no cap) so Phase 1
+        # can converge in the ~15-20 epochs before phase1_patience fires.
+        # Reduce if Phase 1 shows training-loss divergence.
         if training_phase == 1 and phase1_active:
             for pg in optimizer.param_groups:
                 pg["lr"] = min(pg["lr"], pg["initial_lr"] * phase1_lr_fraction)

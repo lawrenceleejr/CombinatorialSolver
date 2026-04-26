@@ -55,12 +55,14 @@ training:
   #             Phase 2 start epoch.
   #   Set phase1_patience: 0 to disable two-phase training (legacy behaviour).
   phase1_patience: 15
-  # During Phase 1 the normal cosine warmup ramps LR from 0 to learning_rate
-  # over warmup_epochs.  This is calibrated for the Phase 2 multi-component
-  # loss; the simple grouping-CE pseudolabel loss diverges at that scale.
-  # phase1_max_lr_fraction caps each param group at initial_lr × fraction,
-  # keeping Phase 1 stable.  0.1 (= 3e-5 with learning_rate=3e-4) works well.
-  phase1_max_lr_fraction: 0.1
+  # LR cap for Phase 1.  Phase 1 uses a pure 10-class grouping-CE loss (no
+  # auxiliary sym/qcd/adversary terms); this simple objective is stable at the
+  # full cosine-schedule LR.  Setting phase1_max_lr_fraction: 1.0 lets Phase 1
+  # follow the same cosine warmup as Phase 2, so it converges in the 15-20
+  # epochs before phase1_patience fires (rather than barely moving off random
+  # at the overly-conservative 3e-5 = 0.1 × 3e-4 that was previously used).
+  # Reduce below 1.0 only if Phase 1 shows training-loss divergence.
+  phase1_max_lr_fraction: 1.0
 
 data:
   normalize_by_ht: true
