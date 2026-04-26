@@ -234,6 +234,11 @@ def train(config_path: str | None = None, data_path: str | None = None):
     # -------------------------------------------------------------------------
     phase1_patience = tc.get("phase1_patience", 0)
     phase1_active = phase1_patience > 0
+    # Phase 1 LR cap: the normal cosine warmup ramps from 0 to base_lr in
+    # warmup_epochs, which is calibrated for the Phase 2 multi-component loss.
+    # The simple grouping-CE pseudolabel loss diverges at that scale, so we cap
+    # Phase 1 LR at phase1_max_lr_fraction * initial_lr.
+    phase1_lr_fraction = tc.get("phase1_max_lr_fraction", 0.1)
     training_phase = 1  # 1 or 2
     phase1_best_acc = 0.0
     phase1_no_improve = 0
@@ -253,12 +258,14 @@ def train(config_path: str | None = None, data_path: str | None = None):
             print(
                 f"Phase 1: ISR head frozen. Training grouping head with "
                 f"mass-asymmetry pseudolabels "
-                f"(patience={phase1_patience} epochs before Phase 2)."
+                f"(patience={phase1_patience} epochs, "
+                f"LR capped at {phase1_lr_fraction * base_lr:.1e} before Phase 2)."
             )
         else:
             print(
                 f"Phase 1: Training with mass-asymmetry pseudolabels "
-                f"(patience={phase1_patience} epochs before Phase 2)."
+                f"(patience={phase1_patience} epochs, "
+                f"LR capped at {phase1_lr_fraction * base_lr:.1e} before Phase 2)."
             )
 
     for epoch in range(tc["num_epochs"]):
@@ -266,6 +273,13 @@ def train(config_path: str | None = None, data_path: str | None = None):
             optimizer, epoch, tc["num_epochs"], tc["warmup_epochs"],
             restart_period=tc.get("restart_period", 0),
         )
+
+        # During Phase 1, clamp LR to a small fraction of each group's max LR
+        # so the pseudolabel CE loss doesn't diverge during warmup.
+        if training_phase == 1 and phase1_active:
+            for pg in optimizer.param_groups:
+                pg["lr"] = min(pg["lr"], pg["initial_lr"] * phase1_lr_fraction)
+
         current_lr = optimizer.param_groups[0]["lr"]
 
         if use_adversary and training_phase == 2:
