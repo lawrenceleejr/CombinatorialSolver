@@ -121,7 +121,12 @@ def evaluate(
             # interpretations without retraining the model.
             if physics_blend_alpha > 0.0 and "mass_asym_flat" in output:
                 probs = logits.softmax(dim=-1)
-                # Per-event uncertainty: 0 when confident, 1 when uniform.
+                # Per-event uncertainty via 1 - max(softmax): 0 when fully
+                # confident in one assignment, 1 when uniform over all.
+                # This is used instead of entropy here because it produces
+                # the same ordering of events by confidence but is cheaper
+                # to compute (no log) and maps to [0, 1] without requiring
+                # normalization by log(N_assignments).
                 uncertainty = 1.0 - probs.max(dim=-1).values   # (batch,)
                 # Physics score: reward high asymmetry, penalise high mass sum.
                 mass_asym = output["mass_asym_flat"]            # (batch, N)

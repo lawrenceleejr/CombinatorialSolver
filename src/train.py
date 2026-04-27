@@ -302,6 +302,14 @@ def train(config_path: str | None = None, data_path: str | None = None):
     lambda_entropy_mass_max = tc.get("lambda_entropy_mass", 0.0)
     lambda_entropy_asym_rampup = tc.get("lambda_entropy_asym_rampup", 0)
     lambda_entropy_mass_rampup = tc.get("lambda_entropy_mass_rampup", 0)
+    if lambda_entropy_asym_max > 0 or lambda_entropy_mass_max > 0:
+        print(
+            f"Entropy-weighted physics prior: "
+            f"lambda_entropy_asym={lambda_entropy_asym_max} "
+            f"(rampup={lambda_entropy_asym_rampup}), "
+            f"lambda_entropy_mass={lambda_entropy_mass_max} "
+            f"(rampup={lambda_entropy_mass_rampup})"
+        )
     if lambda_distill_max > 0 and lambda_distill_epochs > 0:
         print(
             f"Classical distillation: lambda={lambda_distill_max}, "
