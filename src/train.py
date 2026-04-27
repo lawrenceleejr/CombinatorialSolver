@@ -449,6 +449,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
             )
         asym_str = (
             f" | AvgAsym={val_metrics['avg_mass_asym']:.4f}"
+            f"±{val_metrics['std_mass_asym']:.4f}"
             if "avg_mass_asym" in val_metrics
             else ""
         )
@@ -590,6 +591,7 @@ def _run_epoch(
     total_samples = 0
     total_mass_asym = 0.0
     total_mass_asym_samples = 0
+    all_pred_asym = []
     all_mass_pred = []
     all_mass_true = []
     factored = model.has_isr
@@ -790,6 +792,7 @@ def _run_epoch(
             pred_asym = mass_asym_flat.gather(1, preds.unsqueeze(1)).squeeze(1)  # (batch,)
             total_mass_asym += pred_asym.sum().item()
             total_mass_asym_samples += batch_size
+            all_pred_asym.append(pred_asym.cpu())
 
         mass_mask = parent_mass > 0
         if mass_mask.any():
@@ -812,6 +815,7 @@ def _run_epoch(
     result = {"loss": avg_loss, "acc": acc, "acc5": acc5, "adv_r2": adv_r2}
     if total_mass_asym_samples > 0:
         result["avg_mass_asym"] = total_mass_asym / total_mass_asym_samples
+        result["std_mass_asym"] = torch.cat(all_pred_asym).std().item()
     if factored:
         result["isr_acc"] = total_isr_correct / max(total_samples, 1)
         result["grp_acc"] = total_grp_correct / max(total_samples, 1)
