@@ -81,7 +81,7 @@ training:
 data:
   normalize_by_ht: true
   num_jets: 7
-  pt_smear_frac: 0.0
+  pt_smear_frac: 0.20
   # Compute truth labels as argmin |m1-m2| over all 70 interpretations (recommended).
   # This is the physically correct ground truth for equal-mass pair-produced resonances
   # and removes dependence on potentially incorrect TARGETS entries in the HDF5 file.
