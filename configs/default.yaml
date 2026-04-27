@@ -43,9 +43,9 @@ training:
   # proxy) because they directly use the network's own uncertainty as the signal.
   # Both default to 0 (disabled); ramp up from Phase 2 start over N epochs like
   # lambda_sym/qcd.  Start with small values (0.05–0.2) and monitor val acc.
-  lambda_entropy_asym: 0.0
+  lambda_entropy_asym: 0.1
   lambda_entropy_asym_rampup: 20
-  lambda_entropy_mass: 0.0
+  lambda_entropy_mass: 0.05
   lambda_entropy_mass_rampup: 20
   # Distillation from the classical mass-asymmetry solver.
   # At Phase 2 epoch 0 this loss pulls the NN logits toward the assignment with
