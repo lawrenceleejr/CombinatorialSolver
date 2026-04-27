@@ -210,6 +210,8 @@ def train(config_path: str | None = None, data_path: str | None = None):
     lambda_qcd_max = tc.get("lambda_qcd", 0.0)
     lambda_sym_rampup = tc.get("lambda_sym_rampup", 0)
     lambda_qcd_rampup = tc.get("lambda_qcd_rampup", 0)
+    lambda_isr_direct_max = tc.get("lambda_isr_direct", 0.0)
+    lambda_isr_direct_rampup = tc.get("lambda_isr_direct_rampup", 0)
     lambda_distill_max = tc.get("lambda_distill", 2.0)
     lambda_distill_epochs = tc.get("lambda_distill_epochs", 20)
     distill_temperature = tc.get("distill_temperature", 4.0)
@@ -306,6 +308,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
             tf_ratio = 0.0          # irrelevant (CE loss is skipped)
             lambda_sym = 0.0
             lambda_qcd = 0.0
+            lambda_isr_direct = 0.0
             phase1_only_train = True
         else:
             # Phase 2: teacher forcing, auxiliary losses, decaying distillation
@@ -328,6 +331,13 @@ def train(config_path: str | None = None, data_path: str | None = None):
             else:
                 lambda_qcd = lambda_qcd_max
 
+            if lambda_isr_direct_rampup > 0:
+                lambda_isr_direct = lambda_isr_direct_max * min(
+                    1.0, phase2_epoch / lambda_isr_direct_rampup
+                )
+            else:
+                lambda_isr_direct = lambda_isr_direct_max
+
             # Distillation decays from max to zero over lambda_distill_epochs
             if lambda_distill_epochs > 0:
                 lambda_distill = lambda_distill_max * max(
@@ -344,7 +354,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
             model, train_loader, ce_loss_fn, mse_loss_fn,
             lambda_adv, device, optimizer=optimizer,
             tf_ratio=tf_ratio, lambda_sym=lambda_sym, lambda_qcd=lambda_qcd,
-            lambda_isr=lambda_isr,
+            lambda_isr=lambda_isr, lambda_isr_direct=lambda_isr_direct,
             lambda_distill=lambda_distill, distill_temperature=distill_temperature,
             phase1_only=phase1_only_train,
         )
@@ -356,7 +366,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 model, val_loader, ce_loss_fn, mse_loss_fn,
                 lambda_adv, device, optimizer=None,
                 tf_ratio=0.0, lambda_sym=0.0, lambda_qcd=0.0,
-                lambda_isr=lambda_isr,
+                lambda_isr=lambda_isr, lambda_isr_direct=0.0,
                 lambda_distill=0.0, distill_temperature=distill_temperature,
             )
 
@@ -477,7 +487,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
 def _run_epoch(
     model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optimizer=None,
-    tf_ratio=1.0, lambda_sym=0.0, lambda_qcd=0.0, lambda_isr=1.0,
+    tf_ratio=1.0, lambda_sym=0.0, lambda_qcd=0.0, lambda_isr=1.0, lambda_isr_direct=0.0,
     lambda_distill=0.0, distill_temperature=4.0, phase1_only=False,
 ):
     """Run one epoch of training or validation.
@@ -608,6 +618,20 @@ def _run_epoch(
 
                 total_isr_correct += (isr_logits.argmax(dim=-1) == isr_labels).sum().item()
                 total_grp_correct += (gt_grp_logits.argmax(dim=-1) == grouping_labels).sum().item()
+
+                # Direct ISR supervision from flat logits: for each ISR candidate j, take
+                # the max grouping score assuming jet j is ISR.  This marginalises out the
+                # grouping choice and gives a per-jet ISR score derived from the final flat
+                # logits, providing a gradient path directly through the combined logits
+                # rather than only through the isr_head auxiliary branch.
+                if lambda_isr_direct > 0:
+                    f2f_flat = model.factored_to_flat.reshape(-1)  # (num_jets * num_groupings,)
+                    logits_fac = logits[:, f2f_flat].reshape(
+                        labels.shape[0], model.num_jets, model.num_groupings
+                    )
+                    isr_logits_direct = logits_fac.max(dim=2).values   # (batch, num_jets)
+                    loss_isr_direct = ce_loss_fn(isr_logits_direct, isr_labels)
+                    loss_ce = loss_ce + lambda_isr_direct * loss_isr_direct
             else:
                 loss_ce = ce_loss_fn(logits, labels)
 
