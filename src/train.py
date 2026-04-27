@@ -636,13 +636,15 @@ def _run_epoch(
             # factor (massless approximation — η preserved means all components
             # scale proportionally with pT).  Applied per batch so each epoch
             # sees a fresh random realization, acting as data augmentation.
+            # smear_factor = 1 + σ·N(0,1) where σ = pt_smear_frac (std deviation).
             if pt_smear_frac > 0:
                 num_jets = four_mom.shape[1]
                 smear = (
                     1.0 + pt_smear_frac * torch.randn(batch_size, num_jets, device=device)
                 ).clamp(0.5, 1.5).unsqueeze(-1)  # (batch, jets, 1)
                 four_mom = four_mom * smear
-                # Re-normalize by the new HT so scale invariance is preserved
+                # Re-normalize by the new event HT (= sum of new per-jet pT magnitudes)
+                # so that HT-normalized scale invariance is preserved post-smearing.
                 new_ht = torch.sqrt(
                     four_mom[:, :, 1] ** 2 + four_mom[:, :, 2] ** 2
                 ).sum(dim=1, keepdim=True).clamp(min=1e-6).unsqueeze(-1)  # (batch, 1, 1)
