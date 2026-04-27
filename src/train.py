@@ -369,12 +369,17 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 f" | ISR={val_metrics['isr_acc']:.3f}"
                 f" Grp={val_metrics['grp_acc']:.3f}"
             )
+        asym_str = (
+            f" | AvgAsym={val_metrics['avg_mass_asym']:.4f}"
+            if "avg_mass_asym" in val_metrics
+            else ""
+        )
 
         print(
             f"Epoch {epoch+1:3d}/{tc['num_epochs']} {phase_tag} | "
             f"Train loss={train_metrics['loss']:.4f} acc={train_metrics['acc']:.3f} | "
             f"Val loss={val_metrics['loss']:.4f} acc={val_metrics['acc']:.3f}"
-            f"{isr_str}{adv_str} | "
+            f"{isr_str}{adv_str}{asym_str} | "
             f"LR={current_lr:.2e}"
         )
 
@@ -490,6 +495,8 @@ def _run_epoch(
     total_isr_correct = 0
     total_grp_correct = 0
     total_samples = 0
+    total_mass_asym = 0.0
+    total_mass_asym_samples = 0
     all_mass_pred = []
     all_mass_true = []
     factored = model.has_isr
@@ -685,6 +692,12 @@ def _run_epoch(
         _, top5 = logits.topk(5, dim=-1)
         total_correct5 += (top5 == labels.unsqueeze(-1)).any(dim=-1).sum().item()
 
+        if "mass_asym_flat" in output:
+            mass_asym_flat = output["mass_asym_flat"].detach()  # (batch, num_assignments)
+            pred_asym = mass_asym_flat.gather(1, preds.unsqueeze(1)).squeeze(1)  # (batch,)
+            total_mass_asym += pred_asym.sum().item()
+            total_mass_asym_samples += batch_size
+
         mass_mask = parent_mass > 0
         if mass_mask.any():
             all_mass_pred.append(mass_pred[mass_mask].detach().cpu())
@@ -704,6 +717,8 @@ def _run_epoch(
             adv_r2 = 1.0 - (ss_res / ss_tot).item()
 
     result = {"loss": avg_loss, "acc": acc, "acc5": acc5, "adv_r2": adv_r2}
+    if total_mass_asym_samples > 0:
+        result["avg_mass_asym"] = total_mass_asym / total_mass_asym_samples
     if factored:
         result["isr_acc"] = total_isr_correct / max(total_samples, 1)
         result["grp_acc"] = total_grp_correct / max(total_samples, 1)
