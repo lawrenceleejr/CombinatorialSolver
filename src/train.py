@@ -293,6 +293,15 @@ def train(config_path: str | None = None, data_path: str | None = None):
     lambda_distill_max = tc.get("lambda_distill", 2.0)
     lambda_distill_epochs = tc.get("lambda_distill_epochs", 20)
     distill_temperature = tc.get("distill_temperature", 4.0)
+    # Entropy-weighted physics prior losses (push uncertain events toward
+    # QCD-like interpretations with high mass asymmetry and low mass sum):
+    #   lambda_entropy_asym: maximises entropy-weighted expected mass asymmetry.
+    #   lambda_entropy_mass: minimises entropy-weighted expected mass sum (m1+m2).
+    # Both are zero by default; ramp up from Phase 2 start like lambda_sym/qcd.
+    lambda_entropy_asym_max = tc.get("lambda_entropy_asym", 0.0)
+    lambda_entropy_mass_max = tc.get("lambda_entropy_mass", 0.0)
+    lambda_entropy_asym_rampup = tc.get("lambda_entropy_asym_rampup", 0)
+    lambda_entropy_mass_rampup = tc.get("lambda_entropy_mass_rampup", 0)
     if lambda_distill_max > 0 and lambda_distill_epochs > 0:
         print(
             f"Classical distillation: lambda={lambda_distill_max}, "
@@ -387,6 +396,8 @@ def train(config_path: str | None = None, data_path: str | None = None):
             lambda_sym = 0.0
             lambda_qcd = 0.0
             lambda_isr_direct = 0.0
+            lambda_entropy_asym = 0.0
+            lambda_entropy_mass = 0.0
             phase1_only_train = True
         else:
             # Phase 2: teacher forcing, auxiliary losses, decaying distillation
@@ -416,6 +427,20 @@ def train(config_path: str | None = None, data_path: str | None = None):
             else:
                 lambda_isr_direct = lambda_isr_direct_max
 
+            if lambda_entropy_asym_rampup > 0:
+                lambda_entropy_asym = lambda_entropy_asym_max * min(
+                    1.0, phase2_epoch / lambda_entropy_asym_rampup
+                )
+            else:
+                lambda_entropy_asym = lambda_entropy_asym_max
+
+            if lambda_entropy_mass_rampup > 0:
+                lambda_entropy_mass = lambda_entropy_mass_max * min(
+                    1.0, phase2_epoch / lambda_entropy_mass_rampup
+                )
+            else:
+                lambda_entropy_mass = lambda_entropy_mass_max
+
             # Distillation decays from max to zero over lambda_distill_epochs
             if lambda_distill_epochs > 0:
                 lambda_distill = lambda_distill_max * max(
@@ -434,6 +459,8 @@ def train(config_path: str | None = None, data_path: str | None = None):
             tf_ratio=tf_ratio, lambda_sym=lambda_sym, lambda_qcd=lambda_qcd,
             lambda_isr=lambda_isr, lambda_isr_direct=lambda_isr_direct,
             lambda_distill=lambda_distill, distill_temperature=distill_temperature,
+            lambda_entropy_asym=lambda_entropy_asym,
+            lambda_entropy_mass=lambda_entropy_mass,
             phase1_only=phase1_only_train,
         )
 
@@ -446,6 +473,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 tf_ratio=0.0, lambda_sym=0.0, lambda_qcd=0.0,
                 lambda_isr=lambda_isr, lambda_isr_direct=0.0,
                 lambda_distill=0.0, distill_temperature=distill_temperature,
+                lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
             )
 
         # Log
@@ -582,7 +610,9 @@ def train(config_path: str | None = None, data_path: str | None = None):
 def _run_epoch(
     model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optimizer=None,
     tf_ratio=1.0, lambda_sym=0.0, lambda_qcd=0.0, lambda_isr=1.0, lambda_isr_direct=0.0,
-    lambda_distill=0.0, distill_temperature=4.0, phase1_only=False,
+    lambda_distill=0.0, distill_temperature=4.0,
+    lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
+    phase1_only=False,
 ):
     """Run one epoch of training or validation.
 
@@ -784,6 +814,45 @@ def _run_epoch(
                 # Negative sign: minimising drives H * expected_asym upward for high-H events
                 loss_qcd_term = -(H * expected_asym).mean()
                 loss_ce = loss_ce + lambda_qcd * loss_qcd_term
+
+            # Entropy-weighted physics prior losses.
+            #
+            # When the network is uncertain (high output entropy), it receives a
+            # gradient that steers its assignment probabilities toward interpretations
+            # that look like QCD multijet background: high mass asymmetry (|m1-m2|
+            # large relative to m1+m2) and low total mass (m1+m2 small).  This is
+            # complementary to lambda_qcd (which uses pT hierarchy as the QCD proxy)
+            # because it directly uses the network's own uncertainty as the signal.
+            #
+            # Entropy is detached so it acts purely as a per-event weight, not as a
+            # quantity being minimised.  Entropy is normalised by log(N_assignments)
+            # so it lies in [0, 1] regardless of the number of candidate assignments.
+            #
+            # lambda_entropy_asym: coefficient for the asymmetry term.
+            #   loss = -mean(norm_entropy * expected_mass_asym)
+            #   Minimising this drives uncertain events toward high-asymmetry choices.
+            # lambda_entropy_mass: coefficient for the mass-sum term.
+            #   loss = mean(norm_entropy * expected_mass_sum)
+            #   Minimising this drives uncertain events toward low-mass choices.
+            if (lambda_entropy_asym > 0 or lambda_entropy_mass > 0) and "mass_asym_flat" in output:
+                probs_ent = logits.softmax(dim=-1)
+                # Shannon entropy, normalised to [0, 1].
+                # Clamp probabilities away from 0 to avoid log(0).
+                entropy = -(probs_ent * (probs_ent.clamp(min=1e-10)).log()).sum(dim=-1)  # (batch,)
+                max_entropy = math.log(logits.shape[-1])
+                norm_entropy = (entropy / max_entropy).detach()                          # (batch,)
+
+                if lambda_entropy_asym > 0:
+                    mass_asym_ent = output["mass_asym_flat"].detach()                    # (B, N)
+                    expected_asym_ent = (probs_ent * mass_asym_ent).sum(dim=-1)         # (batch,)
+                    loss_entropy_asym = -(norm_entropy * expected_asym_ent).mean()
+                    loss_ce = loss_ce + lambda_entropy_asym * loss_entropy_asym
+
+                if lambda_entropy_mass > 0 and "mass_sum_flat" in output:
+                    mass_sum_ent = output["mass_sum_flat"].detach()                      # (B, N)
+                    expected_mass_sum = (probs_ent * mass_sum_ent).sum(dim=-1)          # (batch,)
+                    loss_entropy_mass_term = (norm_entropy * expected_mass_sum).mean()
+                    loss_ce = loss_ce + lambda_entropy_mass * loss_entropy_mass_term
 
             # Adversarial mass loss
             mass_mask = parent_mass > 0

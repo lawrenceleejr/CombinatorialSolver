@@ -26,6 +26,7 @@ def evaluate(
     output_dir: str = "results",
     config_path: str | None = None,
     include_classical: bool = True,
+    physics_blend_alpha: float = 0.0,
 ):
     """Evaluate model and reconstruct masses.
 
@@ -37,6 +38,19 @@ def evaluate(
         include_classical: Also run the staged classical solver (mass-
             difference-first with physics tie-breaks) and
             save its results alongside the ML model results.
+        physics_blend_alpha: When > 0, blend the model logits with a
+            confidence-weighted physics prior at inference time so that
+            uncertain events favour high-asymmetry, low-mass interpretations.
+            The effective logits become::
+
+                logits_final = logits + alpha * uncertainty * physics_score
+
+            where ``uncertainty = 1 - max(softmax(logits))`` ∈ [0, 1] and
+            ``physics_score = mass_asym_flat - mass_sum_flat`` per assignment
+            (both quantities in HT-normalised units).  This is a post-hoc
+            push without retraining; for a training-time equivalent use the
+            ``lambda_entropy_asym`` / ``lambda_entropy_mass`` config options.
+            Typical values: 0.5–2.0.  Set to 0 (default) to disable.
     """
     device = get_device()
     print(f"Using device: {device}")
@@ -100,6 +114,22 @@ def evaluate(
 
             output = model(four_mom)
             logits = output["logits"]
+
+            # Optional inference-time confidence-weighted physics blending.
+            # For events where the network is uncertain (low max-softmax
+            # probability), add a bias toward high-asymmetry, low-mass
+            # interpretations without retraining the model.
+            if physics_blend_alpha > 0.0 and "mass_asym_flat" in output:
+                probs = logits.softmax(dim=-1)
+                # Per-event uncertainty: 0 when confident, 1 when uniform.
+                uncertainty = 1.0 - probs.max(dim=-1).values   # (batch,)
+                # Physics score: reward high asymmetry, penalise high mass sum.
+                mass_asym = output["mass_asym_flat"]            # (batch, N)
+                physics_score = mass_asym
+                if "mass_sum_flat" in output:
+                    physics_score = physics_score - output["mass_sum_flat"]
+                logits = logits + physics_blend_alpha * uncertainty.unsqueeze(-1) * physics_score
+
             preds = logits.argmax(dim=-1)
 
             all_preds.append(preds.cpu())
@@ -286,5 +316,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip the staged classical solver comparison",
     )
+    parser.add_argument(
+        "--physics-blend-alpha",
+        type=float,
+        default=0.0,
+        help=(
+            "Inference-time physics blending strength (default: 0 = disabled). "
+            "When > 0, uncertain events are pushed toward high-asymmetry, "
+            "low-mass assignments without retraining. Typical values: 0.5–2.0."
+        ),
+    )
     args = parser.parse_args()
-    evaluate(args.checkpoint, args.data, args.output, args.config, not args.no_classical)
+    evaluate(
+        args.checkpoint, args.data, args.output, args.config,
+        not args.no_classical,
+        physics_blend_alpha=args.physics_blend_alpha,
+    )

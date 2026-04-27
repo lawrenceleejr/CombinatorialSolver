@@ -44,6 +44,8 @@ def default_config() -> dict:
             "lambda_distill": 2.0,
             "lambda_distill_epochs": 20,
             "distill_temperature": 4.0,
+            "lambda_entropy_asym": 0.0,
+            "lambda_entropy_mass": 0.0,
         },
         "data": {
             "normalize_by_ht": True,

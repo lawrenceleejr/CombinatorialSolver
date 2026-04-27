@@ -29,6 +29,24 @@ training:
   lambda_sym_rampup: 20
   lambda_qcd: 0.1
   lambda_qcd_rampup: 20
+  # Entropy-weighted physics prior losses.
+  # When the network is uncertain (high output entropy over assignment logits),
+  # these losses steer the predicted assignment distribution toward
+  # QCD-multijet-like interpretations:
+  #   lambda_entropy_asym: maximises entropy-weighted expected mass asymmetry
+  #     (|m1-m2|/(m1+m2)).  Minimising drives uncertain events toward
+  #     high-asymmetry (non-signal-like) choices.
+  #   lambda_entropy_mass: minimises entropy-weighted expected mass sum (m1+m2
+  #     in HT-normalised units).  Drives uncertain events toward low-mass
+  #     triplet interpretations.
+  # These are complementary to lambda_qcd (which uses pT hierarchy as the QCD
+  # proxy) because they directly use the network's own uncertainty as the signal.
+  # Both default to 0 (disabled); ramp up from Phase 2 start over N epochs like
+  # lambda_sym/qcd.  Start with small values (0.05–0.2) and monitor val acc.
+  lambda_entropy_asym: 0.0
+  lambda_entropy_asym_rampup: 20
+  lambda_entropy_mass: 0.0
+  lambda_entropy_mass_rampup: 20
   # Distillation from the classical mass-asymmetry solver.
   # At Phase 2 epoch 0 this loss pulls the NN logits toward the assignment with
   # the smallest |m1-m2|/(m1+m2).  It decays linearly to zero over

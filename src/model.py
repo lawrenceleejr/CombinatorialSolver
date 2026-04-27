@@ -487,7 +487,7 @@ class JetAssignmentTransformer(nn.Module):
 
     def _compute_grouping_logits(
         self, jet_embeddings: torch.Tensor, four_momenta: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Score all groupings for each ISR choice.
 
         Group embeddings are pooled via the shared GroupTransformer (one layer of
@@ -502,6 +502,7 @@ class JetAssignmentTransformer(nn.Module):
         Returns:
             grouping_logits: (batch, num_jets, num_groupings)
             mass_asym_flat: (batch, num_assignments) mass asymmetry per flat assignment
+            mass_sum_flat: (batch, num_assignments) mass sum (m1+m2) per flat assignment
             grouping_summary: (batch, num_jets, d_model) per-ISR-candidate quality summary
         """
         batch_size = jet_embeddings.shape[0]
@@ -530,8 +531,12 @@ class JetAssignmentTransformer(nn.Module):
 
         physics = self._group_physics_factored(four_momenta)  # (batch, n_combos, n_group_physics)
 
-        # Extract raw mass asymmetry BEFORE LayerNorm so that the across-assignment
-        # ranking (argmin mass_asym = classical best assignment) is preserved.
+        # Extract raw mass sum and asymmetry BEFORE LayerNorm so that the
+        # across-assignment ranking (argmin mass_asym = classical best assignment)
+        # is preserved, and so that mass_sum retains its physical scale for the
+        # entropy-weighted low-mass loss.
+        # _mass_features inter-group feature order: [mass_sum, mass_asym, ...]
+        mass_sum_factored = physics[:, :, 0]   # (batch, n_combos)
         mass_asym_factored = physics[:, :, 1]  # (batch, n_combos)
 
         physics = self.physics_norm(physics)
@@ -550,8 +555,9 @@ class JetAssignmentTransformer(nn.Module):
         grouping_summary = self.grouping_summary_proj(grp_context)      # (batch, J, d_model)
         source_idx = self.flat_to_factored[:, 0] * self.num_groupings + self.flat_to_factored[:, 1]
         mass_asym_flat = mass_asym_factored[:, source_idx]  # (batch, num_assignments)
+        mass_sum_flat = mass_sum_factored[:, source_idx]    # (batch, num_assignments)
 
-        return grouping_logits, mass_asym_flat, grouping_summary
+        return grouping_logits, mass_asym_flat, mass_sum_flat, grouping_summary
 
     def _combine_logits(
         self, isr_logits: torch.Tensor, grouping_logits: torch.Tensor
@@ -570,12 +576,13 @@ class JetAssignmentTransformer(nn.Module):
 
     def _score_assignments_flat(
         self, jet_embeddings: torch.Tensor, four_momenta: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Flat scoring for 6-jet mode.
 
         Returns:
             logits: (batch, num_assignments)
             mass_asym_flat: (batch, num_assignments)
+            mass_sum_flat: (batch, num_assignments)
         """
         batch_size = jet_embeddings.shape[0]
         na = self.num_assignments
@@ -615,13 +622,15 @@ class JetAssignmentTransformer(nn.Module):
         g2_4vec = g2_jets.sum(dim=2)
 
         physics = self._mass_features(g1_4vec, g2_4vec, g1_jets, g2_jets)
-        # Extract raw mass asymmetry BEFORE LayerNorm so that the across-assignment
-        # ranking (argmin mass_asym = classical best assignment) is preserved.
+        # Extract raw mass sum and asymmetry BEFORE LayerNorm so that the
+        # across-assignment ranking is preserved and mass_sum retains physical scale.
+        # _mass_features inter-group feature order: [mass_sum, mass_asym, ...]
+        mass_sum_flat = physics[..., 0]              # index 0 = mass_sum
         mass_asym_flat = physics[..., 1]             # index 1 = mass_asym
         physics = self.physics_norm(physics)
         combined = torch.cat([sym_sum, sym_prod, physics], dim=-1)
         logits = self.score_mlp(combined).squeeze(-1)
-        return logits, mass_asym_flat
+        return logits, mass_asym_flat, mass_sum_flat
 
     def predict_mass(self, jet_embeddings: torch.Tensor) -> torch.Tensor:
         pooled = jet_embeddings.mean(dim=1)
@@ -633,8 +642,8 @@ class JetAssignmentTransformer(nn.Module):
         mass_pred = self.predict_mass(jet_embeddings)
         if self.has_isr:
             # Compute groupings first so the ISR head can see grouping quality
-            grouping_logits, mass_asym_flat, grp_summary = self._compute_grouping_logits(
-                jet_embeddings, four_momenta
+            grouping_logits, mass_asym_flat, mass_sum_flat, grp_summary = (
+                self._compute_grouping_logits(jet_embeddings, four_momenta)
             )
             isr_logits = self._compute_isr_logits(
                 jet_embeddings, four_momenta, grp_summary
@@ -645,11 +654,19 @@ class JetAssignmentTransformer(nn.Module):
                 "isr_logits": isr_logits,
                 "grouping_logits": grouping_logits,
                 "mass_asym_flat": mass_asym_flat,
+                "mass_sum_flat": mass_sum_flat,
                 "mass_pred": mass_pred,
             }
         else:
-            logits, mass_asym_flat = self._score_assignments_flat(jet_embeddings, four_momenta)
-            return {"logits": logits, "mass_asym_flat": mass_asym_flat, "mass_pred": mass_pred}
+            logits, mass_asym_flat, mass_sum_flat = self._score_assignments_flat(
+                jet_embeddings, four_momenta
+            )
+            return {
+                "logits": logits,
+                "mass_asym_flat": mass_asym_flat,
+                "mass_sum_flat": mass_sum_flat,
+                "mass_pred": mass_pred,
+            }
 
 
 class MassAsymmetryClassicalSolver(nn.Module):
