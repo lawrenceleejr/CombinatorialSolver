@@ -197,6 +197,12 @@ class JetAssignmentTransformer(nn.Module):
                 nn.Linear(d_model, 1),
             )
 
+            # Learnable scale for the ISR logit contribution to the combined
+            # flat assignment logits.  Initialised to 1.0 (no change from the
+            # additive baseline) so the model can learn whether to amplify or
+            # attenuate the ISR signal relative to the grouping signal.
+            self.isr_aux_logit_scale = nn.Parameter(torch.ones(1))
+
             self.grouping_scorer = nn.Sequential(
                 nn.Linear(2 * d_model + self.n_group_physics, 2 * d_model),
                 nn.GELU(),
@@ -555,7 +561,7 @@ class JetAssignmentTransformer(nn.Module):
         Returns (batch, num_assignments) in canonical flat ordering.
         """
         batch_size = isr_logits.shape[0]
-        combined = isr_logits.unsqueeze(-1) + grouping_logits
+        combined = self.isr_aux_logit_scale * isr_logits.unsqueeze(-1) + grouping_logits
         combined_flat = combined.reshape(batch_size, -1)
 
         f2f = self.flat_to_factored

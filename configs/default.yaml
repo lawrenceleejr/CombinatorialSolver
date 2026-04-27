@@ -2,7 +2,7 @@ model:
   d_model: 128
   nhead: 8
   num_layers: 4
-  dim_feedforward: 256
+  dim_feedforward: 512
   dropout: 0.1
 
 training:
@@ -12,7 +12,7 @@ training:
   weight_decay: 1.0e-4
   num_epochs: 200
   warmup_epochs: 5
-  restart_period: 0
+  restart_period: 50
   patience: 40
   lambda_adv: 0.0
   lambda_adv_rampup: 50
@@ -40,6 +40,14 @@ training:
   lambda_distill: 2.0
   lambda_distill_epochs: 20
   distill_temperature: 4.0
+  # Direct ISR supervision from the flat combined logits.
+  # For each ISR candidate j, the score is max_{groupings} logit(isr=j, grp=k),
+  # which marginalises over groupings and provides a gradient path through the
+  # final combined logits rather than only through the isr_head auxiliary branch.
+  # Ramped up linearly over lambda_isr_direct_rampup Phase-2 epochs so that the
+  # grouping head has time to stabilise before the direct ISR signal kicks in.
+  lambda_isr_direct: 2.0
+  lambda_isr_direct_rampup: 10
   # Two-phase training:
   #   Phase 1 — grouping head trained with mass-asymmetry pseudolabels; ISR head frozen.
   #             For each possible ISR choice, the grouping with the lowest mass
