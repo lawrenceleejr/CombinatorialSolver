@@ -95,6 +95,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
         num_jets=dc["num_jets"],
         normalize_by_ht=dc["normalize_by_ht"],
         pt_smear_frac=dc.get("pt_smear_frac", 0.0),
+        use_mass_asymmetry_labels=dc.get("use_mass_asymmetry_labels", True),
     )
     print(f"Dataset size: {len(dataset)} events")
 
