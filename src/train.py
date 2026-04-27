@@ -208,6 +208,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
         dropout=mc["dropout"],
         num_jets=dc["num_jets"],
         input_dim=4,
+        group_num_layers=mc.get("group_num_layers", 1),
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -248,7 +249,10 @@ def train(config_path: str | None = None, data_path: str | None = None):
         pg["initial_lr"] = pg["lr"]
 
     # Loss functions
-    ce_loss_fn = nn.CrossEntropyLoss()
+    label_smoothing = tc.get("label_smoothing", 0.0)
+    ce_loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    if label_smoothing > 0:
+        print(f"Label smoothing: {label_smoothing}")
     mse_loss_fn = nn.MSELoss()
 
     # Check if adversarial training is useful
@@ -435,6 +439,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
             lambda_isr=lambda_isr, lambda_isr_direct=lambda_isr_direct,
             lambda_distill=lambda_distill, distill_temperature=distill_temperature,
             phase1_only=phase1_only_train,
+            pt_smear_frac=dc.get("pt_smear_frac", 0.0),
         )
 
         # Validation (no augmentation, no teacher forcing: tf_ratio=0 = pure end-to-end)
@@ -582,7 +587,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
 def _run_epoch(
     model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optimizer=None,
     tf_ratio=1.0, lambda_sym=0.0, lambda_qcd=0.0, lambda_isr=1.0, lambda_isr_direct=0.0,
-    lambda_distill=0.0, distill_temperature=4.0, phase1_only=False,
+    lambda_distill=0.0, distill_temperature=4.0, phase1_only=False, pt_smear_frac=0.0,
 ):
     """Run one epoch of training or validation.
 
@@ -626,6 +631,22 @@ def _run_epoch(
 
             flip = (torch.rand(batch_size, device=device) > 0.5).float().view(-1, 1)
             four_mom[:, :, 3] = four_mom[:, :, 3] * (1.0 - 2.0 * flip)
+
+            # Dynamic pT smearing: scale each jet's 4-vector by a random per-jet
+            # factor (massless approximation — η preserved means all components
+            # scale proportionally with pT).  Applied per batch so each epoch
+            # sees a fresh random realization, acting as data augmentation.
+            if pt_smear_frac > 0:
+                num_jets = four_mom.shape[1]
+                smear = (
+                    1.0 + pt_smear_frac * torch.randn(batch_size, num_jets, device=device)
+                ).clamp(0.5, 1.5).unsqueeze(-1)  # (batch, jets, 1)
+                four_mom = four_mom * smear
+                # Re-normalize by the new HT so scale invariance is preserved
+                new_ht = torch.sqrt(
+                    four_mom[:, :, 1] ** 2 + four_mom[:, :, 2] ** 2
+                ).sum(dim=1, keepdim=True).clamp(min=1e-6).unsqueeze(-1)  # (batch, 1, 1)
+                four_mom = four_mom / new_ht
 
         output = model(four_mom)
         logits = output["logits"]

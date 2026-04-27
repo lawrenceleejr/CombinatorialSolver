@@ -143,12 +143,11 @@ class JetAssignmentDataset(Dataset):
             n_events = pt.shape[0]
             max_jets_in_file = pt.shape[1]
 
-            # Apply pT smearing if requested (simulates detector resolution)
-            if self.pt_smear_frac > 0:
-                rng = np.random.RandomState(seed=12345)
-                smear = 1.0 + rng.normal(0, self.pt_smear_frac, size=pt.shape).astype(np.float32)
-                smear = np.clip(smear, 0.5, 1.5)  # Prevent extreme outliers
-                pt = pt * smear * mask  # Only smear valid jets
+            # NOTE: pT smearing is applied dynamically per-batch during training
+            # (see _run_epoch in train.py) so that each epoch sees a fresh random
+            # smearing, acting as data augmentation rather than a fixed perturbation.
+            # The pt_smear_frac value is stored on the dataset for reference and is
+            # passed through to the training loop.
 
             # Count valid jets per event
             n_valid = mask.sum(axis=1)
