@@ -7,6 +7,16 @@ Reads MadGraphMLProducer-format HDF5 files. Supports two data layouts:
 
 Jets are pT-sorted before being fed to the model. Truth indices are remapped
 accordingly. Four-vectors are converted from (pt, eta, phi, mass) to (E, px, py, pz).
+
+By default (``use_mass_asymmetry_labels=True``) truth labels are computed by
+finding the assignment that minimises |m1 - m2| over all 70 interpretations
+(for 7-jet events) or 10 interpretations (for 6-jet events).  This is the
+physically correct approach for pair-produced, equal-mass resonances: in a
+sample with no detector smearing and no jet fragmentation the truth grouping
+gives m1 ≈ m2 ≈ M_parent while any wrong-ISR interpretation yields a much
+larger |m1 - m2|.  It also removes any dependence on potentially incorrect
+TARGETS labels in the HDF5 file (e.g. samples where the generator stores jets
+in an ordering that does not reflect parent-decay membership).
 """
 
 import glob as globmod
@@ -17,7 +27,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .combinatorics import enumerate_assignments, match_truth_groups
+from .combinatorics import build_assignment_tensors, enumerate_assignments, match_truth_groups
 
 
 def pt_eta_phi_mass_to_epxpypz(pt, eta, phi, mass):
@@ -40,6 +50,14 @@ class JetAssignmentDataset(Dataset):
             resolution (e.g. 0.05 for 5%). Smearing is applied per-jet before
             the four-vector conversion, simulating detector resolution effects.
             The smearing is applied once at load time (fixed per event).
+        use_mass_asymmetry_labels: If True (default), compute truth labels as the
+            assignment index that minimises |m1 - m2| over all interpretations,
+            using the raw (E, px, py, pz) four-vectors.  This is the physically
+            correct ground truth for equal-mass pair-produced resonances and
+            removes any dependence on TARGETS entries in the HDF5 file, which
+            may be incorrect for some topologies (e.g. when the generator stores
+            jets in an ordering that does not reflect parent-decay membership).
+            Set to False to fall back to the TARGETS-based labelling.
     """
 
     def __init__(
@@ -48,10 +66,12 @@ class JetAssignmentDataset(Dataset):
         num_jets: int = 7,
         normalize_by_ht: bool = True,
         pt_smear_frac: float = 0.0,
+        use_mass_asymmetry_labels: bool = True,
     ):
         self.num_jets = num_jets
         self.normalize_by_ht = normalize_by_ht
         self.pt_smear_frac = pt_smear_frac
+        self.use_mass_asymmetry_labels = use_mass_asymmetry_labels
 
         # Resolve file paths
         if isinstance(data_paths, str):
@@ -142,7 +162,15 @@ class JetAssignmentDataset(Dataset):
             )
 
             # Read truth labels
-            if has_targets:
+            if self.use_mass_asymmetry_labels:
+                # Primary path: compute labels as argmin |m1-m2| over all
+                # interpretations from the raw four-momenta.  This is the
+                # physically correct ground truth and is immune to incorrect
+                # TARGETS entries in the HDF5 file.
+                labels, parent_mass_arr = self._compute_mass_asymmetry_labels(
+                    sorted_four_mom, effective_num_jets
+                )
+            elif has_targets:
                 labels, parent_mass_arr = self._read_targets(
                     f, sort_indices, n_valid, effective_num_jets
                 )
@@ -227,6 +255,58 @@ class JetAssignmentDataset(Dataset):
             sorted_four_mom[i, :n_selected] = four_mom
 
         return sorted_four_mom, sorted_mask, sort_indices
+
+    @staticmethod
+    def _compute_mass_asymmetry_labels(
+        sorted_four_mom: np.ndarray, num_jets: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compute truth labels as argmin of |m1 - m2| over all assignments.
+
+        For each event, enumerates every valid split of the ``num_jets`` pT-sorted
+        jets into (ISR, triplet1, triplet2) and selects the one that minimises the
+        absolute mass difference |m1 - m2|.
+
+        With no detector smearing and no jet fragmentation the physically correct
+        interpretation gives m1 ≈ m2 ≈ M_parent while any wrong-ISR interpretation
+        yields a much larger |m1 - m2| (the triplet that absorbs the ISR jet has a
+        very different invariant mass from the signal triplet).
+
+        Args:
+            sorted_four_mom: ``(N, num_jets, 4)`` array of ``(E, px, py, pz)`` in
+                physical units (GeV), *before* any HT normalisation.
+            num_jets: Number of jets per event (6 or 7).
+
+        Returns:
+            labels: ``(N,)`` int64 array of assignment indices.
+            parent_masses: ``(N,)`` float32 array of estimated parent masses in GeV,
+                computed as ``(m1 + m2) / 2`` for the best-scoring assignment.
+        """
+        at = build_assignment_tensors(num_jets)
+        g1_idx = at["group1_indices"].detach().cpu().numpy()  # (N_assign, 3)
+        g2_idx = at["group2_indices"].detach().cpu().numpy()  # (N_assign, 3)
+
+        # Gather group four-momenta for every assignment simultaneously.
+        # sorted_four_mom[:, g1_idx, :] → (N, N_assign, 3, 4)
+        g1_sum = sorted_four_mom[:, g1_idx, :].sum(axis=2)  # (N, N_assign, 4)
+        g2_sum = sorted_four_mom[:, g2_idx, :].sum(axis=2)  # (N, N_assign, 4)
+
+        def inv_mass(v: np.ndarray) -> np.ndarray:
+            m2 = v[..., 0] ** 2 - v[..., 1] ** 2 - v[..., 2] ** 2 - v[..., 3] ** 2
+            return np.sqrt(np.maximum(m2, 0.0))
+
+        m1 = inv_mass(g1_sum)  # (N, N_assign)
+        m2 = inv_mass(g2_sum)  # (N, N_assign)
+
+        mass_diff = np.abs(m1 - m2)  # (N, N_assign)
+        labels = mass_diff.argmin(axis=1).astype(np.int64)  # (N,)
+
+        # Estimate parent mass from winning assignment: average of the two triplet masses
+        n = len(labels)
+        best_m1 = m1[np.arange(n), labels]
+        best_m2 = m2[np.arange(n), labels]
+        parent_masses = ((best_m1 + best_m2) / 2.0).astype(np.float32)
+
+        return labels, parent_masses
 
     def _read_targets(self, f, sort_indices, n_valid, num_jets):
         """Read truth from TARGETS/g1 and TARGETS/g2 groups.

@@ -29,8 +29,46 @@ training:
   lambda_sym_rampup: 20
   lambda_qcd: 0.1
   lambda_qcd_rampup: 20
+  # Distillation from the classical mass-asymmetry solver.
+  # At Phase 2 epoch 0 this loss pulls the NN logits toward the assignment with
+  # the smallest |m1-m2|/(m1+m2).  It decays linearly to zero over
+  # lambda_distill_epochs so the labelled CE signal takes over.
+  # NOTE: the T² gradient-restoration factor (Hinton 2015) is NOT applied here
+  # because the teacher logits are -mass_asym ∈ [-1,0], not NN outputs.  T²
+  # would amplify the KL gradient by 16 (T=4), overpowering CE and capping
+  # accuracy near random for the full decay period.
+  lambda_distill: 2.0
+  lambda_distill_epochs: 20
+  distill_temperature: 4.0
+  # Two-phase training:
+  #   Phase 1 — grouping head trained with mass-asymmetry pseudolabels; ISR head frozen.
+  #             For each possible ISR choice, the grouping with the lowest mass
+  #             asymmetry is used as a CE pseudolabel.  This bypasses the frozen
+  #             ISR head and gives a direct gradient to the grouping scorer without
+  #             any temperature-sensitivity.  (The KL-distillation approach was
+  #             abandoned because mass_asym ∈ [0,1] with T=4 makes the teacher
+  #             distribution nearly uniform, yielding ~zero gradient.)
+  #             Phase 1 ends when val grp_acc stops improving for phase1_patience epochs.
+  #   Phase 2 — full supervised training (CE + ISR + sym + qcd) begins; ISR head
+  #             is unfrozen.  Distillation (KL toward classical solver) decays from
+  #             lambda_distill_max over lambda_distill_epochs measured from the
+  #             Phase 2 start epoch.
+  #   Set phase1_patience: 0 to disable two-phase training (legacy behaviour).
+  phase1_patience: 15
+  # LR cap for Phase 1.  Phase 1 uses a pure 10-class grouping-CE loss (no
+  # auxiliary sym/qcd/adversary terms); this simple objective is stable at the
+  # full cosine-schedule LR.  Setting phase1_max_lr_fraction: 1.0 lets Phase 1
+  # follow the same cosine warmup as Phase 2, so it converges in the 15-20
+  # epochs before phase1_patience fires (rather than barely moving off random
+  # at the overly-conservative 3e-5 = 0.1 × 3e-4 that was previously used).
+  # Reduce below 1.0 only if Phase 1 shows training-loss divergence.
+  phase1_max_lr_fraction: 1.0
 
 data:
   normalize_by_ht: true
   num_jets: 7
   pt_smear_frac: 0.0
+  # Compute truth labels as argmin |m1-m2| over all 70 interpretations (recommended).
+  # This is the physically correct ground truth for equal-mass pair-produced resonances
+  # and removes dependence on potentially incorrect TARGETS entries in the HDF5 file.
+  use_mass_asymmetry_labels: true

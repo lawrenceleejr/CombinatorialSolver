@@ -237,9 +237,14 @@ class JetAssignmentTransformer(nn.Module):
         return log_pt.unsqueeze(-1) - log_pt.unsqueeze(-2)
 
     @staticmethod
-    def _wrap_dphi(dphi: torch.Tensor) -> torch.Tensor:
+    def wrap_dphi(dphi: torch.Tensor) -> torch.Tensor:
         """Wrap Δφ into [-π, π]."""
         return dphi - 2 * torch.pi * torch.round(dphi / (2 * torch.pi))
+
+    @staticmethod
+    def _wrap_dphi(dphi: torch.Tensor) -> torch.Tensor:
+        """Backward-compatible alias for wrap_dphi."""
+        return JetAssignmentTransformer.wrap_dphi(dphi)
 
     def encode_jets(self, four_momenta: torch.Tensor) -> torch.Tensor:
         x = self.input_proj(four_momenta)
@@ -294,7 +299,7 @@ class JetAssignmentTransformer(nn.Module):
         total = jet_embeddings.sum(dim=1, keepdim=True)    # (batch, 1, d_model)
         loo_ctx = (total - jet_embeddings) / n_others      # (batch, num_jets, d_model)
         physics = self._isr_physics(four_momenta)
-        features = torch.cat([jet_embeddings, loo_ctx, physics], dim=-1)
+        features = torch.cat([jet_embeddings, loo_ctx, physics, grouping_context], dim=-1)
         return self.isr_head(features).squeeze(-1)
 
     def _group_physics_factored(self, four_momenta: torch.Tensor) -> torch.Tensor:
@@ -320,7 +325,7 @@ class JetAssignmentTransformer(nn.Module):
         return self._mass_features(g1_4vec, g2_4vec, g1_jets, g2_jets)
 
     @staticmethod
-    def _intra_group_features(jets_4vec: torch.Tensor) -> torch.Tensor:
+    def intra_group_features(jets_4vec: torch.Tensor) -> torch.Tensor:
         """Compute 9 QCD-discriminating features from a 3-jet candidate group.
 
         Features capture pT hierarchy, Lund-plane splittings, energy correlation
@@ -369,7 +374,7 @@ class JetAssignmentTransformer(nn.Module):
             z_ij = pt_soft / (pt_i + pt_j).clamp(min=1e-8)
 
             deta = eta[..., i] - eta[..., j]
-            dphi = JetAssignmentTransformer._wrap_dphi(phi[..., i] - phi[..., j])
+            dphi = JetAssignmentTransformer.wrap_dphi(phi[..., i] - phi[..., j])
             dr = torch.sqrt(deta**2 + dphi**2 + 1e-8)
 
             z_lund_list.append(z_ij)
@@ -424,6 +429,11 @@ class JetAssignmentTransformer(nn.Module):
         )                                                               # (..., 9)
 
     @staticmethod
+    def _intra_group_features(jets_4vec: torch.Tensor) -> torch.Tensor:
+        """Backward-compatible alias for intra_group_features."""
+        return JetAssignmentTransformer.intra_group_features(jets_4vec)
+
+    @staticmethod
     def _mass_features(
         g1_4vec: torch.Tensor,
         g2_4vec: torch.Tensor,
@@ -457,14 +467,14 @@ class JetAssignmentTransformer(nn.Module):
 
         eta1, phi1 = eta_phi(g1_4vec)
         eta2, phi2 = eta_phi(g2_4vec)
-        dphi = JetAssignmentTransformer._wrap_dphi(phi1 - phi2)
+        dphi = JetAssignmentTransformer.wrap_dphi(phi1 - phi2)
         delta_r = torch.sqrt((eta1 - eta2) ** 2 + dphi**2)
 
         inter = torch.stack([mass_sum, mass_asym, mass_ratio, m1, m2, delta_r], dim=-1)
 
         if g1_jets is not None and g2_jets is not None:
-            intra1 = JetAssignmentTransformer._intra_group_features(g1_jets)
-            intra2 = JetAssignmentTransformer._intra_group_features(g2_jets)
+            intra1 = JetAssignmentTransformer.intra_group_features(g1_jets)
+            intra2 = JetAssignmentTransformer.intra_group_features(g2_jets)
             return torch.cat([inter, intra1, intra2], dim=-1)   # (..., 24)
 
         return inter                                             # (..., 6)
@@ -513,6 +523,11 @@ class JetAssignmentTransformer(nn.Module):
         sym_prod = g1_pooled * g2_pooled
 
         physics = self._group_physics_factored(four_momenta)  # (batch, n_combos, n_group_physics)
+
+        # Extract raw mass asymmetry BEFORE LayerNorm so that the across-assignment
+        # ranking (argmin mass_asym = classical best assignment) is preserved.
+        mass_asym_factored = physics[:, :, 1]  # (batch, n_combos)
+
         physics = self.physics_norm(physics)
 
         combined = torch.cat([sym_sum, sym_prod, physics], dim=-1)
@@ -527,9 +542,6 @@ class JetAssignmentTransformer(nn.Module):
         grp_weights = grouping_logits.softmax(dim=-1).unsqueeze(-1)     # (batch, J, 10, 1)
         grp_context = (grp_weights * combined_per_isr).sum(dim=2)       # (batch, J, 2*d+phys)
         grouping_summary = self.grouping_summary_proj(grp_context)      # (batch, J, d_model)
-
-        # Remap mass asymmetry (physics dim 1) to flat assignment ordering
-        mass_asym_factored = physics[:, :, 1]  # (batch, n_combos)
         source_idx = self.flat_to_factored[:, 0] * self.num_groupings + self.flat_to_factored[:, 1]
         mass_asym_flat = mass_asym_factored[:, source_idx]  # (batch, num_assignments)
 
@@ -597,10 +609,12 @@ class JetAssignmentTransformer(nn.Module):
         g2_4vec = g2_jets.sum(dim=2)
 
         physics = self._mass_features(g1_4vec, g2_4vec, g1_jets, g2_jets)
+        # Extract raw mass asymmetry BEFORE LayerNorm so that the across-assignment
+        # ranking (argmin mass_asym = classical best assignment) is preserved.
+        mass_asym_flat = physics[..., 1]             # index 1 = mass_asym
         physics = self.physics_norm(physics)
         combined = torch.cat([sym_sum, sym_prod, physics], dim=-1)
         logits = self.score_mlp(combined).squeeze(-1)
-        mass_asym_flat = physics[..., 1]             # index 1 = mass_asym
         return logits, mass_asym_flat
 
     def predict_mass(self, jet_embeddings: torch.Tensor) -> torch.Tensor:
@@ -633,22 +647,49 @@ class JetAssignmentTransformer(nn.Module):
 
 
 class MassAsymmetryClassicalSolver(nn.Module):
-    """Classical jet assignment solver that minimises mass asymmetry.
+    """Classical jet assignment solver with mass-difference-first ranking.
 
     For every event all combinatorial assignments are enumerated (same set
     as used by the ML model).  The invariant masses of the two candidate
-    groups are computed for each assignment and the one with the smallest
-    relative mass asymmetry
+    groups are computed for each assignment and scored in two stages:
 
-        A = |m1 - m2| / (m1 + m2)
+      1) Primary classical objective: minimise absolute mass difference
+           D = |m1 - m2|
+      2) Secondary refinements: use additional physics-inspired features
+         (pT hierarchy, angular geometry, Dalitz-like balance, and opening-
+         angle/pT consistency scaled to sqrt(s)=13 TeV) as a small tie-breaker
 
-    is selected.  Logits are returned as the *negative* asymmetry so that
-    ``argmax(logits)`` gives the best (minimum-asymmetry) assignment —
+    Logits are returned as the negative staged score so that ``argmax(logits)``
+    gives the best assignment —
     matching the inference interface of :class:`JetAssignmentTransformer`.
 
     Args:
         num_jets: Number of input jets (6 or 7).
     """
+    # LHC proton-proton center-of-mass energy in GeV (sqrt(s)=13 TeV = 13000 GeV).
+    COM_ENERGY_GEV = 13000.0
+    # Theoretical maximum of E_total/sqrt(s): 1.0 when all COM energy is captured.
+    ENERGY_FRACTION_BASELINE = 1.0
+    # Unit offset keeps opening-angle scaling active even at low energy fraction.
+    OPENING_SCALE_OFFSET = 1.0
+    # Small ΔR contribution to angular penalty (secondary to Δφ back-to-backness).
+    DELTA_R_WEIGHT = 0.1
+    # Indices match intra_group_features return order:
+    # [max_pt_ratio, pt_cv, min_z, max_kt, ecf2, ecf3, d2, dalitz_max_ratio, dalitz_min_ratio]
+    MAX_PT_RATIO_IDX = 0
+    PT_CV_IDX = 1
+    DALITZ_MAX_RATIO_IDX = 7
+    DALITZ_MIN_RATIO_IDX = 8
+    # Secondary-feature blend used only for tie-breaking after primary mass difference.
+    SECONDARY_WEIGHTS = {
+        "asymmetry": 0.45,
+        "pt_hierarchy": 0.20,
+        "angular": 0.15,
+        "dalitz": 0.10,
+        "kine13": 0.10,
+    }
+    # Keeps secondary term lexicographic-like versus GeV-scale primary |m1-m2|.
+    SECONDARY_TIEBREAK_SCALE = 1.0e-3
 
     def __init__(self, num_jets: int = 7):
         super().__init__()
@@ -660,7 +701,7 @@ class MassAsymmetryClassicalSolver(nn.Module):
         self.num_assignments = at["num_assignments"]
 
     def forward(self, four_momenta: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Compute negative mass-asymmetry scores for all assignments.
+        """Compute staged classical scores for all assignments.
 
         Args:
             four_momenta: (batch, num_jets, 4) tensor with (E, px, py, pz).
@@ -670,7 +711,8 @@ class MassAsymmetryClassicalSolver(nn.Module):
 
         Returns:
             dict with ``logits`` of shape (batch, num_assignments).
-            ``logits.argmax(dim=-1)`` gives the minimum-asymmetry assignment.
+            ``logits.argmax(dim=-1)`` gives the assignment with minimum
+            primary mass difference and best secondary physics tie-break.
         """
         batch_size = four_momenta.shape[0]
         na = self.num_assignments
@@ -694,9 +736,82 @@ class MassAsymmetryClassicalSolver(nn.Module):
         m1 = compute_invariant_mass(g1_sum)
         m2 = compute_invariant_mass(g2_sum)
 
-        # Relative mass asymmetry; clamp denominator to avoid division by zero
+        # Primary objective: minimize absolute parent mass difference.
+        mass_diff = torch.abs(m1 - m2)
+
+        # Secondary refinements
+        # Relative mass asymmetry (classical normalization)
         asymmetry = torch.abs(m1 - m2) / (m1 + m2).clamp(min=1e-8)
 
-        # Negative asymmetry as logits: argmax selects minimum asymmetry
-        logits = -asymmetry
+        # Intra-group QCD-sensitive features (reuse model feature definitions)
+        g1_jets = torch.gather(fm_expanded, 2, g1_idx)
+        g2_jets = torch.gather(fm_expanded, 2, g2_idx)
+        intra1 = JetAssignmentTransformer.intra_group_features(g1_jets)
+        intra2 = JetAssignmentTransformer.intra_group_features(g2_jets)
+
+        # pT hierarchy penalty (prefer less hierarchical candidate parents)
+        pt_hierarchy = (
+            0.5 * (
+                (intra1[..., self.MAX_PT_RATIO_IDX] - 1.0)
+                + (intra2[..., self.MAX_PT_RATIO_IDX] - 1.0)
+            )
+            + 0.5 * (intra1[..., self.PT_CV_IDX] + intra2[..., self.PT_CV_IDX])
+        )
+
+        # Angular relationships between reconstructed parent candidates
+        px1, py1, pz1 = g1_sum[..., 1], g1_sum[..., 2], g1_sum[..., 3]
+        px2, py2, pz2 = g2_sum[..., 1], g2_sum[..., 2], g2_sum[..., 3]
+        pt1 = torch.sqrt(px1**2 + py1**2).clamp(min=1e-8)
+        pt2 = torch.sqrt(px2**2 + py2**2).clamp(min=1e-8)
+        eta1 = torch.asinh(pz1 / pt1)
+        eta2 = torch.asinh(pz2 / pt2)
+        phi1 = torch.atan2(py1, px1)
+        phi2 = torch.atan2(py2, px2)
+        dphi = JetAssignmentTransformer.wrap_dphi(phi1 - phi2)
+        delta_r = torch.sqrt((eta1 - eta2) ** 2 + dphi**2 + 1e-8)
+        angular_penalty = (
+            torch.abs(torch.pi - torch.abs(dphi)) / torch.pi
+            + self.DELTA_R_WEIGHT * delta_r
+        )
+
+        # Dalitz-like inter-group consistency
+        dalitz_penalty = (
+            torch.abs(
+                intra1[..., self.DALITZ_MAX_RATIO_IDX] - intra2[..., self.DALITZ_MAX_RATIO_IDX]
+            )
+            + torch.abs(
+                intra1[..., self.DALITZ_MIN_RATIO_IDX] - intra2[..., self.DALITZ_MIN_RATIO_IDX]
+            )
+        )
+
+        # Opening-angle/pT consistency with explicit sqrt(s)=13 TeV scale
+        pt_balance = torch.abs(pt1 - pt2) / (pt1 + pt2).clamp(min=1e-8)
+        dphi_norm = torch.abs(dphi) / torch.pi
+        # Balanced parent pT (low pt_balance) should align with back-to-back opening (high dphi_norm).
+        # Expected normalized opening increases as pT balance improves (pt_balance -> 0).
+        expected_dphi_norm = self.ENERGY_FRACTION_BASELINE - pt_balance
+        opening_pt_consistency = torch.abs(expected_dphi_norm - dphi_norm)
+        energy_fraction = (g1_sum[..., 0] + g2_sum[..., 0]) / self.COM_ENERGY_GEV
+        energy_overflow = torch.relu(energy_fraction - self.ENERGY_FRACTION_BASELINE)
+        kine13_penalty = (
+            opening_pt_consistency
+            * (self.OPENING_SCALE_OFFSET + energy_fraction.clamp(min=0.0))
+            + energy_overflow
+        )
+
+        secondary_penalty = (
+            self.SECONDARY_WEIGHTS["asymmetry"] * asymmetry
+            + self.SECONDARY_WEIGHTS["pt_hierarchy"] * pt_hierarchy
+            + self.SECONDARY_WEIGHTS["angular"] * angular_penalty
+            + self.SECONDARY_WEIGHTS["dalitz"] * dalitz_penalty
+            + self.SECONDARY_WEIGHTS["kine13"] * kine13_penalty
+        )
+
+        # Hard physicality guard: convert overflow fraction back to GeV scale so it
+        # is comparable to the primary |m1-m2| term and can strongly reject unphysical
+        # interpretations even before tiny secondary tie-break terms are applied.
+        physicality_penalty = energy_overflow * self.COM_ENERGY_GEV
+        # Lexicographic-style score: primary mass difference first, then refinement.
+        staged_score = mass_diff + physicality_penalty + self.SECONDARY_TIEBREAK_SCALE * secondary_penalty
+        logits = -staged_score
         return {"logits": logits}

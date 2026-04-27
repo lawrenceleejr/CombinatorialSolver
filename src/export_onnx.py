@@ -7,11 +7,12 @@ Two ONNX files are produced:
       The trained transformer model.  Input: normalised four-momenta.
 
   <output_dir>/classical_mass_asymmetry.onnx
-      A purely classical solver that selects the jet assignment minimising
-      the relative mass asymmetry |m1-m2|/(m1+m2) between the two
-      reconstructed candidates.  Input: *un-normalised* physical four-momenta
-      (same units as the HDF5 data files) so that meaningful invariant masses
-      can be computed.
+      A purely classical staged solver that first minimises the absolute
+      mass difference |m1-m2| between reconstructed parent candidates, then
+      applies smaller physics-informed tie-breaks (mass asymmetry, pT hierarchy,
+      angular and Dalitz-like consistency, and 13 TeV kinematic scaling).
+      Input: *un-normalised* physical four-momenta (same units as the HDF5
+      data files) so that meaningful invariant masses can be computed.
 
 Both models share the same output interface:
 
@@ -95,7 +96,7 @@ def export_classical_solver(
     output_path: str,
     num_jets: int = 7,
 ) -> None:
-    """Export the classical mass-asymmetry solver to ONNX.
+    """Export the staged classical assignment solver to ONNX.
 
     The classical solver does not require a checkpoint — it is a purely
     deterministic computation over the jet four-momenta.
