@@ -11,8 +11,11 @@ Supports:
 
 import argparse
 import csv
+import datetime
 import math
 import os
+import subprocess
+import zipfile
 from pathlib import Path
 
 import torch
@@ -22,8 +25,83 @@ import torch.onnx
 from torch.utils.data import DataLoader, random_split
 
 from .dataset import JetAssignmentDataset
+from .export_onnx import export_classical_solver, export_ml_model
 from .model import JetAssignmentTransformer
 from .utils import get_config, get_device
+
+
+def _get_git_commit_hash() -> str:
+    """Return the short git commit hash of HEAD, or 'unknown' if unavailable."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def _export_phase1_snapshot(
+    checkpoint_path: str,
+    num_jets: int,
+    val_acc: float,
+) -> None:
+    """Export phase-1 best model + classical solver as a timestamped ONNX bundle.
+
+    Produces a zip archive at ``onnx_snapshots/phase1_<timestamp>_<commit>.zip``
+    containing:
+      - ``ml_model_phase1_<timestamp>_<commit>.onnx``   – the ML transformer
+      - ``classical_mass_asymmetry_<timestamp>_<commit>.onnx`` – classical solver
+
+    Args:
+        checkpoint_path: Path to the phase-1 best-model checkpoint.
+        num_jets: Number of jets per event (from the data config).
+        val_acc: Best validation accuracy reached during phase 1 (for the log message).
+    """
+    ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    commit = _get_git_commit_hash()
+    tag = f"phase1_{ts}_{commit}"
+
+    snapshot_dir = Path("onnx_snapshots") / tag
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    ml_name = f"ml_model_{tag}.onnx"
+    classical_name = f"classical_mass_asymmetry_{tag}.onnx"
+    ml_path = str(snapshot_dir / ml_name)
+    classical_path = str(snapshot_dir / classical_name)
+
+    try:
+        export_ml_model(checkpoint_path=checkpoint_path, output_path=ml_path)
+    except Exception as exc:
+        print(f"  Warning: ML model ONNX export failed: {exc}")
+        ml_path = None
+
+    try:
+        export_classical_solver(output_path=classical_path, num_jets=num_jets)
+    except Exception as exc:
+        print(f"  Warning: Classical solver ONNX export failed: {exc}")
+        classical_path = None
+
+    zip_path = Path("onnx_snapshots") / f"{tag}.zip"
+    exported = [(p, n) for p, n in [(ml_path, ml_name), (classical_path, classical_name)] if p is not None]
+    if exported:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for path, name in exported:
+                zf.write(path, arcname=name)
+    else:
+        zip_path = None
+
+    print(
+        f"\n*** Phase 1 ONNX snapshot ***\n"
+        f"  ML model      : {ml_path or 'export failed'}\n"
+        f"  Classical     : {classical_path or 'export failed'}\n"
+        f"  Bundle        : {zip_path or 'not created (no successful exports)'}\n"
+        f"  (val_acc={val_acc:.4f}, commit={commit})\n"
+    )
 
 
 def export_onnx(model, num_jets, device, val_acc):
@@ -419,6 +497,16 @@ def train(config_path: str | None = None, data_path: str | None = None):
             if phase1_monitor > phase1_best_acc:
                 phase1_best_acc = phase1_monitor
                 phase1_no_improve = 0
+                torch.save(
+                    {
+                        "epoch": epoch + 1,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "val_acc": phase1_best_acc,
+                        "config": config,
+                    },
+                    "checkpoints/phase1_best_model.pt",
+                )
             else:
                 phase1_no_improve += 1
 
@@ -430,6 +518,11 @@ def train(config_path: str | None = None, data_path: str | None = None):
                     f"(best grp_acc={phase1_best_acc:.4f}, "
                     f"no improvement for {phase1_patience} epochs). "
                     f"Entering Phase 2: full supervised training. ***\n"
+                )
+                _export_phase1_snapshot(
+                    checkpoint_path="checkpoints/phase1_best_model.pt",
+                    num_jets=dc["num_jets"],
+                    val_acc=phase1_best_acc,
                 )
                 if model.has_isr:
                     for p in model.isr_head.parameters():
