@@ -45,26 +45,29 @@ def _get_git_commit_hash() -> str:
         return "unknown"
 
 
-def _export_phase1_snapshot(
+def _export_onnx_snapshot(
     checkpoint_path: str,
     num_jets: int,
     val_acc: float,
+    tag_prefix: str = "final",
 ) -> None:
-    """Export phase-1 best model + classical solver as a timestamped ONNX bundle.
+    """Export best model + classical solver as a timestamped ONNX bundle.
 
-    Produces a zip archive at ``onnx_snapshots/phase1_<timestamp>_<commit>.zip``
-    containing:
-      - ``ml_model_phase1_<timestamp>_<commit>.onnx``   – the ML transformer
-      - ``classical_mass_asymmetry_<timestamp>_<commit>.onnx`` – classical solver
+    Produces a zip archive at
+    ``onnx_snapshots/<tag_prefix>_<timestamp>_<commit>.zip`` containing:
+      - ``ml_model_<tag>.onnx``                     – the ML transformer
+      - ``classical_mass_asymmetry_<tag>.onnx``      – classical solver
 
     Args:
-        checkpoint_path: Path to the phase-1 best-model checkpoint.
+        checkpoint_path: Path to the saved model checkpoint (``.pt`` file).
         num_jets: Number of jets per event (from the data config).
-        val_acc: Best validation accuracy reached during phase 1 (for the log message).
+        val_acc: Best validation accuracy reached (used in the log message).
+        tag_prefix: String prepended to the snapshot tag (e.g. ``"phase1"``
+            or ``"final"``).
     """
     ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
     commit = _get_git_commit_hash()
-    tag = f"phase1_{ts}_{commit}"
+    tag = f"{tag_prefix}_{ts}_{commit}"
 
     snapshot_dir = Path("onnx_snapshots") / tag
     snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -95,12 +98,27 @@ def _export_phase1_snapshot(
     else:
         zip_path = None
 
+    label = tag_prefix.replace("_", " ").title()
     print(
-        f"\n*** Phase 1 ONNX snapshot ***\n"
+        f"\n*** {label} ONNX snapshot ***\n"
         f"  ML model      : {ml_path or 'export failed'}\n"
         f"  Classical     : {classical_path or 'export failed'}\n"
         f"  Bundle        : {zip_path or 'not created (no successful exports)'}\n"
         f"  (val_acc={val_acc:.4f}, commit={commit})\n"
+    )
+
+
+def _export_phase1_snapshot(
+    checkpoint_path: str,
+    num_jets: int,
+    val_acc: float,
+) -> None:
+    """Backward-compatible wrapper: export phase-1 snapshot bundle."""
+    _export_onnx_snapshot(
+        checkpoint_path=checkpoint_path,
+        num_jets=num_jets,
+        val_acc=val_acc,
+        tag_prefix="phase1",
     )
 
 
@@ -578,10 +596,40 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
     print(f"\nTraining complete. Best val accuracy: {best_val_acc:.4f} at epoch {best_epoch}")
 
+    final_checkpoint = "checkpoints/best_model.pt"
+    if not Path(final_checkpoint).exists():
+        # This can happen when phase1_active=True and Phase 2 never ran or never
+        # improved (so best_model.pt was never written).  Fall back to the Phase 1
+        # best checkpoint so that at least some model is exported.
+        fallback = "checkpoints/phase1_best_model.pt"
+        if Path(fallback).exists():
+            print(
+                f"  Warning: {final_checkpoint} not found; "
+                f"falling back to {fallback} for ONNX export."
+            )
+            final_checkpoint = fallback
+        else:
+            print(
+                f"  Warning: neither {final_checkpoint} nor {fallback} found. "
+                f"Skipping ONNX export."
+            )
+            return
+
     # Reload best checkpoint before ONNX export
-    ckpt = torch.load("checkpoints/best_model.pt", map_location=device, weights_only=False)
+    ckpt = torch.load(final_checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
+
+    # Plain ONNX for quick access at the well-known path
     export_onnx(model, dc["num_jets"], device, best_val_acc)
+
+    # Full timestamped snapshot bundle (ML model + classical solver), mirroring
+    # the Phase 1 snapshot produced by _export_phase1_snapshot.
+    _export_onnx_snapshot(
+        checkpoint_path=final_checkpoint,
+        num_jets=dc["num_jets"],
+        val_acc=best_val_acc,
+        tag_prefix="final",
+    )
 
 
 def _run_epoch(
