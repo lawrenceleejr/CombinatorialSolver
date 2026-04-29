@@ -945,9 +945,10 @@ def _plot_training_curves(
     _add_phase_lines(ax)
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
+    ax.set_yscale("log")
     ax.set_title("Loss vs Epoch")
     ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.3, which="both")
     fig.tight_layout()
     loss_path = plots_dir / f"loss_{tag}.pdf"
     fig.savefig(loss_path)
@@ -1004,9 +1005,9 @@ def _plot_training_curves(
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Mass asymmetry of chosen interpretation")
         ax.set_title("Mass Asymmetry of Chosen Interpretation vs Epoch")
-        ax.set_ylim(bottom=0.0)
+        ax.set_yscale("log")
         ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.grid(True, alpha=0.3, which="both")
         fig.tight_layout()
         asym_path = plots_dir / f"mass_asym_{tag}.pdf"
         fig.savefig(asym_path)
