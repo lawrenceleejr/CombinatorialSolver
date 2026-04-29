@@ -367,6 +367,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
     patience = tc.get("patience", 25)
     no_improve = 0
     val_asym_history: list = []  # per-epoch list of numpy arrays (val pred_asym_values)
+    val_mass_sum_history: list = []  # per-epoch list of numpy arrays (val pred_mass_sum_values)
 
     tf_start = tc.get("tf_start", 1.0)
     tf_end = tc.get("tf_end", 0.3)
@@ -579,6 +580,10 @@ def train(config_path: str | None = None, data_path: str | None = None):
         if "pred_asym_values" in val_metrics:
             val_asym_history.append((epoch + 1, training_phase, val_metrics["pred_asym_values"]))
 
+        # Accumulate per-event validation mass-sum distribution for GIF
+        if "pred_mass_sum_values" in val_metrics:
+            val_mass_sum_history.append((epoch + 1, training_phase, val_metrics["pred_mass_sum_values"]))
+
         # Log
         phase_tag = f"[P{training_phase}]" if phase1_active else ""
         adv_str = f" | Adv R²={val_metrics['adv_r2']:.3f}" if use_adversary else ""
@@ -634,6 +639,12 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 val_asym_history,
                 phase2_start_epoch=phase2_start_epoch,
                 gif_path=Path("plots") / "mass_asym_anim_latest.gif",
+            )
+        if val_mass_sum_history:
+            _make_mass_sum_gif(
+                val_mass_sum_history,
+                phase2_start_epoch=phase2_start_epoch,
+                gif_path=Path("plots") / "mass_sum_anim_latest.gif",
             )
 
         # ---------------------------------------------------------------
@@ -759,6 +770,12 @@ def train(config_path: str | None = None, data_path: str | None = None):
         if gif is not None:
             plot_paths.append(gif)
 
+    # Animated GIF of the validation average candidate mass distribution.
+    if val_mass_sum_history:
+        mass_sum_gif = _make_mass_sum_gif(val_mass_sum_history, phase2_start_epoch=phase2_start_epoch)
+        if mass_sum_gif is not None:
+            plot_paths.append(mass_sum_gif)
+
     # Full timestamped snapshot bundle (ML model + classical solver + plots),
     # mirroring the Phase 1 snapshot produced by _export_phase1_snapshot.
     _export_onnx_snapshot(
@@ -877,6 +894,122 @@ def _make_mass_asym_gif(
         plt.close(fig)
 
 
+def _make_mass_sum_gif(
+    val_mass_sum_history: list,
+    phase2_start_epoch: int | None = None,
+    gif_path: str | Path | None = None,
+) -> "Path | None":
+    """Build an animated GIF of the validation average-candidate-mass distribution.
+
+    Each frame shows a histogram of ``(m₁ + m₂) / 2`` for the model's chosen
+    interpretation across all validation events for that epoch.  A vertical
+    line marks the per-epoch mean.  When two-phase training was used, frames
+    from Phase 2 onward carry a "Phase 2" annotation so the transition is
+    immediately visible.
+
+    When *gif_path* is ``None`` the file is written to
+    ``plots/mass_sum_anim_{timestamp}_{commit}.gif``; pass an explicit path
+    (e.g. ``plots/mass_sum_anim_latest.gif``) to overwrite a fixed file on
+    every call.  Requires ``pillow`` (pip install pillow).
+
+    Args:
+        val_mass_sum_history: List of ``(epoch, phase, values_array)`` tuples
+            where *values_array* contains ``mass_sum_flat`` at the predicted
+            assignment for each validation event.
+        phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
+            ``None`` for single-phase runs.
+        gif_path: Destination file path.  When ``None`` a timestamped path
+            inside ``plots/`` is generated automatically.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.animation as animation
+    except ImportError:
+        print("  Warning: matplotlib not available; skipping mass-sum GIF.")
+        return None
+
+    if not val_mass_sum_history:
+        return None
+
+    plots_dir = Path("plots")
+    plots_dir.mkdir(exist_ok=True)
+
+    if gif_path is None:
+        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        commit = _get_git_commit_hash()
+        gif_path = plots_dir / f"mass_sum_anim_{ts}_{commit}.gif"
+    gif_path = Path(gif_path)
+
+    import numpy as np
+
+    # The average mass per candidate is mass_sum / 2.
+    all_avg_mass = [v / 2.0 for _, _, v in val_mass_sum_history]
+
+    # Fixed x-axis determined from the global data range (1st–99th percentile).
+    all_concat = np.concatenate(all_avg_mass)
+    x_min = float(np.percentile(all_concat, 1))
+    x_max = float(np.percentile(all_concat, 99))
+    if x_min >= x_max:
+        x_min, x_max = float(all_concat.min()), float(all_concat.max())
+    n_bins = 50
+    bin_edges = [x_min + (x_max - x_min) * i / n_bins for i in range(n_bins + 1)]
+
+    # Pre-compute counts for every frame to fix the y-axis.
+    max_count = 0
+    for avg_mass in all_avg_mass:
+        counts, _ = np.histogram(avg_mass, bins=bin_edges)
+        if counts.max() > max_count:
+            max_count = int(counts.max())
+    y_max = max_count * 1.1
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    def _draw_frame(frame_idx):
+        epoch, phase, _ = val_mass_sum_history[frame_idx]
+        avg_mass = all_avg_mass[frame_idx]
+        ax.cla()
+        counts, edges = np.histogram(avg_mass, bins=bin_edges)
+        centers = [(edges[i] + edges[i + 1]) / 2 for i in range(len(edges) - 1)]
+        ax.bar(centers, counts, width=(x_max - x_min) / n_bins,
+               color="mediumseagreen", alpha=0.75, align="center")
+        mean_val = float(avg_mass.mean())
+        ax.axvline(mean_val, color="darkorange", linewidth=2.0,
+                   label=f"Mean = {mean_val:.3f}")
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(0, y_max)
+        ax.set_xlabel("Average candidate mass (m₁+m₂)/2 of chosen interpretation")
+        ax.set_ylabel("Validation events")
+        phase_label = ""
+        if phase2_start_epoch is not None:
+            phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
+        elif phase == 2:
+            phase_label = " [Phase 2]"
+        ax.set_title(f"Epoch {epoch}{phase_label}")
+        ax.legend(loc="upper right")
+        ax.grid(True, alpha=0.3)
+
+    anim = animation.FuncAnimation(
+        fig,
+        _draw_frame,
+        frames=len(val_mass_sum_history),
+        interval=200,
+        repeat=False,
+    )
+
+    try:
+        anim.save(str(gif_path), writer="pillow", fps=5)
+        print(f"  -> Saved mass sum GIF  : {gif_path}")
+        return gif_path
+    except Exception as exc:
+        print(f"  Warning: could not save mass-sum GIF ({exc}). "
+              "Is pillow installed?  pip install pillow")
+        return None
+    finally:
+        plt.close(fig)
+
+
 def _plot_training_curves(
     log_path: str | Path,
     phase2_start_epoch: int | None = None,
@@ -923,6 +1056,7 @@ def _plot_training_curves(
     # --- Read CSV ---
     epochs, train_loss, val_loss, train_acc, val_acc, phases = [], [], [], [], [], []
     train_avg_asym, train_std_asym, val_avg_asym, val_std_asym = [], [], [], []
+    train_grp_acc, val_grp_acc = [], []
     with open(log_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -940,6 +1074,8 @@ def _plot_training_curves(
             train_std_asym.append(_parse_float(row.get("train_std_mass_asym", "")))
             val_avg_asym.append(_parse_float(row.get("val_avg_mass_asym", "")))
             val_std_asym.append(_parse_float(row.get("val_std_mass_asym", "")))
+            train_grp_acc.append(_parse_float(row.get("train_grp_acc", "")))
+            val_grp_acc.append(_parse_float(row.get("val_grp_acc", "")))
 
     if not epochs:
         print("  Warning: empty training log; skipping plots.")
@@ -1055,6 +1191,30 @@ def _plot_training_curves(
         print(f"  -> Saved mass asym plot: {asym_path}")
         saved_paths.append(asym_path)
 
+    # --- GRP score (grouping accuracy) plot – only for factored (ISR) models ---
+    import math as _math2
+    grp_epochs = [e for e, v in zip(epochs, val_grp_acc) if not _math2.isnan(v) and v > 0]
+    if grp_epochs:
+        grp_train = [v for e, v in zip(epochs, train_grp_acc)
+                     if e in set(grp_epochs) and not _math2.isnan(v)]
+        grp_val   = [v for e, v in zip(epochs, val_grp_acc)
+                     if e in set(grp_epochs) and not _math2.isnan(v)]
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.plot(grp_epochs, grp_train, label="Train grp acc", color="steelblue")
+        ax.plot(grp_epochs, grp_val, label="Val grp acc", color="darkorange")
+        _add_phase_lines(ax)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Grouping accuracy")
+        ax.set_title("GRP Score (Grouping Accuracy) vs Epoch")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        grp_path = plots_dir / f"grp_acc_{tag}.pdf"
+        fig.savefig(grp_path)
+        plt.close(fig)
+        print(f"  -> Saved GRP acc plot  : {grp_path}")
+        saved_paths.append(grp_path)
+
     return saved_paths
 
 
@@ -1084,6 +1244,7 @@ def _run_epoch(
     total_mass_asym = 0.0
     total_mass_asym_samples = 0
     all_pred_asym = []
+    all_pred_mass_sum = []
     all_mass_pred = []
     all_mass_true = []
     factored = model.has_isr
@@ -1360,6 +1521,11 @@ def _run_epoch(
             total_mass_asym_samples += batch_size
             all_pred_asym.append(pred_asym.cpu())
 
+        if "mass_sum_flat" in output:
+            mass_sum_flat = output["mass_sum_flat"].detach()  # (batch, num_assignments)
+            pred_mass_sum = mass_sum_flat.gather(1, preds.unsqueeze(1)).squeeze(1)  # (batch,)
+            all_pred_mass_sum.append(pred_mass_sum.cpu())
+
         mass_mask = parent_mass > 0
         if mass_mask.any():
             all_mass_pred.append(mass_pred[mass_mask].detach().cpu())
@@ -1384,6 +1550,8 @@ def _run_epoch(
         result["avg_mass_asym"] = total_mass_asym / total_mass_asym_samples
         result["std_mass_asym"] = pred_asym_cat.std().item()
         result["pred_asym_values"] = pred_asym_cat.numpy()  # full per-event array
+    if all_pred_mass_sum:
+        result["pred_mass_sum_values"] = torch.cat(all_pred_mass_sum).numpy()  # full per-event array
     if factored:
         result["isr_acc"] = total_isr_correct / max(total_samples, 1)
         result["grp_acc"] = total_grp_correct / max(total_samples, 1)
