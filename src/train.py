@@ -578,11 +578,19 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
         # Accumulate per-event validation mass-asymmetry distribution for GIF
         if "pred_asym_values" in val_metrics:
-            val_asym_history.append((epoch + 1, training_phase, val_metrics["pred_asym_values"]))
+            val_asym_history.append((
+                epoch + 1, training_phase,
+                val_metrics["pred_asym_values"],
+                val_metrics.get("pred_correct_values"),  # bool array or None
+            ))
 
         # Accumulate per-event validation mass-sum distribution for GIF
         if "pred_mass_sum_values" in val_metrics:
-            val_mass_sum_history.append((epoch + 1, training_phase, val_metrics["pred_mass_sum_values"]))
+            val_mass_sum_history.append((
+                epoch + 1, training_phase,
+                val_metrics["pred_mass_sum_values"],
+                val_metrics.get("pred_correct_values"),  # bool array or None
+            ))
 
         # Log
         phase_tag = f"[P{training_phase}]" if phase1_active else ""
@@ -794,11 +802,13 @@ def _make_mass_asym_gif(
 ) -> "Path | None":
     """Build an animated GIF of the validation mass-asymmetry distribution.
 
-    Each frame shows a histogram of the mass asymmetry of the model's chosen
-    interpretation across all validation events for that epoch.  A vertical
-    line marks the per-epoch mean.  When two-phase training was used, frames
-    from Phase 2 onward carry a "Phase 2" annotation so the transition is
-    immediately visible.
+    Each frame shows a histogram of log₁₀(mass asymmetry) for the model's
+    chosen interpretation across all validation events for that epoch.  When a
+    per-event correctness mask is available (4-tuple history entries) the bars
+    are stacked by correct vs incorrect network outputs.  A vertical line marks
+    the per-epoch mean.  When two-phase training was used, frames from Phase 2
+    onward carry a "Phase 2" annotation so the transition is immediately
+    visible.
 
     When *gif_path* is ``None`` the file is written to
     ``plots/mass_asym_anim_{timestamp}_{commit}.gif``; pass an explicit path
@@ -806,8 +816,10 @@ def _make_mass_asym_gif(
     every call and requires ``pillow`` (pip install pillow).
 
     Args:
-        val_asym_history: List of ``(epoch, phase, values_array)`` tuples
-            collected during training, one entry per epoch.
+        val_asym_history: List of ``(epoch, phase, values_array[, correct_mask])``
+            tuples collected during training, one entry per epoch.  The optional
+            fourth element is a boolean NumPy array aligned with *values_array*
+            (True = model chose the correct assignment).
         phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
             ``None`` for single-phase runs.
         gif_path: Destination file path.  When ``None`` a timestamped path
@@ -820,10 +832,10 @@ def _make_mass_asym_gif(
         import matplotlib.animation as animation
     except ImportError:
         print("  Warning: matplotlib not available; skipping mass-asym GIF.")
-        return
+        return None
 
     if not val_asym_history:
-        return
+        return None
 
     plots_dir = Path("plots")
     plots_dir.mkdir(exist_ok=True)
@@ -834,36 +846,62 @@ def _make_mass_asym_gif(
         gif_path = plots_dir / f"mass_asym_anim_{ts}_{commit}.gif"
     gif_path = Path(gif_path)
 
-    # Fixed x-axis and y-axis limits computed once across all frames.
-    all_values = [v for _, _, v in val_asym_history]
-    x_min, x_max = 0.0, 1.0
-    n_bins = 50
-    bin_edges = [x_min + (x_max - x_min) * i / n_bins for i in range(n_bins + 1)]
-
-    # Pre-compute counts for every frame to fix the y-axis.
     import numpy as np
+
+    # Unpack history: support both 3-tuple (legacy) and 4-tuple (with correct mask).
+    def _unpack(entry):
+        if len(entry) == 4:
+            return entry
+        return entry[0], entry[1], entry[2], None
+
+    # x-axis in log10 space: mass_asym ∈ (0, 1] → log10 ∈ (-∞, 0].
+    # Clip values below 1e-4 to avoid -inf.
+    LOG_CLIP = 1e-4
+    x_min, x_max = -4.0, 0.0
+    n_bins = 50
+    bin_edges = np.linspace(x_min, x_max, n_bins + 1)
+
+    # Pre-compute stacked counts for every frame to fix the y-axis.
     max_count = 0
-    for values in all_values:
-        counts, _ = np.histogram(values, bins=bin_edges)
-        if counts.max() > max_count:
-            max_count = counts.max()
+    for entry in val_asym_history:
+        _, _, values, correct_mask = _unpack(entry)
+        log_vals = np.log10(np.clip(values, LOG_CLIP, 1.0))
+        counts_total, _ = np.histogram(log_vals, bins=bin_edges)
+        if counts_total.max() > max_count:
+            max_count = int(counts_total.max())
     y_max = max_count * 1.1
 
     fig, ax = plt.subplots(figsize=(8, 5))
+    bar_width = (x_max - x_min) / n_bins
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 
     def _draw_frame(frame_idx):
-        epoch, phase, values = val_asym_history[frame_idx]
+        _, _, values, correct_mask = _unpack(val_asym_history[frame_idx])
+        epoch, phase = val_asym_history[frame_idx][0], val_asym_history[frame_idx][1]
         ax.cla()
-        counts, edges = np.histogram(values, bins=bin_edges)
-        centers = [(edges[i] + edges[i + 1]) / 2 for i in range(len(edges) - 1)]
-        ax.bar(centers, counts, width=(x_max - x_min) / n_bins,
-               color="steelblue", alpha=0.75, align="center")
-        mean_val = float(values.mean())
+        log_vals = np.log10(np.clip(values, LOG_CLIP, 1.0))
+        mean_val = float(log_vals.mean())
+
+        if correct_mask is not None:
+            log_correct   = log_vals[correct_mask]
+            log_incorrect = log_vals[~correct_mask]
+            counts_correct,   _ = np.histogram(log_correct,   bins=bin_edges)
+            counts_incorrect, _ = np.histogram(log_incorrect, bins=bin_edges)
+            ax.bar(centers, counts_correct,   width=bar_width,
+                   color="steelblue", alpha=0.85, align="center", label="Correct")
+            ax.bar(centers, counts_incorrect, width=bar_width,
+                   color="coral",     alpha=0.85, align="center", label="Incorrect",
+                   bottom=counts_correct)
+        else:
+            counts, _ = np.histogram(log_vals, bins=bin_edges)
+            ax.bar(centers, counts, width=bar_width,
+                   color="steelblue", alpha=0.75, align="center")
+
         ax.axvline(mean_val, color="darkorange", linewidth=2.0,
-                   label=f"Mean = {mean_val:.3f}")
+                   label=f"Mean = {mean_val:.2f}")
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(0, y_max)
-        ax.set_xlabel("Mass asymmetry of chosen interpretation")
+        ax.set_xlabel("log₁₀(mass asymmetry of chosen interpretation)")
         ax.set_ylabel("Validation events")
         phase_label = ""
         if phase2_start_epoch is not None:
@@ -871,7 +909,7 @@ def _make_mass_asym_gif(
         elif phase == 2:
             phase_label = " [Phase 2]"
         ax.set_title(f"Epoch {epoch}{phase_label}")
-        ax.legend(loc="upper right")
+        ax.legend(loc="upper left")
         ax.grid(True, alpha=0.3)
 
     anim = animation.FuncAnimation(
@@ -902,10 +940,12 @@ def _make_mass_sum_gif(
     """Build an animated GIF of the validation average-candidate-mass distribution.
 
     Each frame shows a histogram of ``(m₁ + m₂) / 2`` for the model's chosen
-    interpretation across all validation events for that epoch.  A vertical
-    line marks the per-epoch mean.  When two-phase training was used, frames
-    from Phase 2 onward carry a "Phase 2" annotation so the transition is
-    immediately visible.
+    interpretation across all validation events for that epoch.  When a
+    per-event correctness mask is available (4-tuple history entries) the bars
+    are stacked by correct vs incorrect network outputs.  A vertical line marks
+    the per-epoch mean.  When two-phase training was used, frames from Phase 2
+    onward carry a "Phase 2" annotation so the transition is immediately
+    visible.
 
     When *gif_path* is ``None`` the file is written to
     ``plots/mass_sum_anim_{timestamp}_{commit}.gif``; pass an explicit path
@@ -913,9 +953,11 @@ def _make_mass_sum_gif(
     every call.  Requires ``pillow`` (pip install pillow).
 
     Args:
-        val_mass_sum_history: List of ``(epoch, phase, values_array)`` tuples
-            where *values_array* contains ``mass_sum_flat`` at the predicted
-            assignment for each validation event.
+        val_mass_sum_history: List of ``(epoch, phase, values_array[, correct_mask])``
+            tuples where *values_array* contains ``mass_sum_flat`` at the
+            predicted assignment for each validation event.  The optional
+            fourth element is a boolean NumPy array aligned with *values_array*
+            (True = model chose the correct assignment).
         phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
             ``None`` for single-phase runs.
         gif_path: Destination file path.  When ``None`` a timestamped path
@@ -944,8 +986,14 @@ def _make_mass_sum_gif(
 
     import numpy as np
 
+    # Unpack history: support both 3-tuple (legacy) and 4-tuple (with correct mask).
+    def _unpack(entry):
+        if len(entry) == 4:
+            return entry
+        return entry[0], entry[1], entry[2], None
+
     # The average mass per candidate is mass_sum / 2.
-    all_avg_mass = [v / 2.0 for _, _, v in val_mass_sum_history]
+    all_avg_mass = [v / 2.0 for *_, v, _ in [_unpack(e) for e in val_mass_sum_history]]
 
     # Fixed x-axis determined from the global data range (1st–99th percentile).
     all_concat = np.concatenate(all_avg_mass)
@@ -954,9 +1002,9 @@ def _make_mass_sum_gif(
     if x_min >= x_max:
         x_min, x_max = float(all_concat.min()), float(all_concat.max())
     n_bins = 50
-    bin_edges = [x_min + (x_max - x_min) * i / n_bins for i in range(n_bins + 1)]
+    bin_edges = np.linspace(x_min, x_max, n_bins + 1)
 
-    # Pre-compute counts for every frame to fix the y-axis.
+    # Pre-compute total counts for every frame to fix the y-axis.
     max_count = 0
     for avg_mass in all_avg_mass:
         counts, _ = np.histogram(avg_mass, bins=bin_edges)
@@ -965,16 +1013,30 @@ def _make_mass_sum_gif(
     y_max = max_count * 1.1
 
     fig, ax = plt.subplots(figsize=(8, 5))
+    bar_width = (x_max - x_min) / n_bins
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 
     def _draw_frame(frame_idx):
-        epoch, phase, _ = val_mass_sum_history[frame_idx]
-        avg_mass = all_avg_mass[frame_idx]
+        epoch, phase, values, correct_mask = _unpack(val_mass_sum_history[frame_idx])
+        avg_mass = values / 2.0
         ax.cla()
-        counts, edges = np.histogram(avg_mass, bins=bin_edges)
-        centers = [(edges[i] + edges[i + 1]) / 2 for i in range(len(edges) - 1)]
-        ax.bar(centers, counts, width=(x_max - x_min) / n_bins,
-               color="mediumseagreen", alpha=0.75, align="center")
         mean_val = float(avg_mass.mean())
+
+        if correct_mask is not None:
+            avg_correct   = avg_mass[correct_mask]
+            avg_incorrect = avg_mass[~correct_mask]
+            counts_correct,   _ = np.histogram(avg_correct,   bins=bin_edges)
+            counts_incorrect, _ = np.histogram(avg_incorrect, bins=bin_edges)
+            ax.bar(centers, counts_correct,   width=bar_width,
+                   color="mediumseagreen", alpha=0.85, align="center", label="Correct")
+            ax.bar(centers, counts_incorrect, width=bar_width,
+                   color="coral",           alpha=0.85, align="center", label="Incorrect",
+                   bottom=counts_correct)
+        else:
+            counts, _ = np.histogram(avg_mass, bins=bin_edges)
+            ax.bar(centers, counts, width=bar_width,
+                   color="mediumseagreen", alpha=0.75, align="center")
+
         ax.axvline(mean_val, color="darkorange", linewidth=2.0,
                    label=f"Mean = {mean_val:.3f}")
         ax.set_xlim(x_min, x_max)
@@ -1244,6 +1306,7 @@ def _run_epoch(
     total_mass_asym = 0.0
     total_mass_asym_samples = 0
     all_pred_asym = []
+    all_pred_correct = []
     all_pred_mass_sum = []
     all_mass_pred = []
     all_mass_true = []
@@ -1520,6 +1583,7 @@ def _run_epoch(
             total_mass_asym += pred_asym.sum().item()
             total_mass_asym_samples += batch_size
             all_pred_asym.append(pred_asym.cpu())
+            all_pred_correct.append((preds == labels).cpu())  # aligned with pred_asym
 
         if "mass_sum_flat" in output:
             mass_sum_flat = output["mass_sum_flat"].detach()  # (batch, num_assignments)
@@ -1550,6 +1614,7 @@ def _run_epoch(
         result["avg_mass_asym"] = total_mass_asym / total_mass_asym_samples
         result["std_mass_asym"] = pred_asym_cat.std().item()
         result["pred_asym_values"] = pred_asym_cat.numpy()  # full per-event array
+        result["pred_correct_values"] = torch.cat(all_pred_correct).numpy()  # bool per-event
     if all_pred_mass_sum:
         result["pred_mass_sum_values"] = torch.cat(all_pred_mass_sum).numpy()  # full per-event array
     if factored:
