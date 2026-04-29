@@ -50,6 +50,7 @@ def _export_onnx_snapshot(
     num_jets: int,
     val_acc: float,
     tag_prefix: str = "final",
+    extra_files: "list[Path] | None" = None,
 ) -> None:
     """Export best model + classical solver as a timestamped ONNX bundle.
 
@@ -57,6 +58,7 @@ def _export_onnx_snapshot(
     ``onnx_snapshots/<tag_prefix>_<timestamp>_<commit>.zip`` containing:
       - ``ml_model_<tag>.onnx``                     – the ML transformer
       - ``classical_mass_asymmetry_<tag>.onnx``      – classical solver
+      - any paths listed in *extra_files* (e.g. training-curve PDFs / GIFs)
 
     Args:
         checkpoint_path: Path to the saved model checkpoint (``.pt`` file).
@@ -64,7 +66,11 @@ def _export_onnx_snapshot(
         val_acc: Best validation accuracy reached (used in the log message).
         tag_prefix: String prepended to the snapshot tag (e.g. ``"phase1"``
             or ``"final"``).
+        extra_files: Optional list of additional file paths to copy into the
+            snapshot directory and include in the zip bundle.
     """
+    import shutil
+
     ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
     commit = _get_git_commit_hash()
     tag = f"{tag_prefix}_{ts}_{commit}"
@@ -89,8 +95,20 @@ def _export_onnx_snapshot(
         print(f"  Warning: Classical solver ONNX export failed: {exc}")
         classical_path = None
 
+    # Copy extra files (e.g. training-curve plots) into the snapshot directory.
+    extra_entries: list[tuple[str, str]] = []
+    for src in (extra_files or []):
+        src = Path(src)
+        if src.exists():
+            dest = snapshot_dir / src.name
+            shutil.copy2(src, dest)
+            extra_entries.append((str(dest), src.name))
+        else:
+            print(f"  Warning: extra file not found, skipping: {src}")
+
     zip_path = Path("onnx_snapshots") / f"{tag}.zip"
     exported = [(p, n) for p, n in [(ml_path, ml_name), (classical_path, classical_name)] if p is not None]
+    exported.extend(extra_entries)
     if exported:
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for path, name in exported:
@@ -99,10 +117,12 @@ def _export_onnx_snapshot(
         zip_path = None
 
     label = tag_prefix.replace("_", " ").title()
+    extra_summary = "".join(f"  Plot          : {n}\n" for _, n in extra_entries)
     print(
         f"\n*** {label} ONNX snapshot ***\n"
         f"  ML model      : {ml_path or 'export failed'}\n"
         f"  Classical     : {classical_path or 'export failed'}\n"
+        f"{extra_summary}"
         f"  Bundle        : {zip_path or 'not created (no successful exports)'}\n"
         f"  (val_acc={val_acc:.4f}, commit={commit})\n"
     )
@@ -724,29 +744,37 @@ def train(config_path: str | None = None, data_path: str | None = None):
     # Plain ONNX for quick access at the well-known path
     export_onnx(model, dc["num_jets"], device, best_val_acc)
 
-    # Full timestamped snapshot bundle (ML model + classical solver), mirroring
-    # the Phase 1 snapshot produced by _export_phase1_snapshot.
+    # Generate training-curve plots and the mass-asymmetry GIF first so that
+    # they can be bundled into the ONNX snapshot zip below.
+    plot_paths: list = []
+
+    # Training-curve plots (loss and accuracy vs epoch) with phase transition markers.
+    plot_paths.extend(
+        _plot_training_curves(log_path, phase2_start_epoch=phase2_start_epoch) or []
+    )
+
+    # Animated GIF of the validation mass-asymmetry distribution.
+    if val_asym_history:
+        gif = _make_mass_asym_gif(val_asym_history, phase2_start_epoch=phase2_start_epoch)
+        if gif is not None:
+            plot_paths.append(gif)
+
+    # Full timestamped snapshot bundle (ML model + classical solver + plots),
+    # mirroring the Phase 1 snapshot produced by _export_phase1_snapshot.
     _export_onnx_snapshot(
         checkpoint_path=final_checkpoint,
         num_jets=dc["num_jets"],
         val_acc=best_val_acc,
         tag_prefix="final",
+        extra_files=plot_paths,
     )
-
-    # Generate training-curve plots (loss and accuracy vs epoch) with phase
-    # transition markers and save as timestamped PDFs in plots/.
-    _plot_training_curves(log_path, phase2_start_epoch=phase2_start_epoch)
-
-    # Generate animated GIF of the validation mass-asymmetry distribution.
-    if val_asym_history:
-        _make_mass_asym_gif(val_asym_history, phase2_start_epoch=phase2_start_epoch)
 
 
 def _make_mass_asym_gif(
     val_asym_history: list,
     phase2_start_epoch: int | None = None,
     gif_path: str | Path | None = None,
-) -> None:
+) -> "Path | None":
     """Build an animated GIF of the validation mass-asymmetry distribution.
 
     Each frame shows a histogram of the mass asymmetry of the model's chosen
@@ -840,9 +868,11 @@ def _make_mass_asym_gif(
     try:
         anim.save(str(gif_path), writer="pillow", fps=5)
         print(f"  -> Saved mass asym GIF : {gif_path}")
+        return gif_path
     except Exception as exc:
         print(f"  Warning: could not save mass-asym GIF ({exc}). "
               "Is pillow installed?  pip install pillow")
+        return None
     finally:
         plt.close(fig)
 
@@ -851,7 +881,7 @@ def _plot_training_curves(
     log_path: str | Path,
     phase2_start_epoch: int | None = None,
     tag: str | None = None,
-) -> None:
+) -> "list[Path]":
     """Generate loss, accuracy, and mass-asymmetry plots from the training log CSV.
 
     Creates three PDF files in a ``plots/`` directory:
@@ -872,6 +902,10 @@ def _plot_training_curves(
             timestamp + commit hash is generated automatically.  Pass a fixed
             string (e.g. ``"latest"``) to overwrite the same files on every
             call, which is useful for live monitoring during training.
+
+    Returns:
+        List of :class:`~pathlib.Path` objects for the PDF files that were
+        successfully saved.  Empty list when plots could not be generated.
     """
     try:
         import matplotlib
@@ -879,12 +913,12 @@ def _plot_training_curves(
         import matplotlib.pyplot as plt
     except ImportError:
         print("  Warning: matplotlib not available; skipping training curve plots.")
-        return
+        return []
 
     log_path = Path(log_path)
     if not log_path.exists():
         print(f"  Warning: training log not found at {log_path}; skipping plots.")
-        return
+        return []
 
     # --- Read CSV ---
     epochs, train_loss, val_loss, train_acc, val_acc, phases = [], [], [], [], [], []
@@ -909,7 +943,7 @@ def _plot_training_curves(
 
     if not epochs:
         print("  Warning: empty training log; skipping plots.")
-        return
+        return []
 
     # --- Output directory and file tag ---
     if tag is None:
@@ -940,6 +974,8 @@ def _plot_training_curves(
                 label="Phase 1 → 2" if idx == 0 else None,
             )
 
+    saved_paths: list[Path] = []
+
     # --- Loss plot ---
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.plot(epochs, train_loss, label="Train loss", color="steelblue")
@@ -956,6 +992,7 @@ def _plot_training_curves(
     fig.savefig(loss_path)
     plt.close(fig)
     print(f"  -> Saved loss plot     : {loss_path}")
+    saved_paths.append(loss_path)
 
     # --- Accuracy plot ---
     fig, ax = plt.subplots(figsize=(9, 5))
@@ -972,6 +1009,7 @@ def _plot_training_curves(
     fig.savefig(acc_path)
     plt.close(fig)
     print(f"  -> Saved accuracy plot : {acc_path}")
+    saved_paths.append(acc_path)
 
     # --- Mass asymmetry plot (only when data are available) ---
     import math as _math
@@ -1015,6 +1053,9 @@ def _plot_training_curves(
         fig.savefig(asym_path)
         plt.close(fig)
         print(f"  -> Saved mass asym plot: {asym_path}")
+        saved_paths.append(asym_path)
+
+    return saved_paths
 
 
 def _run_epoch(
