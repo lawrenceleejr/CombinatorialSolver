@@ -1,9 +1,10 @@
 model:
-  d_model: 128
+  d_model: 256
   nhead: 8
-  num_layers: 4
-  dim_feedforward: 512
+  num_layers: 6
+  dim_feedforward: 1024
   dropout: 0.1
+  group_num_layers: 2
 
 training:
   batch_size: 256
@@ -19,6 +20,11 @@ training:
   tf_start: 1.0
   tf_end: 0.3
   tf_decay_epochs: 100
+  # Label smoothing regularizes the cross-entropy loss by distributing a small
+  # fraction of the probability mass uniformly across all classes.  With noisy
+  # smeared data the "correct" assignment is not always unambiguous, so smoothing
+  # prevents overconfident predictions and improves generalization.
+  label_smoothing: 0.1
   # Upweights the ISR classification loss relative to the teacher-forced grouping loss.
   # Root cause: signal jets receive gradient from loss_grp_tf via all 10 groupings (10
   # gradient paths per signal jet), while the ISR jet receives gradient only from loss_isr
@@ -93,7 +99,7 @@ training:
 data:
   normalize_by_ht: true
   num_jets: 7
-  pt_smear_frac: 0.0
+  pt_smear_frac: 0.20
   # Compute truth labels as argmin |m1-m2| over all 70 interpretations (recommended).
   # This is the physically correct ground truth for equal-mass pair-produced resonances
   # and removes dependence on potentially incorrect TARGETS entries in the HDF5 file.

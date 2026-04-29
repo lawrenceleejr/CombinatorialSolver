@@ -120,6 +120,7 @@ class JetAssignmentTransformer(nn.Module):
         dropout: float = 0.1,
         num_jets: int = 7,
         input_dim: int = 4,
+        group_num_layers: int = 1,
     ):
         super().__init__()
         self.d_model = d_model
@@ -154,7 +155,7 @@ class JetAssignmentTransformer(nn.Module):
         self.group_transformer = GroupTransformer(
             d_model=d_model,
             nhead=group_nhead,
-            num_layers=1,
+            num_layers=group_num_layers,
             dropout=dropout,
         )
 
@@ -182,7 +183,7 @@ class JetAssignmentTransformer(nn.Module):
             # ISR decision to see how well the remaining jets form pair-production
             # groupings.
             self.grouping_summary_proj = nn.Sequential(
-                nn.Linear(2 * d_model + self.n_group_physics, d_model),
+                nn.Linear(3 * d_model + self.n_group_physics, d_model),
                 nn.GELU(),
             )
             self.isr_head = nn.Sequential(
@@ -204,7 +205,7 @@ class JetAssignmentTransformer(nn.Module):
             self.isr_aux_logit_scale = nn.Parameter(torch.ones(1))
 
             self.grouping_scorer = nn.Sequential(
-                nn.Linear(2 * d_model + self.n_group_physics, 2 * d_model),
+                nn.Linear(3 * d_model + self.n_group_physics, 2 * d_model),
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(2 * d_model, d_model),
@@ -219,7 +220,7 @@ class JetAssignmentTransformer(nn.Module):
             self.num_assignments = at["num_assignments"]
 
             self.score_mlp = nn.Sequential(
-                nn.Linear(2 * d_model + self.n_group_physics, 2 * d_model),
+                nn.Linear(3 * d_model + self.n_group_physics, 2 * d_model),
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(2 * d_model, d_model),
@@ -528,6 +529,7 @@ class JetAssignmentTransformer(nn.Module):
 
         sym_sum = g1_pooled + g2_pooled
         sym_prod = g1_pooled * g2_pooled
+        sym_diff = (g1_pooled - g2_pooled).abs()
 
         physics = self._group_physics_factored(four_momenta)  # (batch, n_combos, n_group_physics)
 
@@ -541,7 +543,7 @@ class JetAssignmentTransformer(nn.Module):
 
         physics = self.physics_norm(physics)
 
-        combined = torch.cat([sym_sum, sym_prod, physics], dim=-1)
+        combined = torch.cat([sym_sum, sym_prod, sym_diff, physics], dim=-1)
         scores = self.grouping_scorer(combined).squeeze(-1)
         grouping_logits = scores.reshape(batch_size, self.num_jets, self.num_groupings)
 
@@ -608,6 +610,7 @@ class JetAssignmentTransformer(nn.Module):
 
         sym_sum = g1_pooled + g2_pooled
         sym_prod = g1_pooled * g2_pooled
+        sym_diff = (g1_pooled - g2_pooled).abs()
 
         fm = four_momenta[:, :, :4].unsqueeze(1).expand(-1, na, -1, -1)
         g1_4idx = self.group1_indices.unsqueeze(0).unsqueeze(-1).expand(
@@ -628,7 +631,7 @@ class JetAssignmentTransformer(nn.Module):
         mass_sum_flat = physics[..., 0]              # index 0 = mass_sum
         mass_asym_flat = physics[..., 1]             # index 1 = mass_asym
         physics = self.physics_norm(physics)
-        combined = torch.cat([sym_sum, sym_prod, physics], dim=-1)
+        combined = torch.cat([sym_sum, sym_prod, sym_diff, physics], dim=-1)
         logits = self.score_mlp(combined).squeeze(-1)
         return logits, mass_asym_flat, mass_sum_flat
 
