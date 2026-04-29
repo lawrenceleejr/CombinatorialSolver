@@ -303,6 +303,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
     best_epoch = 0
     patience = tc.get("patience", 25)
     no_improve = 0
+    val_asym_history: list = []  # per-epoch list of numpy arrays (val pred_asym_values)
 
     tf_start = tc.get("tf_start", 1.0)
     tf_end = tc.get("tf_end", 0.3)
@@ -509,6 +510,10 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
             )
 
+        # Accumulate per-event validation mass-asymmetry distribution for GIF
+        if "pred_asym_values" in val_metrics:
+            val_asym_history.append((epoch + 1, training_phase, val_metrics["pred_asym_values"]))
+
         # Log
         phase_tag = f"[P{training_phase}]" if phase1_active else ""
         adv_str = f" | Adv R²={val_metrics['adv_r2']:.3f}" if use_adversary else ""
@@ -676,6 +681,108 @@ def train(config_path: str | None = None, data_path: str | None = None):
     # Generate training-curve plots (loss and accuracy vs epoch) with phase
     # transition markers and save as timestamped PDFs in plots/.
     _plot_training_curves(log_path, phase2_start_epoch=phase2_start_epoch)
+
+    # Generate animated GIF of the validation mass-asymmetry distribution.
+    if val_asym_history:
+        _make_mass_asym_gif(val_asym_history, phase2_start_epoch=phase2_start_epoch)
+
+
+def _make_mass_asym_gif(
+    val_asym_history: list,
+    phase2_start_epoch: int | None = None,
+) -> None:
+    """Build an animated GIF of the validation mass-asymmetry distribution.
+
+    Each frame shows a histogram of the mass asymmetry of the model's chosen
+    interpretation across all validation events for that epoch.  A vertical
+    line marks the per-epoch mean.  When two-phase training was used, frames
+    from Phase 2 onward carry a "Phase 2" annotation so the transition is
+    immediately visible.
+
+    The file is written to ``plots/mass_asym_anim_{timestamp}_{commit}.gif``
+    and requires ``pillow`` (pip install pillow).
+
+    Args:
+        val_asym_history: List of ``(epoch, phase, values_array)`` tuples
+            collected during training, one entry per epoch.
+        phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
+            ``None`` for single-phase runs.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.animation as animation
+    except ImportError:
+        print("  Warning: matplotlib not available; skipping mass-asym GIF.")
+        return
+
+    if not val_asym_history:
+        return
+
+    plots_dir = Path("plots")
+    plots_dir.mkdir(exist_ok=True)
+
+    ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    commit = _get_git_commit_hash()
+    gif_path = plots_dir / f"mass_asym_anim_{ts}_{commit}.gif"
+
+    # Fixed x-axis and y-axis limits computed once across all frames.
+    all_values = [v for _, _, v in val_asym_history]
+    x_min, x_max = 0.0, 1.0
+    n_bins = 50
+    bin_edges = [x_min + (x_max - x_min) * i / n_bins for i in range(n_bins + 1)]
+
+    # Pre-compute counts for every frame to fix the y-axis.
+    import numpy as np
+    max_count = 0
+    for values in all_values:
+        counts, _ = np.histogram(values, bins=bin_edges)
+        if counts.max() > max_count:
+            max_count = counts.max()
+    y_max = max_count * 1.1
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    def _draw_frame(frame_idx):
+        epoch, phase, values = val_asym_history[frame_idx]
+        ax.cla()
+        counts, edges = np.histogram(values, bins=bin_edges)
+        centers = [(edges[i] + edges[i + 1]) / 2 for i in range(len(edges) - 1)]
+        ax.bar(centers, counts, width=(x_max - x_min) / n_bins,
+               color="steelblue", alpha=0.75, align="center")
+        mean_val = float(values.mean())
+        ax.axvline(mean_val, color="darkorange", linewidth=2.0,
+                   label=f"Mean = {mean_val:.3f}")
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(0, y_max)
+        ax.set_xlabel("Mass asymmetry of chosen interpretation")
+        ax.set_ylabel("Validation events")
+        phase_label = ""
+        if phase2_start_epoch is not None:
+            phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
+        elif phase == 2:
+            phase_label = " [Phase 2]"
+        ax.set_title(f"Epoch {epoch}{phase_label}")
+        ax.legend(loc="upper right")
+        ax.grid(True, alpha=0.3)
+
+    anim = animation.FuncAnimation(
+        fig,
+        _draw_frame,
+        frames=len(val_asym_history),
+        interval=200,
+        repeat=False,
+    )
+
+    try:
+        anim.save(str(gif_path), writer="pillow", fps=5)
+        print(f"  -> Saved mass asym GIF : {gif_path}")
+    except Exception as exc:
+        print(f"  Warning: could not save mass-asym GIF ({exc}). "
+              "Is pillow installed?  pip install pillow")
+    finally:
+        plt.close(fig)
 
 
 def _plot_training_curves(
@@ -1160,8 +1267,10 @@ def _run_epoch(
 
     result = {"loss": avg_loss, "acc": acc, "acc5": acc5, "adv_r2": adv_r2}
     if total_mass_asym_samples > 0:
+        pred_asym_cat = torch.cat(all_pred_asym)
         result["avg_mass_asym"] = total_mass_asym / total_mass_asym_samples
-        result["std_mass_asym"] = torch.cat(all_pred_asym).std().item()
+        result["std_mass_asym"] = pred_asym_cat.std().item()
+        result["pred_asym_values"] = pred_asym_cat.numpy()  # full per-event array
     if factored:
         result["isr_acc"] = total_isr_correct / max(total_samples, 1)
         result["grp_acc"] = total_grp_correct / max(total_samples, 1)
