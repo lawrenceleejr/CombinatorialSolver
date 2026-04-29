@@ -604,6 +604,16 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 f"{val_metrics['std_mass_asym']:.6f}" if "std_mass_asym" in val_metrics else "",
             ])
 
+        # Per-epoch live-monitoring plots (overwrite fixed "latest" files so a
+        # viewer that auto-refreshes (e.g. an open PDF) always shows current progress).
+        _plot_training_curves(log_path, phase2_start_epoch=phase2_start_epoch, tag="latest")
+        if val_asym_history:
+            _make_mass_asym_gif(
+                val_asym_history,
+                phase2_start_epoch=phase2_start_epoch,
+                gif_path=Path("plots") / "mass_asym_anim_latest.gif",
+            )
+
         # ---------------------------------------------------------------
         # Phase 1 plateau detection → trigger Phase 2
         # ---------------------------------------------------------------
@@ -733,6 +743,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
 def _make_mass_asym_gif(
     val_asym_history: list,
     phase2_start_epoch: int | None = None,
+    gif_path: str | Path | None = None,
 ) -> None:
     """Build an animated GIF of the validation mass-asymmetry distribution.
 
@@ -742,14 +753,18 @@ def _make_mass_asym_gif(
     from Phase 2 onward carry a "Phase 2" annotation so the transition is
     immediately visible.
 
-    The file is written to ``plots/mass_asym_anim_{timestamp}_{commit}.gif``
-    and requires ``pillow`` (pip install pillow).
+    When *gif_path* is ``None`` the file is written to
+    ``plots/mass_asym_anim_{timestamp}_{commit}.gif``; pass an explicit path
+    (e.g. ``plots/mass_asym_anim_latest.gif``) to overwrite a fixed file on
+    every call and requires ``pillow`` (pip install pillow).
 
     Args:
         val_asym_history: List of ``(epoch, phase, values_array)`` tuples
             collected during training, one entry per epoch.
         phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
             ``None`` for single-phase runs.
+        gif_path: Destination file path.  When ``None`` a timestamped path
+            inside ``plots/`` is generated automatically.
     """
     try:
         import matplotlib
@@ -766,9 +781,11 @@ def _make_mass_asym_gif(
     plots_dir = Path("plots")
     plots_dir.mkdir(exist_ok=True)
 
-    ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-    commit = _get_git_commit_hash()
-    gif_path = plots_dir / f"mass_asym_anim_{ts}_{commit}.gif"
+    if gif_path is None:
+        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        commit = _get_git_commit_hash()
+        gif_path = plots_dir / f"mass_asym_anim_{ts}_{commit}.gif"
+    gif_path = Path(gif_path)
 
     # Fixed x-axis and y-axis limits computed once across all frames.
     all_values = [v for _, _, v in val_asym_history]
@@ -831,6 +848,7 @@ def _make_mass_asym_gif(
 def _plot_training_curves(
     log_path: str | Path,
     phase2_start_epoch: int | None = None,
+    tag: str | None = None,
 ) -> None:
     """Generate loss, accuracy, and mass-asymmetry plots from the training log CSV.
 
@@ -848,6 +866,10 @@ def _plot_training_curves(
         log_path: Path to the training log CSV file written during training.
         phase2_start_epoch: The (1-based) epoch at which Phase 2 began, or
             ``None`` if single-phase training was used.
+        tag: File-name suffix used for the output PDFs.  When ``None`` a
+            timestamp + commit hash is generated automatically.  Pass a fixed
+            string (e.g. ``"latest"``) to overwrite the same files on every
+            call, which is useful for live monitoring during training.
     """
     try:
         import matplotlib
@@ -888,9 +910,10 @@ def _plot_training_curves(
         return
 
     # --- Output directory and file tag ---
-    ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-    commit = _get_git_commit_hash()
-    tag = f"{ts}_{commit}"
+    if tag is None:
+        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        commit = _get_git_commit_hash()
+        tag = f"{ts}_{commit}"
     plots_dir = Path("plots")
     plots_dir.mkdir(exist_ok=True)
 
