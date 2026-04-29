@@ -674,6 +674,7 @@ def _run_epoch(
     lambda_distill=0.0, distill_temperature=4.0,
     lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
     phase1_only=False,
+    pt_smear_frac=0.0,
 ):
     """Run one epoch of training or validation.
 
