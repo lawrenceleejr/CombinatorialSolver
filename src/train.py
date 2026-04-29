@@ -295,6 +295,8 @@ def train(config_path: str | None = None, data_path: str | None = None):
             "val_loss", "val_acc", "val_acc5",
             "train_isr_acc", "train_grp_acc", "val_isr_acc", "val_grp_acc",
             "adv_r2", "lr", "phase",
+            "train_avg_mass_asym", "train_std_mass_asym",
+            "val_avg_mass_asym", "val_std_mass_asym",
         ])
 
     best_val_acc = 0.0
@@ -548,6 +550,10 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 f"{val_metrics['adv_r2']:.4f}",
                 f"{current_lr:.6e}",
                 training_phase,
+                f"{train_metrics['avg_mass_asym']:.6f}" if "avg_mass_asym" in train_metrics else "",
+                f"{train_metrics['std_mass_asym']:.6f}" if "std_mass_asym" in train_metrics else "",
+                f"{val_metrics['avg_mass_asym']:.6f}" if "avg_mass_asym" in val_metrics else "",
+                f"{val_metrics['std_mass_asym']:.6f}" if "std_mass_asym" in val_metrics else "",
             ])
 
         # ---------------------------------------------------------------
@@ -676,11 +682,13 @@ def _plot_training_curves(
     log_path: str | Path,
     phase2_start_epoch: int | None = None,
 ) -> None:
-    """Generate loss and accuracy plots from the training log CSV.
+    """Generate loss, accuracy, and mass-asymmetry plots from the training log CSV.
 
-    Creates two PDF files in a ``plots/`` directory:
-      - ``loss_{tag}.pdf``     – train and validation loss vs epoch
-      - ``accuracy_{tag}.pdf`` – train and validation accuracy vs epoch
+    Creates three PDF files in a ``plots/`` directory:
+      - ``loss_{tag}.pdf``         – train and validation loss vs epoch
+      - ``accuracy_{tag}.pdf``     – train and validation accuracy vs epoch
+      - ``mass_asym_{tag}.pdf``    – mean ± 1σ mass asymmetry of the chosen
+                                     interpretation vs epoch (train and val)
 
     Vertical dashed lines mark phase transitions (Phase 1 → Phase 2) when
     two-phase training was used.  Files are named with a UTC timestamp and
@@ -706,6 +714,7 @@ def _plot_training_curves(
 
     # --- Read CSV ---
     epochs, train_loss, val_loss, train_acc, val_acc, phases = [], [], [], [], [], []
+    train_avg_asym, train_std_asym, val_avg_asym, val_std_asym = [], [], [], []
     with open(log_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -715,6 +724,14 @@ def _plot_training_curves(
             train_acc.append(float(row["train_acc"]))
             val_acc.append(float(row["val_acc"]))
             phases.append(int(row["phase"]))
+            # Mass-asymmetry columns are present only in logs from this version onward;
+            # older logs will have an empty string which we convert to NaN.
+            def _parse_float(s):
+                return float(s) if s else float("nan")
+            train_avg_asym.append(_parse_float(row.get("train_avg_mass_asym", "")))
+            train_std_asym.append(_parse_float(row.get("train_std_mass_asym", "")))
+            val_avg_asym.append(_parse_float(row.get("val_avg_mass_asym", "")))
+            val_std_asym.append(_parse_float(row.get("val_std_mass_asym", "")))
 
     if not epochs:
         print("  Warning: empty training log; skipping plots.")
@@ -779,6 +796,49 @@ def _plot_training_curves(
     fig.savefig(acc_path)
     plt.close(fig)
     print(f"  -> Saved accuracy plot : {acc_path}")
+
+    # --- Mass asymmetry plot (only when data are available) ---
+    import math as _math
+    # Filter to rows where at least the val mean is a real number.
+    asym_epochs = [e for e, v in zip(epochs, val_avg_asym) if not _math.isnan(v)]
+    if asym_epochs:
+        asym_train_avg = [v for v in train_avg_asym if not _math.isnan(v)]
+        asym_train_std = [v for v in train_std_asym if not _math.isnan(v)]
+        asym_val_avg   = [v for v in val_avg_asym   if not _math.isnan(v)]
+        asym_val_std   = [v for v in val_std_asym   if not _math.isnan(v)]
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+
+        # Train: line + ±1σ shaded band
+        ax.plot(asym_epochs, asym_train_avg, label="Train mean asym", color="steelblue")
+        ax.fill_between(
+            asym_epochs,
+            [m - s for m, s in zip(asym_train_avg, asym_train_std)],
+            [m + s for m, s in zip(asym_train_avg, asym_train_std)],
+            color="steelblue", alpha=0.2, label="Train ±1σ",
+        )
+
+        # Val: line + ±1σ shaded band
+        ax.plot(asym_epochs, asym_val_avg, label="Val mean asym", color="darkorange")
+        ax.fill_between(
+            asym_epochs,
+            [m - s for m, s in zip(asym_val_avg, asym_val_std)],
+            [m + s for m, s in zip(asym_val_avg, asym_val_std)],
+            color="darkorange", alpha=0.2, label="Val ±1σ",
+        )
+
+        _add_phase_lines(ax)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Mass asymmetry of chosen interpretation")
+        ax.set_title("Mass Asymmetry of Chosen Interpretation vs Epoch")
+        ax.set_ylim(bottom=0.0)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        asym_path = plots_dir / f"mass_asym_{tag}.pdf"
+        fig.savefig(asym_path)
+        plt.close(fig)
+        print(f"  -> Saved mass asym plot: {asym_path}")
 
 
 def _run_epoch(
