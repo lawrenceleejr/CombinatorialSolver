@@ -541,7 +541,8 @@ def train(config_path: str | None = None, data_path: str | None = None):
             pt_smear_frac=dc.get("pt_smear_frac", 0.0),
         )
 
-        # Validation (no augmentation, no teacher forcing: tf_ratio=0 = pure end-to-end)
+        # Validation (no φ/η augmentation, no teacher forcing: tf_ratio=0 = pure
+        # end-to-end; pT smearing is applied if configured, matching training conditions)
         model.eval()
         with torch.no_grad():
             val_metrics = _run_epoch(
@@ -551,6 +552,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 lambda_isr=lambda_isr, lambda_isr_direct=0.0,
                 lambda_distill=0.0, distill_temperature=distill_temperature,
                 lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
+                pt_smear_frac=dc.get("pt_smear_frac", 0.0),
             )
 
         # Accumulate per-event validation mass-asymmetry distribution for GIF
@@ -1066,23 +1068,26 @@ def _run_epoch(
             flip = (torch.rand(batch_size, device=device) > 0.5).float().view(-1, 1)
             four_mom[:, :, 3] = four_mom[:, :, 3] * (1.0 - 2.0 * flip)
 
-            # Dynamic pT smearing: scale each jet's 4-vector by a random per-jet
-            # factor (massless approximation — η preserved means all components
-            # scale proportionally with pT).  Applied per batch so each epoch
-            # sees a fresh random realization, acting as data augmentation.
-            # smear_factor = 1 + σ·N(0,1) where σ = pt_smear_frac (std deviation).
-            if pt_smear_frac > 0:
-                num_jets = four_mom.shape[1]
-                smear = (
-                    1.0 + pt_smear_frac * torch.randn(batch_size, num_jets, device=device)
-                ).clamp(0.5, 1.5).unsqueeze(-1)  # (batch, jets, 1)
-                four_mom = four_mom * smear
-                # Re-normalize by the new event HT (= sum of new per-jet pT magnitudes)
-                # so that HT-normalized scale invariance is preserved post-smearing.
-                new_ht = torch.sqrt(
-                    four_mom[:, :, 1] ** 2 + four_mom[:, :, 2] ** 2
-                ).sum(dim=1, keepdim=True).clamp(min=1e-6).unsqueeze(-1)  # (batch, 1, 1)
-                four_mom = four_mom / new_ht
+        # Dynamic pT smearing: scale each jet's 4-vector by a random per-jet
+        # factor (massless approximation — η preserved means all components
+        # scale proportionally with pT).  Applied per batch so each epoch
+        # sees a fresh random realization.  Applied during both training and
+        # validation so that evaluation conditions match training conditions.
+        # smear_factor = 1 + σ·N(0,1) where σ = pt_smear_frac (std deviation).
+        if pt_smear_frac > 0:
+            four_mom = four_mom.clone()
+            batch_size = four_mom.shape[0]
+            num_jets = four_mom.shape[1]
+            smear = (
+                1.0 + pt_smear_frac * torch.randn(batch_size, num_jets, device=device)
+            ).clamp(0.5, 1.5).unsqueeze(-1)  # (batch, jets, 1)
+            four_mom = four_mom * smear
+            # Re-normalize by the new event HT (= sum of new per-jet pT magnitudes)
+            # so that HT-normalized scale invariance is preserved post-smearing.
+            new_ht = torch.sqrt(
+                four_mom[:, :, 1] ** 2 + four_mom[:, :, 2] ** 2
+            ).sum(dim=1, keepdim=True).clamp(min=1e-6).unsqueeze(-1)  # (batch, 1, 1)
+            four_mom = four_mom / new_ht
 
         output = model(four_mom)
         logits = output["logits"]
