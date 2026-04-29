@@ -172,8 +172,51 @@ def cosine_with_warmup(optimizer, epoch, num_epochs, warmup_epochs, restart_peri
         pg["lr"] = pg["initial_lr"] * lr_scale
 
 
+def _check_optional_deps() -> None:
+    """Warn the user if optional plotting dependencies are missing.
+
+    ``matplotlib`` and ``pillow`` are required for the training-curve PDFs and
+    the animated mass-asymmetry GIF.  Neither is needed for the core training
+    loop itself, so the user is given the choice to continue without them.
+    """
+    missing = []
+    try:
+        import matplotlib  # noqa: F401
+    except ImportError:
+        missing.append("matplotlib")
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        missing.append("pillow")
+
+    if not missing:
+        return
+
+    pkg_str = " ".join(missing)
+    print(
+        f"\n  [WARNING] Optional plotting package(s) not installed: {pkg_str}\n"
+        f"  Install with:  pip install {pkg_str}\n"
+        f"  Without them, training-curve PDFs and the mass-asymmetry GIF\n"
+        f"  will be skipped, but training itself will proceed normally.\n"
+    )
+    try:
+        answer = input("  Continue without plotting? [Y/n]: ").strip().lower()
+    except (EOFError, OSError):
+        # Non-interactive environment (e.g. CI / script redirect) → continue.
+        print("  Non-interactive environment detected; continuing without plots.")
+        return
+
+    if answer in ("n", "no"):
+        raise SystemExit(
+            f"Aborted. Install the missing packages and re-run:\n"
+            f"  pip install {pkg_str}"
+        )
+
+
 def train(config_path: str | None = None, data_path: str | None = None):
     """Main training function."""
+    _check_optional_deps()
+
     config = get_config(config_path)
     device = get_device()
     print(f"Using device: {device}")
