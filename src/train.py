@@ -360,6 +360,8 @@ def train(config_path: str | None = None, data_path: str | None = None):
             "adv_r2", "lr", "phase",
             "train_avg_mass_asym", "train_std_mass_asym",
             "val_avg_mass_asym", "val_std_mass_asym",
+            "train_avg_max_triplet_pt", "train_std_max_triplet_pt",
+            "val_avg_max_triplet_pt", "val_std_max_triplet_pt",
         ])
 
     best_val_acc = 0.0
@@ -368,6 +370,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
     no_improve = 0
     val_asym_history: list = []  # per-epoch list of numpy arrays (val pred_asym_values)
     val_mass_sum_history: list = []  # per-epoch list of numpy arrays (val pred_mass_sum_values)
+    val_max_triplet_pt_history: list = []  # per-epoch list of numpy arrays (val max-triplet scalar pT)
 
     tf_start = tc.get("tf_start", 1.0)
     tf_end = tc.get("tf_end", 0.3)
@@ -592,6 +595,14 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 val_metrics.get("pred_correct_values"),  # bool array or None
             ))
 
+        # Accumulate per-event validation max-triplet scalar-pT distribution for GIF
+        if "pred_max_triplet_pt_values" in val_metrics:
+            val_max_triplet_pt_history.append((
+                epoch + 1, training_phase,
+                val_metrics["pred_max_triplet_pt_values"],
+                val_metrics.get("pred_correct_values"),  # bool array or None
+            ))
+
         # Log
         phase_tag = f"[P{training_phase}]" if phase1_active else ""
         adv_str = f" | Adv R²={val_metrics['adv_r2']:.3f}" if use_adversary else ""
@@ -637,6 +648,10 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 f"{train_metrics['std_mass_asym']:.6f}" if "std_mass_asym" in train_metrics else "",
                 f"{val_metrics['avg_mass_asym']:.6f}" if "avg_mass_asym" in val_metrics else "",
                 f"{val_metrics['std_mass_asym']:.6f}" if "std_mass_asym" in val_metrics else "",
+                f"{train_metrics['avg_max_triplet_pt']:.6f}" if "avg_max_triplet_pt" in train_metrics else "",
+                f"{train_metrics['std_max_triplet_pt']:.6f}" if "std_max_triplet_pt" in train_metrics else "",
+                f"{val_metrics['avg_max_triplet_pt']:.6f}" if "avg_max_triplet_pt" in val_metrics else "",
+                f"{val_metrics['std_max_triplet_pt']:.6f}" if "std_max_triplet_pt" in val_metrics else "",
             ])
 
         # Per-epoch live-monitoring plots (overwrite fixed "latest" files so a
@@ -653,6 +668,12 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 val_mass_sum_history,
                 phase2_start_epoch=phase2_start_epoch,
                 gif_path=Path("plots") / "mass_sum_anim_latest.gif",
+            )
+        if val_max_triplet_pt_history:
+            _make_max_triplet_pt_gif(
+                val_max_triplet_pt_history,
+                phase2_start_epoch=phase2_start_epoch,
+                gif_path=Path("plots") / "max_triplet_pt_anim_latest.gif",
             )
 
         # ---------------------------------------------------------------
@@ -783,6 +804,12 @@ def train(config_path: str | None = None, data_path: str | None = None):
         mass_sum_gif = _make_mass_sum_gif(val_mass_sum_history, phase2_start_epoch=phase2_start_epoch)
         if mass_sum_gif is not None:
             plot_paths.append(mass_sum_gif)
+
+    # Animated GIF of the validation max-triplet scalar-sum pT distribution.
+    if val_max_triplet_pt_history:
+        mpt_gif = _make_max_triplet_pt_gif(val_max_triplet_pt_history, phase2_start_epoch=phase2_start_epoch)
+        if mpt_gif is not None:
+            plot_paths.append(mpt_gif)
 
     # Full timestamped snapshot bundle (ML model + classical solver + plots),
     # mirroring the Phase 1 snapshot produced by _export_phase1_snapshot.
@@ -1072,6 +1099,145 @@ def _make_mass_sum_gif(
         plt.close(fig)
 
 
+def _make_max_triplet_pt_gif(
+    val_max_triplet_pt_history: list,
+    phase2_start_epoch: int | None = None,
+    gif_path: str | Path | None = None,
+) -> "Path | None":
+    """Build an animated GIF of the max-triplet scalar-sum-pT distribution.
+
+    For each event the scalar sum pT of each of the two triplets in the
+    predicted interpretation is computed and the larger of the two is
+    recorded.  Each frame shows the histogram of this quantity over all
+    validation events for that epoch.  When a per-event correctness mask is
+    available (4-tuple history entries) the bars are stacked by correct vs
+    incorrect network outputs.  A vertical line marks the per-epoch mean.
+    When two-phase training was used, frames from Phase 2 onward carry a
+    "Phase 2" annotation so the transition is immediately visible.
+
+    When *gif_path* is ``None`` the file is written to
+    ``plots/max_triplet_pt_anim_{timestamp}_{commit}.gif``; pass an explicit
+    path (e.g. ``plots/max_triplet_pt_anim_latest.gif``) to overwrite a fixed
+    file on every call.  Requires ``pillow`` (pip install pillow).
+
+    Args:
+        val_max_triplet_pt_history: List of ``(epoch, phase, values_array[, correct_mask])``
+            tuples where *values_array* contains the max-triplet scalar-sum pT at the
+            predicted assignment for each validation event.  The optional
+            fourth element is a boolean NumPy array aligned with *values_array*
+            (True = model chose the correct assignment).
+        phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
+            ``None`` for single-phase runs.
+        gif_path: Destination file path.  When ``None`` a timestamped path
+            inside ``plots/`` is generated automatically.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.animation as animation
+    except ImportError:
+        print("  Warning: matplotlib not available; skipping max-triplet-pT GIF.")
+        return None
+
+    if not val_max_triplet_pt_history:
+        return None
+
+    plots_dir = Path("plots")
+    plots_dir.mkdir(exist_ok=True)
+
+    if gif_path is None:
+        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        commit = _get_git_commit_hash()
+        gif_path = plots_dir / f"max_triplet_pt_anim_{ts}_{commit}.gif"
+    gif_path = Path(gif_path)
+
+    import numpy as np
+
+    # Unpack history: support both 3-tuple (legacy) and 4-tuple (with correct mask).
+    def _unpack(entry):
+        if len(entry) == 4:
+            return entry
+        return entry[0], entry[1], entry[2], None
+
+    all_values = [_unpack(e)[2] for e in val_max_triplet_pt_history]
+
+    # Fixed x-axis determined from the global data range (1st–99th percentile).
+    all_concat = np.concatenate(all_values)
+    x_min = float(np.percentile(all_concat, 1))
+    x_max = float(np.percentile(all_concat, 99))
+    if x_min >= x_max:
+        x_min, x_max = float(all_concat.min()), float(all_concat.max())
+    n_bins = 50
+    bin_edges = np.linspace(x_min, x_max, n_bins + 1)
+
+    # Pre-compute total counts for every frame to fix the y-axis.
+    max_count = 0
+    for vals in all_values:
+        counts, _ = np.histogram(vals, bins=bin_edges)
+        if counts.max() > max_count:
+            max_count = int(counts.max())
+    y_max = max_count * 1.1
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bar_width = (x_max - x_min) / n_bins
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    def _draw_frame(frame_idx):
+        epoch, phase, values, correct_mask = _unpack(val_max_triplet_pt_history[frame_idx])
+        ax.cla()
+        mean_val = float(values.mean())
+
+        if correct_mask is not None:
+            vals_correct   = values[correct_mask]
+            vals_incorrect = values[~correct_mask]
+            counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
+            counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
+            ax.bar(centers, counts_correct,   width=bar_width,
+                   color="mediumorchid", alpha=0.85, align="center", label="Correct")
+            ax.bar(centers, counts_incorrect, width=bar_width,
+                   color="coral",        alpha=0.85, align="center", label="Incorrect",
+                   bottom=counts_correct)
+        else:
+            counts, _ = np.histogram(values, bins=bin_edges)
+            ax.bar(centers, counts, width=bar_width,
+                   color="mediumorchid", alpha=0.75, align="center")
+
+        ax.axvline(mean_val, color="darkorange", linewidth=2.0,
+                   label=f"Mean = {mean_val:.3f}")
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(0, y_max)
+        ax.set_xlabel("Max-triplet scalar sum pT of chosen interpretation")
+        ax.set_ylabel("Validation events")
+        phase_label = ""
+        if phase2_start_epoch is not None:
+            phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
+        elif phase == 2:
+            phase_label = " [Phase 2]"
+        ax.set_title(f"Epoch {epoch}{phase_label}")
+        ax.legend(loc="upper right")
+        ax.grid(True, alpha=0.3)
+
+    anim = animation.FuncAnimation(
+        fig,
+        _draw_frame,
+        frames=len(val_max_triplet_pt_history),
+        interval=200,
+        repeat=False,
+    )
+
+    try:
+        anim.save(str(gif_path), writer="pillow", fps=5)
+        print(f"  -> Saved max-triplet-pT GIF: {gif_path}")
+        return gif_path
+    except Exception as exc:
+        print(f"  Warning: could not save max-triplet-pT GIF ({exc}). "
+              "Is pillow installed?  pip install pillow")
+        return None
+    finally:
+        plt.close(fig)
+
+
 def _plot_training_curves(
     log_path: str | Path,
     phase2_start_epoch: int | None = None,
@@ -1119,6 +1285,7 @@ def _plot_training_curves(
     epochs, train_loss, val_loss, train_acc, val_acc, phases = [], [], [], [], [], []
     train_avg_asym, train_std_asym, val_avg_asym, val_std_asym = [], [], [], []
     train_grp_acc, val_grp_acc = [], []
+    train_avg_mpt, train_std_mpt, val_avg_mpt, val_std_mpt = [], [], [], []
     with open(log_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -1138,6 +1305,10 @@ def _plot_training_curves(
             val_std_asym.append(_parse_float(row.get("val_std_mass_asym", "")))
             train_grp_acc.append(_parse_float(row.get("train_grp_acc", "")))
             val_grp_acc.append(_parse_float(row.get("val_grp_acc", "")))
+            train_avg_mpt.append(_parse_float(row.get("train_avg_max_triplet_pt", "")))
+            train_std_mpt.append(_parse_float(row.get("train_std_max_triplet_pt", "")))
+            val_avg_mpt.append(_parse_float(row.get("val_avg_max_triplet_pt", "")))
+            val_std_mpt.append(_parse_float(row.get("val_std_max_triplet_pt", "")))
 
     if not epochs:
         print("  Warning: empty training log; skipping plots.")
@@ -1277,6 +1448,46 @@ def _plot_training_curves(
         print(f"  -> Saved GRP acc plot  : {grp_path}")
         saved_paths.append(grp_path)
 
+    # --- Max-triplet scalar-sum pT plot (only when data are available) ---
+    import math as _math3
+    mpt_epochs = [e for e, v in zip(epochs, val_avg_mpt) if not _math3.isnan(v)]
+    if mpt_epochs:
+        mpt_train_avg = [v for e, v in zip(epochs, train_avg_mpt) if e in set(mpt_epochs) and not _math3.isnan(v)]
+        mpt_train_std = [v for e, v in zip(epochs, train_std_mpt) if e in set(mpt_epochs) and not _math3.isnan(v)]
+        mpt_val_avg   = [v for e, v in zip(epochs, val_avg_mpt)   if e in set(mpt_epochs) and not _math3.isnan(v)]
+        mpt_val_std   = [v for e, v in zip(epochs, val_std_mpt)   if e in set(mpt_epochs) and not _math3.isnan(v)]
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+
+        ax.plot(mpt_epochs, mpt_train_avg, label="Train mean max-triplet pT", color="steelblue")
+        ax.fill_between(
+            mpt_epochs,
+            [m - s for m, s in zip(mpt_train_avg, mpt_train_std)],
+            [m + s for m, s in zip(mpt_train_avg, mpt_train_std)],
+            color="steelblue", alpha=0.2, label="Train ±1σ",
+        )
+
+        ax.plot(mpt_epochs, mpt_val_avg, label="Val mean max-triplet pT", color="darkorange")
+        ax.fill_between(
+            mpt_epochs,
+            [m - s for m, s in zip(mpt_val_avg, mpt_val_std)],
+            [m + s for m, s in zip(mpt_val_avg, mpt_val_std)],
+            color="darkorange", alpha=0.2, label="Val ±1σ",
+        )
+
+        _add_phase_lines(ax)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Max-triplet scalar sum pT of chosen interpretation")
+        ax.set_title("Max-Triplet Scalar Sum pT of Chosen Interpretation vs Epoch")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        mpt_path = plots_dir / f"max_triplet_pt_{tag}.pdf"
+        fig.savefig(mpt_path)
+        plt.close(fig)
+        print(f"  -> Saved max-triplet-pT plot: {mpt_path}")
+        saved_paths.append(mpt_path)
+
     return saved_paths
 
 
@@ -1308,6 +1519,7 @@ def _run_epoch(
     all_pred_asym = []
     all_pred_correct = []
     all_pred_mass_sum = []
+    all_pred_max_triplet_pt = []
     all_mass_pred = []
     all_mass_true = []
     factored = model.has_isr
@@ -1590,6 +1802,28 @@ def _run_epoch(
             pred_mass_sum = mass_sum_flat.gather(1, preds.unsqueeze(1)).squeeze(1)  # (batch,)
             all_pred_mass_sum.append(pred_mass_sum.cpu())
 
+        # Max-triplet scalar-sum pT: look up the two triplets for each event's
+        # predicted assignment and take the larger of the two per-triplet pT sums.
+        if factored and hasattr(model, "f_group1"):
+            f2f = model.flat_to_factored              # (num_assignments, 2)
+            pred_isr_i = f2f[preds, 0]                # (batch,)
+            pred_grp_i = f2f[preds, 1]                # (batch,)
+            g1_jets = model.f_group1[pred_isr_i, pred_grp_i]  # (batch, 3)
+            g2_jets = model.f_group2[pred_isr_i, pred_grp_i]  # (batch, 3)
+        elif not factored and hasattr(model, "group1_indices"):
+            g1_jets = model.group1_indices[preds]     # (batch, 3)
+            g2_jets = model.group2_indices[preds]     # (batch, 3)
+        else:
+            g1_jets = None
+        if g1_jets is not None:
+            px_b = four_mom[:, :, 1]
+            py_b = four_mom[:, :, 2]
+            pt_b = torch.sqrt(px_b**2 + py_b**2)     # (batch, num_jets)
+            pt_g1 = pt_b.gather(1, g1_jets).sum(dim=1)   # (batch,)
+            pt_g2 = pt_b.gather(1, g2_jets).sum(dim=1)   # (batch,)
+            max_triplet_pt = torch.maximum(pt_g1, pt_g2)  # (batch,)
+            all_pred_max_triplet_pt.append(max_triplet_pt.detach().cpu())
+
         mass_mask = parent_mass > 0
         if mass_mask.any():
             all_mass_pred.append(mass_pred[mass_mask].detach().cpu())
@@ -1617,6 +1851,11 @@ def _run_epoch(
         result["pred_correct_values"] = torch.cat(all_pred_correct).numpy()  # bool per-event
     if all_pred_mass_sum:
         result["pred_mass_sum_values"] = torch.cat(all_pred_mass_sum).numpy()  # full per-event array
+    if all_pred_max_triplet_pt:
+        mpt_cat = torch.cat(all_pred_max_triplet_pt)
+        result["pred_max_triplet_pt_values"] = mpt_cat.numpy()
+        result["avg_max_triplet_pt"] = mpt_cat.mean().item()
+        result["std_max_triplet_pt"] = mpt_cat.std().item()
     if factored:
         result["isr_acc"] = total_isr_correct / max(total_samples, 1)
         result["grp_acc"] = total_grp_correct / max(total_samples, 1)
