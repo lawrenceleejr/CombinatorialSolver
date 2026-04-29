@@ -1449,13 +1449,12 @@ def _plot_training_curves(
         saved_paths.append(grp_path)
 
     # --- Max-triplet scalar-sum pT plot (only when data are available) ---
-    import math as _math3
-    mpt_epochs = [e for e, v in zip(epochs, val_avg_mpt) if not _math3.isnan(v)]
+    mpt_epochs = [e for e, v in zip(epochs, val_avg_mpt) if not _math2.isnan(v)]
     if mpt_epochs:
-        mpt_train_avg = [v for e, v in zip(epochs, train_avg_mpt) if e in set(mpt_epochs) and not _math3.isnan(v)]
-        mpt_train_std = [v for e, v in zip(epochs, train_std_mpt) if e in set(mpt_epochs) and not _math3.isnan(v)]
-        mpt_val_avg   = [v for e, v in zip(epochs, val_avg_mpt)   if e in set(mpt_epochs) and not _math3.isnan(v)]
-        mpt_val_std   = [v for e, v in zip(epochs, val_std_mpt)   if e in set(mpt_epochs) and not _math3.isnan(v)]
+        mpt_train_avg = [v for e, v in zip(epochs, train_avg_mpt) if e in set(mpt_epochs) and not _math2.isnan(v)]
+        mpt_train_std = [v for e, v in zip(epochs, train_std_mpt) if e in set(mpt_epochs) and not _math2.isnan(v)]
+        mpt_val_avg   = [v for e, v in zip(epochs, val_avg_mpt)   if e in set(mpt_epochs) and not _math2.isnan(v)]
+        mpt_val_std   = [v for e, v in zip(epochs, val_std_mpt)   if e in set(mpt_epochs) and not _math2.isnan(v)]
 
         fig, ax = plt.subplots(figsize=(9, 5))
 
