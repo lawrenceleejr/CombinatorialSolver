@@ -667,6 +667,119 @@ def train(config_path: str | None = None, data_path: str | None = None):
         tag_prefix="final",
     )
 
+    # Generate training-curve plots (loss and accuracy vs epoch) with phase
+    # transition markers and save as timestamped PDFs in plots/.
+    _plot_training_curves(log_path, phase2_start_epoch=phase2_start_epoch)
+
+
+def _plot_training_curves(
+    log_path: str | Path,
+    phase2_start_epoch: int | None = None,
+) -> None:
+    """Generate loss and accuracy plots from the training log CSV.
+
+    Creates two PDF files in a ``plots/`` directory:
+      - ``loss_{tag}.pdf``     – train and validation loss vs epoch
+      - ``accuracy_{tag}.pdf`` – train and validation accuracy vs epoch
+
+    Vertical dashed lines mark phase transitions (Phase 1 → Phase 2) when
+    two-phase training was used.  Files are named with a UTC timestamp and
+    the short git commit hash for traceability.
+
+    Args:
+        log_path: Path to the training log CSV file written during training.
+        phase2_start_epoch: The (1-based) epoch at which Phase 2 began, or
+            ``None`` if single-phase training was used.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # non-interactive backend, safe in all environments
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("  Warning: matplotlib not available; skipping training curve plots.")
+        return
+
+    log_path = Path(log_path)
+    if not log_path.exists():
+        print(f"  Warning: training log not found at {log_path}; skipping plots.")
+        return
+
+    # --- Read CSV ---
+    epochs, train_loss, val_loss, train_acc, val_acc, phases = [], [], [], [], [], []
+    with open(log_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            epochs.append(int(row["epoch"]))
+            train_loss.append(float(row["train_loss"]))
+            val_loss.append(float(row["val_loss"]))
+            train_acc.append(float(row["train_acc"]))
+            val_acc.append(float(row["val_acc"]))
+            phases.append(int(row["phase"]))
+
+    if not epochs:
+        print("  Warning: empty training log; skipping plots.")
+        return
+
+    # --- Output directory and file tag ---
+    ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    commit = _get_git_commit_hash()
+    tag = f"{ts}_{commit}"
+    plots_dir = Path("plots")
+    plots_dir.mkdir(exist_ok=True)
+
+    # --- Phase-transition x-positions (between last Phase-1 and first Phase-2 epoch) ---
+    phase_transitions: list[float] = []
+    if phase2_start_epoch is not None:
+        # Passed explicitly: transition happens just before this epoch starts.
+        phase_transitions.append(phase2_start_epoch - 0.5)
+    else:
+        # Infer from the phase column in case the caller didn't provide it.
+        for i in range(1, len(phases)):
+            if phases[i] != phases[i - 1]:
+                phase_transitions.append(epochs[i - 1] + 0.5)
+
+    def _add_phase_lines(ax):
+        for idx, x in enumerate(phase_transitions):
+            ax.axvline(
+                x=x,
+                color="gray",
+                linestyle="--",
+                linewidth=1.2,
+                label="Phase 1 → 2" if idx == 0 else None,
+            )
+
+    # --- Loss plot ---
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(epochs, train_loss, label="Train loss", color="steelblue")
+    ax.plot(epochs, val_loss, label="Val loss", color="darkorange")
+    _add_phase_lines(ax)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("Loss vs Epoch")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    loss_path = plots_dir / f"loss_{tag}.pdf"
+    fig.savefig(loss_path)
+    plt.close(fig)
+    print(f"  -> Saved loss plot     : {loss_path}")
+
+    # --- Accuracy plot ---
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(epochs, train_acc, label="Train acc", color="steelblue")
+    ax.plot(epochs, val_acc, label="Val acc", color="darkorange")
+    _add_phase_lines(ax)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Accuracy")
+    ax.set_title("Accuracy vs Epoch")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    acc_path = plots_dir / f"accuracy_{tag}.pdf"
+    fig.savefig(acc_path)
+    plt.close(fig)
+    print(f"  -> Saved accuracy plot : {acc_path}")
+
 
 def _run_epoch(
     model, loader, ce_loss_fn, mse_loss_fn, lambda_adv, device, optimizer=None,
