@@ -586,12 +586,25 @@ def train(config_path: str | None = None, data_path: str | None = None):
                     pt_smear_frac=dc.get("pt_smear_frac", 0.0),
                 )
 
+            # Choose the correct mask for histogram stacks.
+            # Phase 1: ISR head is frozen/random (~1/7 correct), making the full
+            #   assignment acc ~15%.  Use the oracle-grouping mask instead so the
+            #   stacked histograms show grouping-head progress (typically 80-90%)
+            #   rather than the ISR-diluted full-assignment accuracy.
+            # Phase 2 (and non-factored models): use the full-assignment mask.
+            _grp_oracle = val_metrics.get("pred_grp_oracle_correct_values")
+            _full_assign = val_metrics.get("pred_correct_values")
+            _hist_correct = (
+                _grp_oracle if (training_phase == 1 and _grp_oracle is not None)
+                else _full_assign
+            )
+
             # Accumulate per-event validation mass-asymmetry distribution for GIF
             if "pred_asym_values" in val_metrics:
                 val_asym_history.append((
                     epoch + 1, training_phase,
                     val_metrics["pred_asym_values"],
-                    val_metrics.get("pred_correct_values"),  # bool array or None
+                    _hist_correct,
                 ))
 
             # Accumulate per-event validation mass-sum distribution for GIF
@@ -599,7 +612,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 val_mass_sum_history.append((
                     epoch + 1, training_phase,
                     val_metrics["pred_mass_sum_values"],
-                    val_metrics.get("pred_correct_values"),  # bool array or None
+                    _hist_correct,
                 ))
 
             # Accumulate per-event validation max-triplet scalar-pT distribution for GIF
@@ -607,7 +620,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 val_max_triplet_pt_history.append((
                     epoch + 1, training_phase,
                     val_metrics["pred_max_triplet_pt_values"],
-                    val_metrics.get("pred_correct_values"),  # bool array or None
+                    _hist_correct,
                 ))
 
             # Accumulate per-event validation ΔΦ distribution for GIF
@@ -615,7 +628,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 val_delta_phi_history.append((
                     epoch + 1, training_phase,
                     val_metrics["pred_delta_phi_values"],
-                    val_metrics.get("pred_correct_values"),  # bool array or None
+                    _hist_correct,
                 ))
 
             # Accumulate per-event validation pT-democracy distribution for GIF
@@ -623,7 +636,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 val_democracy_history.append((
                     epoch + 1, training_phase,
                     val_metrics["pred_democracy_values"],
-                    val_metrics.get("pred_correct_values"),  # bool array or None
+                    _hist_correct,
                 ))
 
             # Log
@@ -972,10 +985,12 @@ def _make_mass_asym_gif(
             log_incorrect = log_vals[~correct_mask]
             counts_correct,   _ = np.histogram(log_correct,   bins=bin_edges)
             counts_incorrect, _ = np.histogram(log_incorrect, bins=bin_edges)
+            correct_label   = "Correct (oracle grp)" if phase == 1 else "Correct"
+            incorrect_label = "Incorrect (oracle grp)" if phase == 1 else "Incorrect"
             ax.bar(centers, counts_correct,   width=bar_width,
-                   color="steelblue", alpha=0.85, align="center", label="Correct")
+                   color="steelblue", alpha=0.85, align="center", label=correct_label)
             ax.bar(centers, counts_incorrect, width=bar_width,
-                   color="coral",     alpha=0.85, align="center", label="Incorrect",
+                   color="coral",     alpha=0.85, align="center", label=incorrect_label,
                    bottom=counts_correct)
         else:
             counts, _ = np.histogram(log_vals, bins=bin_edges)
@@ -1112,15 +1127,17 @@ def _make_mass_sum_gif(
             avg_incorrect = avg_mass[~correct_mask]
             counts_correct,   _ = np.histogram(avg_correct,   bins=bin_edges)
             counts_incorrect, _ = np.histogram(avg_incorrect, bins=bin_edges)
+            correct_label   = "Correct (oracle grp)" if phase == 1 else "Correct"
+            incorrect_label = "Incorrect (oracle grp)" if phase == 1 else "Incorrect"
             ax.bar(centers, counts_correct,   width=bar_width,
-                   color="mediumseagreen", alpha=0.85, align="center", label="Correct")
+                   color="steelblue", alpha=0.85, align="center", label=correct_label)
             ax.bar(centers, counts_incorrect, width=bar_width,
-                   color="coral",           alpha=0.85, align="center", label="Incorrect",
+                   color="coral",     alpha=0.85, align="center", label=incorrect_label,
                    bottom=counts_correct)
         else:
             counts, _ = np.histogram(avg_mass, bins=bin_edges)
             ax.bar(centers, counts, width=bar_width,
-                   color="mediumseagreen", alpha=0.75, align="center")
+                   color="steelblue", alpha=0.75, align="center")
 
         ax.axvline(mean_val, color="darkorange", linewidth=2.0,
                    label=f"Mean = {mean_val:.3f}")
@@ -1251,15 +1268,17 @@ def _make_max_triplet_pt_gif(
             vals_incorrect = values[~correct_mask]
             counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
             counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
+            correct_label   = "Correct (oracle grp)" if phase == 1 else "Correct"
+            incorrect_label = "Incorrect (oracle grp)" if phase == 1 else "Incorrect"
             ax.bar(centers, counts_correct,   width=bar_width,
-                   color="mediumorchid", alpha=0.85, align="center", label="Correct")
+                   color="steelblue", alpha=0.85, align="center", label=correct_label)
             ax.bar(centers, counts_incorrect, width=bar_width,
-                   color="coral",        alpha=0.85, align="center", label="Incorrect",
+                   color="coral",     alpha=0.85, align="center", label=incorrect_label,
                    bottom=counts_correct)
         else:
             counts, _ = np.histogram(values, bins=bin_edges)
             ax.bar(centers, counts, width=bar_width,
-                   color="mediumorchid", alpha=0.75, align="center")
+                   color="steelblue", alpha=0.75, align="center")
 
         ax.axvline(mean_val, color="darkorange", linewidth=2.0,
                    label=f"Mean = {mean_val:.3f}")
@@ -1380,10 +1399,12 @@ def _make_delta_phi_gif(
             vals_incorrect = values[~correct_mask]
             counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
             counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
+            correct_label   = "Correct (oracle grp)" if phase == 1 else "Correct"
+            incorrect_label = "Incorrect (oracle grp)" if phase == 1 else "Incorrect"
             ax.bar(centers, counts_correct,   width=bar_width,
-                   color="steelblue", alpha=0.85, align="center", label="Correct")
+                   color="steelblue", alpha=0.85, align="center", label=correct_label)
             ax.bar(centers, counts_incorrect, width=bar_width,
-                   color="coral",     alpha=0.85, align="center", label="Incorrect",
+                   color="coral",     alpha=0.85, align="center", label=incorrect_label,
                    bottom=counts_correct)
         else:
             counts, _ = np.histogram(values, bins=bin_edges)
@@ -1511,15 +1532,17 @@ def _make_democracy_gif(
             vals_incorrect = values[~correct_mask]
             counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
             counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
+            correct_label   = "Correct (oracle grp)" if phase == 1 else "Correct"
+            incorrect_label = "Incorrect (oracle grp)" if phase == 1 else "Incorrect"
             ax.bar(centers, counts_correct,   width=bar_width,
-                   color="mediumseagreen", alpha=0.85, align="center", label="Correct")
+                   color="steelblue", alpha=0.85, align="center", label=correct_label)
             ax.bar(centers, counts_incorrect, width=bar_width,
-                   color="coral",           alpha=0.85, align="center", label="Incorrect",
+                   color="coral",     alpha=0.85, align="center", label=incorrect_label,
                    bottom=counts_correct)
         else:
             counts, _ = np.histogram(values, bins=bin_edges)
             ax.bar(centers, counts, width=bar_width,
-                   color="mediumseagreen", alpha=0.75, align="center")
+                   color="steelblue", alpha=0.75, align="center")
 
         ax.axvline(mean_val, color="darkorange", linewidth=2.0,
                    label=f"Mean = {mean_val:.3f}")
@@ -2006,6 +2029,7 @@ def _run_epoch(
     total_mass_asym_samples = 0
     all_pred_asym = []
     all_pred_correct = []
+    all_pred_grp_oracle_correct = []  # correctness conditioned on truth ISR (for factored Phase 1)
     all_pred_mass_sum = []
     all_pred_max_triplet_pt = []
     all_pred_delta_phi = []
@@ -2286,6 +2310,20 @@ def _run_epoch(
             total_mass_asym_samples += batch_size
             all_pred_asym.append(pred_asym.cpu())
             all_pred_correct.append((preds == labels).cpu())  # aligned with pred_asym
+            # Oracle grouping correctness: does grouping_head choose correctly when the
+            # truth ISR jet is given?  Computed for factored models only.  During Phase 1
+            # the ISR head is frozen/random (~1/7 correct), so the full assignment acc
+            # is ~15% even though the grouping head learns well (≥80%).  Using the
+            # oracle-grouping mask in stacked histograms during Phase 1 shows actual
+            # grouping-head progress instead of the ISR-diluted full-assignment acc.
+            if factored and "grouping_logits" in output:
+                _isr_lbls = model.flat_to_factored[labels, 0]      # (batch,) truth ISR idx
+                _grp_lbls = model.flat_to_factored[labels, 1]      # (batch,) truth grp idx
+                _b_idx = torch.arange(batch_size, device=labels.device)
+                _oracle_grp_pred = output["grouping_logits"][_b_idx, _isr_lbls].argmax(-1)
+                all_pred_grp_oracle_correct.append(
+                    (_oracle_grp_pred == _grp_lbls).cpu()
+                )
 
         if "mass_sum_flat" in output:
             mass_sum_flat = output["mass_sum_flat"].detach()  # (batch, num_assignments)
@@ -2360,6 +2398,14 @@ def _run_epoch(
         result["std_mass_asym"] = pred_asym_cat.std().item()
         result["pred_asym_values"] = pred_asym_cat.numpy()  # full per-event array
         result["pred_correct_values"] = torch.cat(all_pred_correct).numpy()  # bool per-event
+        # Oracle-grouping correctness: grouping head correct given truth ISR jet.
+        # Only available for factored models.  Used instead of pred_correct_values
+        # for Phase 1 histogram stacks so the bars show grouping-head progress
+        # rather than the ISR-diluted full-assignment accuracy (~15% in Phase 1).
+        if all_pred_grp_oracle_correct and len(all_pred_grp_oracle_correct) == len(all_pred_correct):
+            result["pred_grp_oracle_correct_values"] = (
+                torch.cat(all_pred_grp_oracle_correct).numpy()
+            )
     if all_pred_mass_sum:
         result["pred_mass_sum_values"] = torch.cat(all_pred_mass_sum).numpy()  # full per-event array
     if all_pred_max_triplet_pt:

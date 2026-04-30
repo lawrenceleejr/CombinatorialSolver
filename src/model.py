@@ -17,7 +17,11 @@ Architecture:
   6. GroupTransformer: intra-group mini-Transformer replaces sum-pooling to capture
      multi-particle angular correlations within each candidate 3-jet group.
      Inspired by arXiv:2202.03772, per-group intra-group physics observables
-     (9 features: pT hierarchy, Lund kT, ECF₂/ECF₃/D₂, Dalitz ratios) are
+     (10 features: pT hierarchy, Lund kT, ECF₂/ECF₃/D₂, all 3 Dalitz ratios) are
+     All three sorted Dalitz ratios (min, mid, max normalised pairwise sub-pair
+     masses) are included to detect on-shell resonances in cascade decays
+     P→j+R→j+(jj), which produce a sharp Dalitz edge absent in direct 3-body
+     decays and QCD.
      computed directly from raw kinematics and projected to a d_model-dimensional
      conditioning token that is appended to each group's jet-embedding sequence
      BEFORE the GroupTransformer self-attention.  This lets the intra-group
@@ -25,9 +29,9 @@ Architecture:
      are computed late (from raw 4-momenta, not from the latent space).
   7. Extended physics features per assignment:
      - 6 inter-group features (mass sum/asymmetry/ratio, deltaR, individual masses)
-     - 9 intra-group features per group (pT hierarchy, Lund-plane kT, ECF₂/ECF₃/D₂,
-       Dalitz pairwise masses) × 2 groups = 18 additional features
-     Total n_group_physics = 24
+     - 10 intra-group features per group (pT hierarchy, Lund-plane kT, ECF₂/ECF₃/D₂,
+       all 3 Dalitz pairwise masses) × 2 groups = 20 additional features
+     Total n_group_physics = 26
 """
 
 import torch
@@ -125,8 +129,8 @@ class JetAssignmentTransformer(nn.Module):
     physics-derived context while those features remain anchored to the raw
     four-momenta rather than to the latent space.
 
-    Physics features per assignment include 6 inter-group features plus 9
-    intra-group features per group (18 total), giving n_group_physics=24.
+    Physics features per assignment include 6 inter-group features plus 10
+    intra-group features per group (20 total), giving n_group_physics=26.
     """
 
     def __init__(
@@ -178,20 +182,23 @@ class JetAssignmentTransformer(nn.Module):
         )
 
         # Number of intra-group physics features (per group) used as conditioning.
-        # These 9 features (pT hierarchy, Lund kT, ECF₂/ECF₃/D₂, Dalitz ratios)
-        # are computed from raw kinematics before GroupTransformer self-attention
-        # and projected to d_model so the attention can condition on them.
-        self.n_intra_physics = 9
+        # These 10 features (pT hierarchy, Lund kT, ECF₂/ECF₃/D₂, all 3 Dalitz
+        # ratios) are computed from raw kinematics before GroupTransformer self-
+        # attention and projected to d_model so the attention can condition on them.
+        # The three Dalitz ratios (min, mid, max pairwise sub-pair masses normalised
+        # by triplet mass) give the full Dalitz-plane structure needed to detect
+        # on-shell intermediate resonances in cascade decays P→j+R→j+(jj).
+        self.n_intra_physics = 10
         self.group_physics_proj = nn.Sequential(
             nn.Linear(self.n_intra_physics, d_model),
             nn.GELU(),
         )
 
-        # 6 inter-group features + 9 intra-group features per group × 2 groups = 24
-        self.n_group_physics = 24
+        # 6 inter-group features + 10 intra-group features per group × 2 groups = 26
+        self.n_group_physics = 26
 
         # Normalize physics features before feeding to scorer MLPs.
-        # The 24 features span very different scales (ratios ∈ [0,1] vs masses
+        # The 26 features span very different scales (ratios ∈ [0,1] vs masses
         # vs angular quantities), so LayerNorm stabilises the scorer inputs.
         self.physics_norm = nn.LayerNorm(self.n_group_physics)
 
@@ -361,20 +368,25 @@ class JetAssignmentTransformer(nn.Module):
 
     @staticmethod
     def intra_group_features(jets_4vec: torch.Tensor) -> torch.Tensor:
-        """Compute 9 QCD-discriminating features from a 3-jet candidate group.
+        """Compute 10 QCD-discriminating features from a 3-jet candidate group.
 
         Features capture pT hierarchy, Lund-plane splittings, energy correlation
-        functions (ECF₂, ECF₃, D₂), and Dalitz pairwise invariant masses —
+        functions (ECF₂, ECF₃, D₂), and all three Dalitz pairwise invariant masses —
         all of which distinguish QCD-like (hierarchical, collinear) topologies
-        from isotropic high-mass signal decays.
+        from isotropic high-mass signal decays.  The full set of three sorted Dalitz
+        ratios (min, mid, max) is required to detect cascade decays P→j+R→j+(jj):
+        the resonance sub-pair has m(jj)=m_R, creating a sharp Dalitz edge that is
+        absent in both direct 3-body decays (which fill the Dalitz plane broadly) and
+        QCD (which has no internal high-mass scale).  dalitz_min alone loses the
+        identity of the resonance pair; having all three unambiguously exposes it.
 
         Args:
             jets_4vec: (..., 3, 4) individual jet 4-vectors (E, px, py, pz)
 
         Returns:
-            (..., 9) per-group features:
+            (..., 10) per-group features:
               [max_pt_ratio, pt_cv, min_z, max_kt, ecf2, ecf3, d2,
-               dalitz_max_ratio, dalitz_min_ratio]
+               dalitz_max_ratio, dalitz_min_ratio, dalitz_mid_ratio]
         """
         E = jets_4vec[..., 0].clamp(min=1e-8)   # (..., 3) energy
         px = jets_4vec[..., 1]
@@ -435,9 +447,15 @@ class JetAssignmentTransformer(nn.Module):
 
         # D₂ = ECF₃ / ECF₂² — probes 2-prong vs 3-prong substructure.
         # Clamp ECF₂ before squaring to avoid underflow when jets are nearly collinear.
+        # D₂ is low for cascade triplets (j2,j3 form the resonance sub-pair → 2-prong).
         d2 = ecf3 / ecf2.clamp(min=1e-4) ** 2
 
-        # --- Dalitz pairwise invariant masses, normalized by group mass ---
+        # --- All 3 Dalitz pairwise invariant masses, normalized by group mass ---
+        # These three ratios fully characterise the Dalitz plane.  In cascade decays
+        # P→j1+R→j1+(j2+j3), one pair has m(j_i,j_j)/m_triplet ≈ m_R/m_P (the
+        # resonance sub-pair), while the other two pairs take different values.
+        # Providing all three sorted values (min, mid, max) lets the model unambiguously
+        # identify which sub-pair is the resonance — impossible with only (min, max).
         p_group = jets_4vec.sum(dim=-2)                                 # (..., 4)
         m2_group = (
             p_group[..., 0]**2 - p_group[..., 1]**2
@@ -455,13 +473,16 @@ class JetAssignmentTransformer(nn.Module):
             dalitz_list.append(torch.sqrt(m2_ij.clamp(min=1e-8)) / m_group.clamp(min=1e-8))
 
         dalitz_t = torch.stack(dalitz_list, dim=-1)                    # (..., 3)
-        dalitz_max = dalitz_t.max(dim=-1).values
-        dalitz_min = dalitz_t.min(dim=-1).values
+        dalitz_sorted, _ = dalitz_t.sort(dim=-1)                       # (..., 3) ascending
+        dalitz_min = dalitz_sorted[..., 0]
+        dalitz_mid = dalitz_sorted[..., 1]
+        dalitz_max = dalitz_sorted[..., 2]
 
         return torch.stack(
-            [max_pt_ratio, pt_cv, min_z, max_kt, ecf2, ecf3, d2, dalitz_max, dalitz_min],
+            [max_pt_ratio, pt_cv, min_z, max_kt, ecf2, ecf3, d2,
+             dalitz_max, dalitz_min, dalitz_mid],
             dim=-1,
-        )                                                               # (..., 9)
+        )                                                               # (..., 10)
 
     @staticmethod
     def _intra_group_features(jets_4vec: torch.Tensor) -> torch.Tensor:
@@ -477,10 +498,10 @@ class JetAssignmentTransformer(nn.Module):
     ) -> torch.Tensor:
         """Compute physics features from two group four-vectors.
 
-        Returns (..., 24) when individual jet 4-vectors are provided:
+        Returns (..., 26) when individual jet 4-vectors are provided:
           - 6 inter-group features: mass_sum, mass_asym, mass_ratio, m1, m2, deltaR
-          - 9 intra-group features for group 1 (pT hierarchy, Lund, ECFs, Dalitz)
-          - 9 intra-group features for group 2
+          - 10 intra-group features for group 1 (pT hierarchy, Lund, ECFs, all 3 Dalitz)
+          - 10 intra-group features for group 2
 
         Returns (..., 6) when g1_jets / g2_jets are omitted (fallback).
         """
@@ -510,7 +531,7 @@ class JetAssignmentTransformer(nn.Module):
         if g1_jets is not None and g2_jets is not None:
             intra1 = JetAssignmentTransformer.intra_group_features(g1_jets)
             intra2 = JetAssignmentTransformer.intra_group_features(g2_jets)
-            return torch.cat([inter, intra1, intra2], dim=-1)   # (..., 24)
+            return torch.cat([inter, intra1, intra2], dim=-1)   # (..., 26)
 
         return inter                                             # (..., 6)
 
@@ -593,10 +614,10 @@ class JetAssignmentTransformer(nn.Module):
         sym_prod = g1_pooled * g2_pooled
         sym_diff = (g1_pooled - g2_pooled).abs()
 
-        # ── full 24-feature physics (computed from already-gathered 4-momenta) ──
-        # _mass_features returns (..., 24): 6 inter-group features
+        # ── full 26-feature physics (computed from already-gathered 4-momenta) ──
+        # _mass_features returns (..., 26): 6 inter-group features
         # [mass_sum, mass_asym, mass_ratio, m1, m2, deltaR] followed by
-        # 9 intra-group features for group 1 and 9 for group 2 (18 total).
+        # 10 intra-group features for group 1 and 10 for group 2 (20 total).
         g1_4vec = g1_jets_4mom.sum(dim=2)   # (batch, n_combos, 4)
         g2_4vec = g2_jets_4mom.sum(dim=2)
         physics = self._mass_features(g1_4vec, g2_4vec, g1_jets_4mom, g2_jets_4mom)
@@ -796,11 +817,13 @@ class MassAsymmetryClassicalSolver(nn.Module):
     # Small ΔR contribution to angular penalty (secondary to Δφ back-to-backness).
     DELTA_R_WEIGHT = 0.1
     # Indices match intra_group_features return order:
-    # [max_pt_ratio, pt_cv, min_z, max_kt, ecf2, ecf3, d2, dalitz_max_ratio, dalitz_min_ratio]
+    # [max_pt_ratio, pt_cv, min_z, max_kt, ecf2, ecf3, d2,
+    #  dalitz_max_ratio, dalitz_min_ratio, dalitz_mid_ratio]
     MAX_PT_RATIO_IDX = 0
     PT_CV_IDX = 1
     DALITZ_MAX_RATIO_IDX = 7
     DALITZ_MIN_RATIO_IDX = 8
+    DALITZ_MID_RATIO_IDX = 9
     # Secondary-feature blend used only for tie-breaking after primary mass difference.
     SECONDARY_WEIGHTS = {
         "asymmetry": 0.45,
@@ -895,13 +918,20 @@ class MassAsymmetryClassicalSolver(nn.Module):
             + self.DELTA_R_WEIGHT * delta_r
         )
 
-        # Dalitz-like inter-group consistency
+        # Dalitz-like inter-group consistency: both groups should have the same
+        # internal Dalitz structure (all three sorted pairwise mass ratios should
+        # match between the two candidate parents).  Using all three ratios (max,
+        # min, mid) is important for cascade decays where one Dalitz ratio is
+        # pinned to m_R/m_P and must be consistent between the two groups.
         dalitz_penalty = (
             torch.abs(
                 intra1[..., self.DALITZ_MAX_RATIO_IDX] - intra2[..., self.DALITZ_MAX_RATIO_IDX]
             )
             + torch.abs(
                 intra1[..., self.DALITZ_MIN_RATIO_IDX] - intra2[..., self.DALITZ_MIN_RATIO_IDX]
+            )
+            + torch.abs(
+                intra1[..., self.DALITZ_MID_RATIO_IDX] - intra2[..., self.DALITZ_MID_RATIO_IDX]
             )
         )
 

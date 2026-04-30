@@ -278,27 +278,27 @@ dim_tag(ax, XB_L + 3.85, Y_SYM, "3×(B,70,256)")
 # ═══════════════════════════════════════════════════════════════════════════
 # RIGHT BRANCH — Full Physics Features
 # ═══════════════════════════════════════════════════════════════════════════
-section_bg(ax, 10.8, 14.8, 10.8, 8.5, "FULL PHYSICS FEATURES  (24)", ACCENT_RED, 0.04)
+section_bg(ax, 10.8, 14.8, 10.8, 8.5, "FULL PHYSICS FEATURES  (26)", ACCENT_RED, 0.04)
 
 arr(ax, BP_X, BP_Y, XB_R, 22.35, color=TEXT_DIM, rad=0.22)
 
 Y_PHYS = 20.5
 rbox(ax, XB_R, Y_PHYS, 8, 2.5,
-     "Full Physics Features  (24 per assignment)",
+     "Full Physics Features  (26 per assignment)",
      body=(
          "Computed from raw 4-momenta  —  LATE, not from latent space\n"
          "─────────────────────────────────────────────────────────\n"
          "Inter-group (6):\n"
          "  mass_sum · mass_asym · mass_ratio · m₁ · m₂ · ΔR\n"
          "\n"
-         "Intra-group × 2 groups (9+9=18):\n"
+         "Intra-group × 2 groups (10+10=20):\n"
          "  pT_max/pT_min · pT-CV · min Lund-z · max Lund-kT\n"
          "  ECF₂ · ECF₃ · D₂=ECF₃/ECF₂²\n"
-         "  Dalitz max ratio · Dalitz min ratio"
+         "  Dalitz max · Dalitz min · Dalitz mid"
      ),
      accent=ACCENT_RED, title_size=10, body_size=7.5, alpha_face=0.15)
 arr(ax, XB_R, 22.35, XB_R, Y_PHYS + 1.25, color=TEXT_DIM)
-dim_tag(ax, XB_R + 4.2, Y_PHYS, "(B,70,24)")
+dim_tag(ax, XB_R + 4.2, Y_PHYS, "(B,70,26)")
 
 Y_LN = 17.85
 rbox(ax, XB_R, Y_LN, 6.5, 0.65,
@@ -306,7 +306,7 @@ rbox(ax, XB_R, Y_LN, 6.5, 0.65,
      body="stabilises mixed-scale features  (ratios · masses · angles)",
      accent=ACCENT_RED, body_size=7.5)
 arr(ax, XB_R, Y_PHYS - 1.25, XB_R, Y_LN + 0.33, color=ACCENT_RED)
-dim_tag(ax, XB_R + 3.35, Y_LN, "(B,70,24)")
+dim_tag(ax, XB_R + 3.35, Y_LN, "(B,70,26)")
 
 # extract mass_sum / mass_asym before LN (dashed side arrow)
 arr(ax, XB_R + 3.3, Y_PHYS - 0.5, XB_R + 5.2, Y_PHYS - 0.5,
@@ -321,7 +321,7 @@ section_bg(ax, 0.4, 10.2, 21.2, 4.45, "GROUPING SCORER + ISR HEAD", ACCENT_PUR, 
 Y_CAT = 14.65
 rbox(ax, XM, Y_CAT, 12, 0.75,
      "Concatenate  [sym_sum | sym_prod | sym_diff | physics_normed]",
-     body="shape: (B, 70, 3·d + 24)    ·    d = 256   →   (B, 70, 792)",
+     body="shape: (B, 70, 3·d + 26)    ·    d = 256   →   (B, 70, 794)",
      accent=ACCENT_PUR, title_size=10)
 # arrows from both branches
 arr(ax, XB_L, Y_SYM - 0.38, XM - 5.5, Y_CAT + 0.18, color=ACCENT_ORG, rad=0.1)
