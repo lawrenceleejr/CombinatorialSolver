@@ -362,6 +362,10 @@ def train(config_path: str | None = None, data_path: str | None = None):
             "val_avg_mass_asym", "val_std_mass_asym",
             "train_avg_max_triplet_pt", "train_std_max_triplet_pt",
             "val_avg_max_triplet_pt", "val_std_max_triplet_pt",
+            "train_avg_delta_phi", "train_std_delta_phi",
+            "val_avg_delta_phi", "val_std_delta_phi",
+            "train_avg_democracy", "train_std_democracy",
+            "val_avg_democracy", "val_std_democracy",
         ])
 
     best_val_acc = 0.0
@@ -371,6 +375,8 @@ def train(config_path: str | None = None, data_path: str | None = None):
     val_asym_history: list = []  # per-epoch list of numpy arrays (val pred_asym_values)
     val_mass_sum_history: list = []  # per-epoch list of numpy arrays (val pred_mass_sum_values)
     val_max_triplet_pt_history: list = []  # per-epoch list of numpy arrays (val max-triplet scalar pT)
+    val_delta_phi_history: list = []  # per-epoch list of numpy arrays (val Δφ between parent candidates)
+    val_democracy_history: list = []  # per-epoch list of numpy arrays (val avg pT democracy of triplets)
 
     tf_start = tc.get("tf_start", 1.0)
     tf_end = tc.get("tf_end", 0.3)
@@ -603,6 +609,22 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 val_metrics.get("pred_correct_values"),  # bool array or None
             ))
 
+        # Accumulate per-event validation ΔΦ distribution for GIF
+        if "pred_delta_phi_values" in val_metrics:
+            val_delta_phi_history.append((
+                epoch + 1, training_phase,
+                val_metrics["pred_delta_phi_values"],
+                val_metrics.get("pred_correct_values"),  # bool array or None
+            ))
+
+        # Accumulate per-event validation pT-democracy distribution for GIF
+        if "pred_democracy_values" in val_metrics:
+            val_democracy_history.append((
+                epoch + 1, training_phase,
+                val_metrics["pred_democracy_values"],
+                val_metrics.get("pred_correct_values"),  # bool array or None
+            ))
+
         # Log
         phase_tag = f"[P{training_phase}]" if phase1_active else ""
         adv_str = f" | Adv R²={val_metrics['adv_r2']:.3f}" if use_adversary else ""
@@ -652,6 +674,14 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 f"{train_metrics['std_max_triplet_pt']:.6f}" if "std_max_triplet_pt" in train_metrics else "",
                 f"{val_metrics['avg_max_triplet_pt']:.6f}" if "avg_max_triplet_pt" in val_metrics else "",
                 f"{val_metrics['std_max_triplet_pt']:.6f}" if "std_max_triplet_pt" in val_metrics else "",
+                f"{train_metrics['avg_delta_phi']:.6f}" if "avg_delta_phi" in train_metrics else "",
+                f"{train_metrics['std_delta_phi']:.6f}" if "std_delta_phi" in train_metrics else "",
+                f"{val_metrics['avg_delta_phi']:.6f}" if "avg_delta_phi" in val_metrics else "",
+                f"{val_metrics['std_delta_phi']:.6f}" if "std_delta_phi" in val_metrics else "",
+                f"{train_metrics['avg_democracy']:.6f}" if "avg_democracy" in train_metrics else "",
+                f"{train_metrics['std_democracy']:.6f}" if "std_democracy" in train_metrics else "",
+                f"{val_metrics['avg_democracy']:.6f}" if "avg_democracy" in val_metrics else "",
+                f"{val_metrics['std_democracy']:.6f}" if "std_democracy" in val_metrics else "",
             ])
 
         # Per-epoch live-monitoring plots (overwrite fixed "latest" files so a
@@ -674,6 +704,18 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 val_max_triplet_pt_history,
                 phase2_start_epoch=phase2_start_epoch,
                 gif_path=Path("plots") / "max_triplet_pt_anim_latest.gif",
+            )
+        if val_delta_phi_history:
+            _make_delta_phi_gif(
+                val_delta_phi_history,
+                phase2_start_epoch=phase2_start_epoch,
+                gif_path=Path("plots") / "delta_phi_anim_latest.gif",
+            )
+        if val_democracy_history:
+            _make_democracy_gif(
+                val_democracy_history,
+                phase2_start_epoch=phase2_start_epoch,
+                gif_path=Path("plots") / "democracy_anim_latest.gif",
             )
 
         # ---------------------------------------------------------------
@@ -810,6 +852,18 @@ def train(config_path: str | None = None, data_path: str | None = None):
         mpt_gif = _make_max_triplet_pt_gif(val_max_triplet_pt_history, phase2_start_epoch=phase2_start_epoch)
         if mpt_gif is not None:
             plot_paths.append(mpt_gif)
+
+    # Animated GIF of the validation ΔΦ between parent candidates.
+    if val_delta_phi_history:
+        dphi_gif = _make_delta_phi_gif(val_delta_phi_history, phase2_start_epoch=phase2_start_epoch)
+        if dphi_gif is not None:
+            plot_paths.append(dphi_gif)
+
+    # Animated GIF of the validation pT democracy.
+    if val_democracy_history:
+        dem_gif = _make_democracy_gif(val_democracy_history, phase2_start_epoch=phase2_start_epoch)
+        if dem_gif is not None:
+            plot_paths.append(dem_gif)
 
     # Full timestamped snapshot bundle (ML model + classical solver + plots),
     # mirroring the Phase 1 snapshot produced by _export_phase1_snapshot.
@@ -1238,6 +1292,266 @@ def _make_max_triplet_pt_gif(
         plt.close(fig)
 
 
+def _make_delta_phi_gif(
+    val_delta_phi_history: list,
+    phase2_start_epoch: int | None = None,
+    gif_path: str | Path | None = None,
+) -> "Path | None":
+    """Build an animated GIF of the Δφ distribution between the two parent candidates.
+
+    For each event Δφ = |φ(triplet1) − φ(triplet2)| is folded into [0, π],
+    where φᵢ = atan2(ΣPy, ΣPx) over the jets assigned to candidate i.  Each
+    frame shows a histogram over all validation events for that epoch.  When a
+    per-event correctness mask is available (4-tuple history entries) the bars
+    are stacked by correct vs incorrect network outputs.  A vertical line marks
+    the per-epoch mean.  When two-phase training was used, frames from Phase 2
+    onward carry a "Phase 2" annotation.
+
+    When *gif_path* is ``None`` the file is written to
+    ``plots/delta_phi_anim_{timestamp}_{commit}.gif``.  Requires ``pillow``
+    (pip install pillow).
+
+    Args:
+        val_delta_phi_history: List of ``(epoch, phase, values_array[, correct_mask])``
+            tuples where *values_array* contains the per-event Δφ in [0, π].
+            The optional fourth element is a boolean NumPy array (True = correct).
+        phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
+            ``None`` for single-phase runs.
+        gif_path: Destination file path.  When ``None`` a timestamped path
+            inside ``plots/`` is generated automatically.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.animation as animation
+    except ImportError:
+        print("  Warning: matplotlib not available; skipping Δφ GIF.")
+        return None
+
+    if not val_delta_phi_history:
+        return None
+
+    plots_dir = Path("plots")
+    plots_dir.mkdir(exist_ok=True)
+
+    if gif_path is None:
+        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        commit = _get_git_commit_hash()
+        gif_path = plots_dir / f"delta_phi_anim_{ts}_{commit}.gif"
+    gif_path = Path(gif_path)
+
+    import numpy as np
+    import math as _math_dphi
+
+    def _unpack(entry):
+        if len(entry) == 4:
+            return entry
+        return entry[0], entry[1], entry[2], None
+
+    x_min, x_max = 0.0, _math_dphi.pi
+    n_bins = 50
+    bin_edges = np.linspace(x_min, x_max, n_bins + 1)
+
+    # Pre-compute total counts to fix the y-axis.
+    max_count = 0
+    for entry in val_delta_phi_history:
+        _, _, values, _ = _unpack(entry)
+        counts, _ = np.histogram(values, bins=bin_edges)
+        if counts.max() > max_count:
+            max_count = int(counts.max())
+    y_max = max_count * 1.1
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bar_width = (x_max - x_min) / n_bins
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    def _draw_frame(frame_idx):
+        epoch, phase, values, correct_mask = _unpack(val_delta_phi_history[frame_idx])
+        ax.cla()
+        mean_val = float(values.mean())
+
+        if correct_mask is not None:
+            vals_correct   = values[correct_mask]
+            vals_incorrect = values[~correct_mask]
+            counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
+            counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
+            ax.bar(centers, counts_correct,   width=bar_width,
+                   color="steelblue", alpha=0.85, align="center", label="Correct")
+            ax.bar(centers, counts_incorrect, width=bar_width,
+                   color="coral",     alpha=0.85, align="center", label="Incorrect",
+                   bottom=counts_correct)
+        else:
+            counts, _ = np.histogram(values, bins=bin_edges)
+            ax.bar(centers, counts, width=bar_width,
+                   color="steelblue", alpha=0.75, align="center")
+
+        ax.axvline(mean_val, color="darkorange", linewidth=2.0,
+                   label=f"Mean = {mean_val:.3f}")
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(0, y_max)
+        ax.set_xlabel("Δφ between parent candidates (rad)")
+        ax.set_ylabel("Validation events")
+        phase_label = ""
+        if phase2_start_epoch is not None:
+            phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
+        elif phase == 2:
+            phase_label = " [Phase 2]"
+        ax.set_title(f"Epoch {epoch}{phase_label}")
+        ax.legend(loc="upper left")
+        ax.grid(True, alpha=0.3)
+
+    anim = animation.FuncAnimation(
+        fig,
+        _draw_frame,
+        frames=len(val_delta_phi_history),
+        interval=200,
+        repeat=False,
+    )
+
+    try:
+        anim.save(str(gif_path), writer="pillow", fps=5)
+        print(f"  -> Saved Δφ GIF        : {gif_path}")
+        return gif_path
+    except Exception as exc:
+        print(f"  Warning: could not save Δφ GIF ({exc}). "
+              "Is pillow installed?  pip install pillow")
+        return None
+    finally:
+        plt.close(fig)
+
+
+def _make_democracy_gif(
+    val_democracy_history: list,
+    phase2_start_epoch: int | None = None,
+    gif_path: str | Path | None = None,
+) -> "Path | None":
+    """Build an animated GIF of the pT-democracy distribution.
+
+    For each event the pT-democracy of a triplet is defined as
+    ``min(pT) / max(pT)`` over its three jets, which equals 1 when all jets
+    carry equal pT and approaches 0 when one jet dominates.  The per-event
+    score is the average democracy across the two triplets in the predicted
+    assignment.  Each frame shows a histogram over all validation events for
+    that epoch.  When a per-event correctness mask is available (4-tuple
+    history entries) the bars are stacked by correct vs incorrect outputs.
+    A vertical line marks the per-epoch mean.  When two-phase training was
+    used, frames from Phase 2 onward carry a "Phase 2" annotation.
+
+    When *gif_path* is ``None`` the file is written to
+    ``plots/democracy_anim_{timestamp}_{commit}.gif``.  Requires ``pillow``
+    (pip install pillow).
+
+    Args:
+        val_democracy_history: List of ``(epoch, phase, values_array[, correct_mask])``
+            tuples where *values_array* contains the per-event average pT
+            democracy in (0, 1].  The optional fourth element is a boolean
+            NumPy array (True = correct).
+        phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
+            ``None`` for single-phase runs.
+        gif_path: Destination file path.  When ``None`` a timestamped path
+            inside ``plots/`` is generated automatically.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.animation as animation
+    except ImportError:
+        print("  Warning: matplotlib not available; skipping democracy GIF.")
+        return None
+
+    if not val_democracy_history:
+        return None
+
+    plots_dir = Path("plots")
+    plots_dir.mkdir(exist_ok=True)
+
+    if gif_path is None:
+        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        commit = _get_git_commit_hash()
+        gif_path = plots_dir / f"democracy_anim_{ts}_{commit}.gif"
+    gif_path = Path(gif_path)
+
+    import numpy as np
+
+    def _unpack(entry):
+        if len(entry) == 4:
+            return entry
+        return entry[0], entry[1], entry[2], None
+
+    x_min, x_max = 0.0, 1.0
+    n_bins = 50
+    bin_edges = np.linspace(x_min, x_max, n_bins + 1)
+
+    # Pre-compute total counts to fix the y-axis.
+    max_count = 0
+    for entry in val_democracy_history:
+        _, _, values, _ = _unpack(entry)
+        counts, _ = np.histogram(values, bins=bin_edges)
+        if counts.max() > max_count:
+            max_count = int(counts.max())
+    y_max = max_count * 1.1
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bar_width = (x_max - x_min) / n_bins
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    def _draw_frame(frame_idx):
+        epoch, phase, values, correct_mask = _unpack(val_democracy_history[frame_idx])
+        ax.cla()
+        mean_val = float(values.mean())
+
+        if correct_mask is not None:
+            vals_correct   = values[correct_mask]
+            vals_incorrect = values[~correct_mask]
+            counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
+            counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
+            ax.bar(centers, counts_correct,   width=bar_width,
+                   color="mediumseagreen", alpha=0.85, align="center", label="Correct")
+            ax.bar(centers, counts_incorrect, width=bar_width,
+                   color="coral",           alpha=0.85, align="center", label="Incorrect",
+                   bottom=counts_correct)
+        else:
+            counts, _ = np.histogram(values, bins=bin_edges)
+            ax.bar(centers, counts, width=bar_width,
+                   color="mediumseagreen", alpha=0.75, align="center")
+
+        ax.axvline(mean_val, color="darkorange", linewidth=2.0,
+                   label=f"Mean = {mean_val:.3f}")
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(0, y_max)
+        ax.set_xlabel("pT democracy = avg(min pT / max pT) per triplet")
+        ax.set_ylabel("Validation events")
+        phase_label = ""
+        if phase2_start_epoch is not None:
+            phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
+        elif phase == 2:
+            phase_label = " [Phase 2]"
+        ax.set_title(f"Epoch {epoch}{phase_label}")
+        ax.legend(loc="upper left")
+        ax.grid(True, alpha=0.3)
+
+    anim = animation.FuncAnimation(
+        fig,
+        _draw_frame,
+        frames=len(val_democracy_history),
+        interval=200,
+        repeat=False,
+    )
+
+    try:
+        anim.save(str(gif_path), writer="pillow", fps=5)
+        print(f"  -> Saved democracy GIF : {gif_path}")
+        return gif_path
+    except Exception as exc:
+        print(f"  Warning: could not save democracy GIF ({exc}). "
+              "Is pillow installed?  pip install pillow")
+        return None
+    finally:
+        plt.close(fig)
+
+
 def _plot_training_curves(
     log_path: str | Path,
     phase2_start_epoch: int | None = None,
@@ -1286,6 +1600,8 @@ def _plot_training_curves(
     train_avg_asym, train_std_asym, val_avg_asym, val_std_asym = [], [], [], []
     train_grp_acc, val_grp_acc = [], []
     train_avg_mpt, train_std_mpt, val_avg_mpt, val_std_mpt = [], [], [], []
+    train_avg_dphi, train_std_dphi, val_avg_dphi, val_std_dphi = [], [], [], []
+    train_avg_dem, train_std_dem, val_avg_dem, val_std_dem = [], [], [], []
     with open(log_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -1309,6 +1625,14 @@ def _plot_training_curves(
             train_std_mpt.append(_parse_float(row.get("train_std_max_triplet_pt", "")))
             val_avg_mpt.append(_parse_float(row.get("val_avg_max_triplet_pt", "")))
             val_std_mpt.append(_parse_float(row.get("val_std_max_triplet_pt", "")))
+            train_avg_dphi.append(_parse_float(row.get("train_avg_delta_phi", "")))
+            train_std_dphi.append(_parse_float(row.get("train_std_delta_phi", "")))
+            val_avg_dphi.append(_parse_float(row.get("val_avg_delta_phi", "")))
+            val_std_dphi.append(_parse_float(row.get("val_std_delta_phi", "")))
+            train_avg_dem.append(_parse_float(row.get("train_avg_democracy", "")))
+            train_std_dem.append(_parse_float(row.get("train_std_democracy", "")))
+            val_avg_dem.append(_parse_float(row.get("val_avg_democracy", "")))
+            val_std_dem.append(_parse_float(row.get("val_std_democracy", "")))
 
     if not epochs:
         print("  Warning: empty training log; skipping plots.")
@@ -1487,6 +1811,78 @@ def _plot_training_curves(
         print(f"  -> Saved max-triplet-pT plot: {mpt_path}")
         saved_paths.append(mpt_path)
 
+    # --- Δφ between parent candidates plot ---
+    dphi_epochs = [e for e, v in zip(epochs, val_avg_dphi) if not _math2.isnan(v)]
+    if dphi_epochs:
+        dphi_train_avg = [v for e, v in zip(epochs, train_avg_dphi) if e in set(dphi_epochs) and not _math2.isnan(v)]
+        dphi_train_std = [v for e, v in zip(epochs, train_std_dphi) if e in set(dphi_epochs) and not _math2.isnan(v)]
+        dphi_val_avg   = [v for e, v in zip(epochs, val_avg_dphi)   if e in set(dphi_epochs) and not _math2.isnan(v)]
+        dphi_val_std   = [v for e, v in zip(epochs, val_std_dphi)   if e in set(dphi_epochs) and not _math2.isnan(v)]
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.plot(dphi_epochs, dphi_train_avg, label="Train mean Δφ", color="steelblue")
+        ax.fill_between(
+            dphi_epochs,
+            [m - s for m, s in zip(dphi_train_avg, dphi_train_std)],
+            [m + s for m, s in zip(dphi_train_avg, dphi_train_std)],
+            color="steelblue", alpha=0.2, label="Train ±1σ",
+        )
+        ax.plot(dphi_epochs, dphi_val_avg, label="Val mean Δφ", color="darkorange")
+        ax.fill_between(
+            dphi_epochs,
+            [m - s for m, s in zip(dphi_val_avg, dphi_val_std)],
+            [m + s for m, s in zip(dphi_val_avg, dphi_val_std)],
+            color="darkorange", alpha=0.2, label="Val ±1σ",
+        )
+        _add_phase_lines(ax)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Δφ between parent candidates (rad)")
+        ax.set_title("Δφ Between Parent Candidates of Chosen Interpretation vs Epoch")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        dphi_path = plots_dir / f"delta_phi_{tag}.pdf"
+        fig.savefig(dphi_path)
+        plt.close(fig)
+        print(f"  -> Saved Δφ plot       : {dphi_path}")
+        saved_paths.append(dphi_path)
+
+    # --- pT democracy plot ---
+    dem_epochs = [e for e, v in zip(epochs, val_avg_dem) if not _math2.isnan(v)]
+    if dem_epochs:
+        dem_train_avg = [v for e, v in zip(epochs, train_avg_dem) if e in set(dem_epochs) and not _math2.isnan(v)]
+        dem_train_std = [v for e, v in zip(epochs, train_std_dem) if e in set(dem_epochs) and not _math2.isnan(v)]
+        dem_val_avg   = [v for e, v in zip(epochs, val_avg_dem)   if e in set(dem_epochs) and not _math2.isnan(v)]
+        dem_val_std   = [v for e, v in zip(epochs, val_std_dem)   if e in set(dem_epochs) and not _math2.isnan(v)]
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.plot(dem_epochs, dem_train_avg, label="Train mean democracy", color="mediumseagreen")
+        ax.fill_between(
+            dem_epochs,
+            [m - s for m, s in zip(dem_train_avg, dem_train_std)],
+            [m + s for m, s in zip(dem_train_avg, dem_train_std)],
+            color="mediumseagreen", alpha=0.2, label="Train ±1σ",
+        )
+        ax.plot(dem_epochs, dem_val_avg, label="Val mean democracy", color="darkorange")
+        ax.fill_between(
+            dem_epochs,
+            [m - s for m, s in zip(dem_val_avg, dem_val_std)],
+            [m + s for m, s in zip(dem_val_avg, dem_val_std)],
+            color="darkorange", alpha=0.2, label="Val ±1σ",
+        )
+        _add_phase_lines(ax)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("pT democracy = avg(min pT / max pT) per triplet")
+        ax.set_title("pT Democracy of Chosen Interpretation vs Epoch")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        dem_path = plots_dir / f"democracy_{tag}.pdf"
+        fig.savefig(dem_path)
+        plt.close(fig)
+        print(f"  -> Saved democracy plot: {dem_path}")
+        saved_paths.append(dem_path)
+
     return saved_paths
 
 
@@ -1519,6 +1915,8 @@ def _run_epoch(
     all_pred_correct = []
     all_pred_mass_sum = []
     all_pred_max_triplet_pt = []
+    all_pred_delta_phi = []
+    all_pred_democracy = []
     all_mass_pred = []
     all_mass_true = []
     factored = model.has_isr
@@ -1803,6 +2201,7 @@ def _run_epoch(
 
         # Max-triplet scalar-sum pT: look up the two triplets for each event's
         # predicted assignment and take the larger of the two per-triplet pT sums.
+        # Also compute Δφ between the two parent 4-vector sums and average pT democracy.
         if factored and hasattr(model, "f_group1"):
             f2f = model.flat_to_factored              # (num_assignments, 2)
             pred_isr_i = f2f[preds, 0]                # (batch,)
@@ -1822,6 +2221,26 @@ def _run_epoch(
             pt_g2 = pt_b.gather(1, g2_jets).sum(dim=1)   # (batch,)
             max_triplet_pt = torch.maximum(pt_g1, pt_g2)  # (batch,)
             all_pred_max_triplet_pt.append(max_triplet_pt.detach().cpu())
+
+            # Δφ: azimuthal angle between the two parent 4-vector sums, in [0, π].
+            sum_px_g1 = px_b.gather(1, g1_jets).sum(dim=1)  # (batch,)
+            sum_py_g1 = py_b.gather(1, g1_jets).sum(dim=1)
+            sum_px_g2 = px_b.gather(1, g2_jets).sum(dim=1)
+            sum_py_g2 = py_b.gather(1, g2_jets).sum(dim=1)
+            phi1 = torch.atan2(sum_py_g1, sum_px_g1)  # (batch,)
+            phi2 = torch.atan2(sum_py_g2, sum_px_g2)
+            dphi = (phi1 - phi2).abs()
+            # Fold into [0, π]: if dphi > π, use 2π − dphi.
+            dphi = torch.where(dphi > torch.pi, 2.0 * torch.pi - dphi, dphi)
+            all_pred_delta_phi.append(dphi.detach().cpu())
+
+            # pT democracy: min(pT)/max(pT) per triplet, averaged across the two.
+            pt_jets_g1 = pt_b.gather(1, g1_jets)       # (batch, 3)
+            pt_jets_g2 = pt_b.gather(1, g2_jets)       # (batch, 3)
+            dem_g1 = pt_jets_g1.min(dim=1).values / (pt_jets_g1.max(dim=1).values.clamp(min=1e-8))
+            dem_g2 = pt_jets_g2.min(dim=1).values / (pt_jets_g2.max(dim=1).values.clamp(min=1e-8))
+            democracy = (dem_g1 + dem_g2) / 2.0        # (batch,)
+            all_pred_democracy.append(democracy.detach().cpu())
 
         mass_mask = parent_mass > 0
         if mass_mask.any():
@@ -1855,6 +2274,16 @@ def _run_epoch(
         result["pred_max_triplet_pt_values"] = mpt_cat.numpy()
         result["avg_max_triplet_pt"] = mpt_cat.mean().item()
         result["std_max_triplet_pt"] = mpt_cat.std().item()
+    if all_pred_delta_phi:
+        dphi_cat = torch.cat(all_pred_delta_phi)
+        result["pred_delta_phi_values"] = dphi_cat.numpy()
+        result["avg_delta_phi"] = dphi_cat.mean().item()
+        result["std_delta_phi"] = dphi_cat.std().item()
+    if all_pred_democracy:
+        dem_cat = torch.cat(all_pred_democracy)
+        result["pred_democracy_values"] = dem_cat.numpy()
+        result["avg_democracy"] = dem_cat.mean().item()
+        result["std_democracy"] = dem_cat.std().item()
     if factored:
         result["isr_acc"] = total_isr_correct / max(total_samples, 1)
         result["grp_acc"] = total_grp_correct / max(total_samples, 1)
