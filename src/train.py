@@ -1602,6 +1602,7 @@ def _plot_training_curves(
     # --- Read CSV ---
     epochs, train_loss, val_loss, train_acc, val_acc, phases = [], [], [], [], [], []
     train_avg_asym, train_std_asym, val_avg_asym, val_std_asym = [], [], [], []
+    train_isr_acc, val_isr_acc = [], []
     train_grp_acc, val_grp_acc = [], []
     train_avg_mpt, train_std_mpt, val_avg_mpt, val_std_mpt = [], [], [], []
     train_avg_dphi, train_std_dphi, val_avg_dphi, val_std_dphi = [], [], [], []
@@ -1623,6 +1624,11 @@ def _plot_training_curves(
             train_std_asym.append(_parse_float(row.get("train_std_mass_asym", "")))
             val_avg_asym.append(_parse_float(row.get("val_avg_mass_asym", "")))
             val_std_asym.append(_parse_float(row.get("val_std_mass_asym", "")))
+            # isr_acc / grp_acc are only non-zero for factored (7-jet ISR) models.
+            # Older logs write 0 for these columns; treat 0 same as missing so that
+            # non-factored runs don't produce flat zero lines in the plots.
+            train_isr_acc.append(_parse_float(row.get("train_isr_acc", "")))
+            val_isr_acc.append(_parse_float(row.get("val_isr_acc", "")))
             train_grp_acc.append(_parse_float(row.get("train_grp_acc", "")))
             val_grp_acc.append(_parse_float(row.get("val_grp_acc", "")))
             train_avg_mpt.append(_parse_float(row.get("train_avg_max_triplet_pt", "")))
@@ -1692,13 +1698,30 @@ def _plot_training_curves(
     saved_paths.append(loss_path)
 
     # --- Accuracy plot ---
+    # Shows:
+    #   - Full assignment accuracy: fraction of events where argmax(logits) matches
+    #     the truth label (which encodes the complete ISR + group1 + group2 triple).
+    #   - ISR accuracy (factored models only): fraction where the ISR jet is correctly
+    #     identified, independent of whether the grouping is also correct.
+    import math as _math
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(epochs, train_acc, label="Train acc", color="steelblue")
-    ax.plot(epochs, val_acc, label="Val acc", color="darkorange")
+    ax.plot(epochs, train_acc, label="Train: full assignment acc", color="steelblue")
+    ax.plot(epochs, val_acc,   label="Val:   full assignment acc", color="darkorange")
+    # Add ISR accuracy curves when the model is factored (ISR + grouping) and the
+    # CSV columns are present and non-zero (non-factored runs log 0 for these).
+    isr_has_data = any(v > 0 for v in val_isr_acc if not _math.isnan(v))
+    if isr_has_data:
+        ax.plot(epochs, train_isr_acc, label="Train: ISR jet acc",
+                color="steelblue", linestyle="--", alpha=0.7)
+        ax.plot(epochs, val_isr_acc,   label="Val:   ISR jet acc",
+                color="darkorange", linestyle="--", alpha=0.7)
     _add_phase_lines(ax)
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Accuracy")
-    ax.set_title("Accuracy vs Epoch")
+    ax.set_ylabel("Fraction of events correct")
+    ax.set_title(
+        "Assignment Accuracy vs Epoch\n"
+        "(full assignment = correct ISR jet + correct 3+3 grouping)"
+    )
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -1709,7 +1732,6 @@ def _plot_training_curves(
     saved_paths.append(acc_path)
 
     # --- Mass asymmetry plot (only when data are available) ---
-    import math as _math
     # Filter to rows where at least the val mean is a real number.
     asym_epochs = [e for e, v in zip(epochs, val_avg_asym) if not _math.isnan(v)]
     if asym_epochs:
@@ -1752,7 +1774,11 @@ def _plot_training_curves(
         print(f"  -> Saved mass asym plot: {asym_path}")
         saved_paths.append(asym_path)
 
-    # --- GRP score (grouping accuracy) plot – only for factored (ISR) models ---
+    # --- GRP score (oracle grouping accuracy) plot – only for factored (ISR) models.
+    # NOTE: grp_acc is *oracle-conditioned* — the grouping head is evaluated using the
+    # *truth* ISR jet index, not the model's predicted ISR.  It answers the question
+    # "given perfect ISR identification, how often does the grouping head choose the
+    # right 3+3 split?"  It is NOT the end-to-end assignment accuracy.
     import math as _math2
     grp_epochs = [e for e, v in zip(epochs, val_grp_acc) if not _math2.isnan(v) and v > 0]
     if grp_epochs:
@@ -1761,12 +1787,15 @@ def _plot_training_curves(
         grp_val   = [v for e, v in zip(epochs, val_grp_acc)
                      if e in set(grp_epochs) and not _math2.isnan(v)]
         fig, ax = plt.subplots(figsize=(9, 5))
-        ax.plot(grp_epochs, grp_train, label="Train grp acc", color="steelblue")
-        ax.plot(grp_epochs, grp_val, label="Val grp acc", color="darkorange")
+        ax.plot(grp_epochs, grp_train, label="Train grp acc (oracle)", color="steelblue")
+        ax.plot(grp_epochs, grp_val,   label="Val grp acc (oracle)",   color="darkorange")
         _add_phase_lines(ax)
         ax.set_xlabel("Epoch")
-        ax.set_ylabel("Grouping accuracy")
-        ax.set_title("GRP Score (Grouping Accuracy) vs Epoch")
+        ax.set_ylabel("Grouping accuracy (oracle: given truth ISR jet)")
+        ax.set_title(
+            "Grouping Accuracy (Oracle) vs Epoch\n"
+            "(correct 3+3 grouping, conditioned on knowing the truth ISR jet)"
+        )
         ax.legend()
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
@@ -1900,12 +1929,48 @@ def _run_epoch(
 ):
     """Run one epoch of training or validation.
 
-    When *phase1_only* is True (Phase 1 training only), the loss is restricted
-    to the classical-distillation term.  All other auxiliary losses (CE, ISR,
-    sym, qcd, adversary) are skipped so that the model focuses exclusively on
-    replicating the argmin-mass-asymmetry heuristic.  Accuracy is still
-    measured the normal way (argmax logits vs ground-truth label) in both
-    phases so that the plateau detector works correctly.
+    Accuracy metrics returned in the result dict
+    ─────────────────────────────────────────────
+    ``acc``
+        **Full assignment accuracy** — fraction of events where
+        ``logits.argmax() == label``.  The label encodes the complete
+        (ISR jet, group1, group2) triple, so this is 1 only when the model
+        correctly identifies *both* the ISR jet *and* the 3+3 grouping.
+        This is the primary correctness metric used for checkpointing and
+        is what the accuracy plot shows.
+
+    ``acc5``
+        Top-5 assignment accuracy — fraction where the correct label is in
+        the five highest-scoring assignments.
+
+    ``isr_acc`` (factored models only)
+        ISR jet identification accuracy — fraction of events where
+        ``isr_logits.argmax() == truth_isr_jet_index``, regardless of
+        whether the grouping is also correct.
+
+    ``grp_acc`` (factored models only)
+        **Oracle-conditioned grouping accuracy** — the grouping head is
+        evaluated using the *truth* ISR jet index rather than the model's
+        own ISR prediction.  Answers "given perfect ISR identification,
+        how often does the grouping head choose the right 3+3 split?"
+        This is NOT an end-to-end metric; it is reported as a training
+        diagnostic to monitor grouping-head learning independently of ISR
+        quality.  During Phase 1 the ISR head is frozen at random weights,
+        so ``isr_acc`` ≈ 1/num_jets and ``acc`` ≈ 1/num_assignments, but
+        ``grp_acc`` correctly reflects grouping-head progress.
+
+    ``pred_correct_values``
+        Boolean array (one entry per validation event) equal to
+        ``logits.argmax() == label`` — identical to ``acc`` per event.
+        Used to split histogram bars in the GIF animations into
+        correct/incorrect stacks.
+
+    When *phase1_only* is True (Phase 1 training only), the loss is
+    restricted to the classical-distillation term.  All other auxiliary
+    losses (CE, ISR, sym, qcd, adversary) are skipped so that the model
+    focuses exclusively on replicating the argmin-mass-asymmetry heuristic.
+    All accuracy metrics are still computed the normal way so that the
+    plateau detector and monitoring work correctly.
     """
     total_loss = 0.0
     total_correct = 0

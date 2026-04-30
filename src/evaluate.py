@@ -147,7 +147,10 @@ def evaluate(
 
     n_events = len(all_preds)
 
-    # Compute ML accuracy
+    # Compute ML accuracy.
+    # "Full assignment accuracy": correct when argmax(logits) matches the label,
+    # which encodes the complete (ISR jet, group1_jets, group2_jets) triple.
+    # This is 1 only when BOTH the ISR jet AND the 3+3 grouping are right.
     correct = (all_preds == all_labels).sum().item()
     accuracy = correct / n_events
     num_assignments = all_logits.shape[1]
@@ -155,8 +158,33 @@ def evaluate(
     _, top5 = all_logits.topk(topk, dim=-1)
     acc5 = (top5 == all_labels.unsqueeze(-1)).any(dim=-1).float().mean().item()
     print(f"Num assignments: {num_assignments} ({dc['num_jets']} jets)")
-    print(f"[ML]      Top-1 accuracy: {accuracy:.4f} ({correct}/{n_events})")
-    print(f"[ML]      Top-{topk} accuracy: {acc5:.4f}")
+    print(f"[ML]      Full assignment top-1 accuracy: {accuracy:.4f} ({correct}/{n_events})")
+    print(f"[ML]      Full assignment top-{topk} accuracy: {acc5:.4f}")
+
+    # For factored (7-jet ISR) models report ISR accuracy separately so that
+    # ISR identification and grouping performance can be distinguished.
+    if model.has_isr:
+        truth_isr = model.flat_to_factored[all_labels, 0]   # (N,) truth ISR jet index
+        # The flat-logit argmax already encodes the combined ISR+grouping prediction;
+        # extract the predicted ISR by looking up its factored index.
+        pred_isr = model.flat_to_factored[all_preds, 0]     # (N,) predicted ISR jet index
+        isr_correct = (pred_isr == truth_isr).sum().item()
+        isr_acc = isr_correct / n_events
+        # Oracle grouping accuracy: given the TRUTH ISR, does the grouping head pick
+        # the right 3+3 split?  This is an upper bound on the end-to-end accuracy.
+        truth_grp = model.flat_to_factored[all_labels, 1]
+        pred_grp  = model.flat_to_factored[all_preds,  1]
+        # Grouping acc conditioned on ISR being correct
+        isr_ok_mask = (pred_isr == truth_isr)
+        grp_given_isr = (
+            (pred_grp[isr_ok_mask] == truth_grp[isr_ok_mask]).sum().item()
+            / max(isr_ok_mask.sum().item(), 1)
+        )
+        print(f"[ML]      ISR jet accuracy:               {isr_acc:.4f} ({isr_correct}/{n_events})")
+        print(
+            f"[ML]      Grouping accuracy | ISR correct: {grp_given_isr:.4f} "
+            f"(non-oracle, {isr_ok_mask.sum().item()} ISR-correct events)"
+        )
 
     # --- Staged classical solver ---
     all_classical_preds = None
@@ -248,13 +276,29 @@ def evaluate(
     # Save results
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
+    # Pre-compute per-event ISR correct flag (only for factored models).
+    has_isr_model = model.has_isr
+    if has_isr_model:
+        _pred_isr_all = model.flat_to_factored[all_preds, 0]
+        _truth_isr_all = model.flat_to_factored[all_labels, 0]
+        isr_correct_per_event = (_pred_isr_all == _truth_isr_all).numpy()
+    else:
+        isr_correct_per_event = None
+
     # Mass distributions as CSV
     csv_path = Path(output_dir) / "mass_reconstruction.csv"
     has_classical = all_classical_preds is not None
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
+        # "correct" = full assignment correct (ISR jet + grouping both right).
+        # "isr_correct" = only the ISR jet identification is right (factored models).
         header = [
-            "event_idx", "pred_assignment", "truth_assignment", "correct",
+            "event_idx", "pred_assignment", "truth_assignment",
+            "correct",
+        ]
+        if has_isr_model:
+            header += ["isr_correct"]
+        header += [
             "mass1_pred", "mass2_pred", "mass_avg_pred",
             "mass1_truth", "mass2_truth", "mass_avg_truth",
         ]
@@ -268,6 +312,10 @@ def evaluate(
             row = [
                 i, all_preds[i].item(), all_labels[i].item(),
                 int(all_preds[i].item() == all_labels[i].item()),
+            ]
+            if has_isr_model:
+                row += [int(isr_correct_per_event[i])]
+            row += [
                 f"{mass1_pred[i]:.2f}", f"{mass2_pred[i]:.2f}", f"{mass_avg_pred[i]:.2f}",
                 f"{mass1_truth[i]:.2f}", f"{mass2_truth[i]:.2f}", f"{mass_avg_truth[i]:.2f}",
             ]
@@ -281,7 +329,9 @@ def evaluate(
                 ]
             writer.writerow(row)
 
-    # Summary numpy arrays (for quick plotting)
+    # Summary numpy arrays (for quick plotting).
+    # ``correct``     : bool array — full assignment correct (ISR + grouping).
+    # ``isr_correct`` : bool array — only ISR jet correct (factored models only).
     npz_kwargs = dict(
         mass_avg_pred=np.array(mass_avg_pred),
         mass_avg_truth=np.array(mass_avg_truth),
@@ -289,6 +339,8 @@ def evaluate(
         mass2_pred=np.array(mass2_pred),
         correct=np.array([all_preds[i].item() == all_labels[i].item() for i in range(n_events)]),
     )
+    if has_isr_model:
+        npz_kwargs["isr_correct"] = isr_correct_per_event
     if has_classical:
         npz_kwargs["mass_avg_classical"] = np.array(mass_avg_classical)
         npz_kwargs["mass1_classical"] = np.array(mass1_classical)
