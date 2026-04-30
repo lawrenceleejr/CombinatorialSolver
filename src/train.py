@@ -1342,14 +1342,14 @@ def _make_delta_phi_gif(
     gif_path = Path(gif_path)
 
     import numpy as np
-    import math as _math_dphi
+    import math as _math_gif
 
     def _unpack(entry):
         if len(entry) == 4:
             return entry
         return entry[0], entry[1], entry[2], None
 
-    x_min, x_max = 0.0, _math_dphi.pi
+    x_min, x_max = 0.0, _math_gif.pi
     n_bins = 50
     bin_edges = np.linspace(x_min, x_max, n_bins + 1)
 
