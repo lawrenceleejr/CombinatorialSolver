@@ -15,7 +15,14 @@ Architecture:
   4. Flat scoring (6 jets): direct 10-way classification
   5. Adversarial mass decorrelation head (gradient reversal)
   6. GroupTransformer: intra-group mini-Transformer replaces sum-pooling to capture
-     multi-particle angular correlations within each candidate 3-jet group
+     multi-particle angular correlations within each candidate 3-jet group.
+     Inspired by arXiv:2202.03772, per-group intra-group physics observables
+     (9 features: pT hierarchy, Lund kT, ECF₂/ECF₃/D₂, Dalitz ratios) are
+     computed directly from raw kinematics and projected to a d_model-dimensional
+     conditioning token that is appended to each group's jet-embedding sequence
+     BEFORE the GroupTransformer self-attention.  This lets the intra-group
+     attention condition on global physics context while the features themselves
+     are computed late (from raw 4-momenta, not from the latent space).
   7. Extended physics features per assignment:
      - 6 inter-group features (mass sum/asymmetry/ratio, deltaR, individual masses)
      - 9 intra-group features per group (pT hierarchy, Lund-plane kT, ECF₂/ECF₃/D₂,
@@ -54,11 +61,15 @@ class GradientReversalLayer(nn.Module):
 
 
 class GroupTransformer(nn.Module):
-    """Mini Transformer to pool a fixed-size set of jet embeddings.
+    """Mini Transformer to pool a set of jet (+ optional physics) embeddings.
 
-    Applies num_layers Transformer layers over the jets in a candidate group
+    Applies num_layers Transformer layers over the tokens in a candidate group
     and returns the mean-pooled representation, capturing intra-group angular
     structure and relative momentum ordering that sum-pooling discards.
+
+    The sequence length is variable: callers may append a physics conditioning
+    token to the 3 jet-embedding tokens so that the intra-group attention can
+    condition on raw-kinematics-derived observables (arXiv:2202.03772 style).
     """
 
     def __init__(
@@ -80,10 +91,11 @@ class GroupTransformer(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Pool a set of jet embeddings via Transformer + mean-readout.
+        """Pool a sequence of tokens via Transformer + mean-readout.
 
         Args:
-            x: (N, n_jets_in_group, d_model)
+            x: (N, seq_len, d_model)  seq_len is 3 (jets only) or 4 (jets +
+               physics conditioning token)
 
         Returns:
             (N, d_model) pooled group representation
@@ -104,8 +116,14 @@ class JetAssignmentTransformer(nn.Module):
     For 6 jets (no ISR):
       - Direct 10-way assignment scoring
 
-    Group pooling uses a shared GroupTransformer (mini-Transformer) rather than
-    sum-pooling to preserve intra-group angular structure.
+    Group pooling uses a shared GroupTransformer (mini-Transformer).  Before
+    each GroupTransformer call the 9 per-group intra-group physics observables
+    (pT hierarchy, Lund kT, ECF₂/ECF₃/D₂, Dalitz ratios) are computed from
+    raw kinematics and projected to a d_model conditioning token that is
+    appended to the 3 jet-embedding tokens.  The intra-group self-attention
+    therefore sees [jet₁, jet₂, jet₃, phys_cond] and can condition on
+    physics-derived context while those features remain anchored to the raw
+    four-momenta rather than to the latent space.
 
     Physics features per assignment include 6 inter-group features plus 9
     intra-group features per group (18 total), giving n_group_physics=24.
@@ -157,6 +175,16 @@ class JetAssignmentTransformer(nn.Module):
             nhead=group_nhead,
             num_layers=group_num_layers,
             dropout=dropout,
+        )
+
+        # Number of intra-group physics features (per group) used as conditioning.
+        # These 9 features (pT hierarchy, Lund kT, ECF₂/ECF₃/D₂, Dalitz ratios)
+        # are computed from raw kinematics before GroupTransformer self-attention
+        # and projected to d_model so the attention can condition on them.
+        self.n_intra_physics = 9
+        self.group_physics_proj = nn.Sequential(
+            nn.Linear(self.n_intra_physics, d_model),
+            nn.GELU(),
         )
 
         # 6 inter-group features + 9 intra-group features per group × 2 groups = 24
@@ -491,9 +519,13 @@ class JetAssignmentTransformer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Score all groupings for each ISR choice.
 
-        Group embeddings are pooled via the shared GroupTransformer (one layer of
-        self-attention over the 3 jets in each candidate group) instead of
-        sum-pooling, preserving intra-group angular ordering.
+        Per-group intra-group physics observables (9 features each) are computed
+        from raw kinematics BEFORE the GroupTransformer self-attention and
+        projected to a d_model conditioning token that is appended to the 3
+        jet-embedding tokens.  The GroupTransformer therefore attends over
+        [jet₁, jet₂, jet₃, phys_cond], allowing intra-group attention to
+        condition on physics context while the features remain tied to raw
+        four-momenta (arXiv:2202.03772-inspired late-physics injection).
 
         Also produces a per-ISR-candidate summary of grouping features via
         attention-weighted pooling (softmax over grouping scores), enabling
@@ -512,26 +544,60 @@ class JetAssignmentTransformer(nn.Module):
         g1_flat = self.f_group1.reshape(-1, 3)
         g2_flat = self.f_group2.reshape(-1, 3)
 
+        # ── gather jet embeddings ──────────────────────────────────────────
         je = jet_embeddings.unsqueeze(1).expand(-1, n_combos, -1, -1)
-        g1_idx = g1_flat.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, -1, self.d_model)
-        g2_idx = g2_flat.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, -1, self.d_model)
+        g1_idx_emb = g1_flat.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, -1, self.d_model)
+        g2_idx_emb = g2_flat.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, -1, self.d_model)
 
-        g1_jets_emb = torch.gather(je, 2, g1_idx)   # (batch, n_combos, 3, d_model)
-        g2_jets_emb = torch.gather(je, 2, g2_idx)
+        g1_jets_emb = torch.gather(je, 2, g1_idx_emb)   # (batch, n_combos, 3, d_model)
+        g2_jets_emb = torch.gather(je, 2, g2_idx_emb)
 
-        # Intra-group attention pooling via shared GroupTransformer
+        # ── gather raw 4-momenta for physics conditioning ──────────────────
+        fm = four_momenta[:, :, :4].unsqueeze(1).expand(-1, n_combos, -1, -1)
+        g1_idx_4 = g1_flat.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, -1, 4)
+        g2_idx_4 = g2_flat.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, -1, 4)
+
+        g1_jets_4mom = torch.gather(fm, 2, g1_idx_4)    # (batch, n_combos, 3, 4)
+        g2_jets_4mom = torch.gather(fm, 2, g2_idx_4)
+
+        # ── intra physics → conditioning token (BEFORE GroupTransformer) ───
+        # Shape: (batch*n_combos, 3, 4) → intra_group_features → (batch, n_combos, 9)
+        g1_intra = self.intra_group_features(
+            g1_jets_4mom.reshape(batch_size * n_combos, 3, 4)
+        ).reshape(batch_size, n_combos, self.n_intra_physics)
+        g2_intra = self.intra_group_features(
+            g2_jets_4mom.reshape(batch_size * n_combos, 3, 4)
+        ).reshape(batch_size, n_combos, self.n_intra_physics)
+
+        # Project 9-dim intra physics to d_model; reshape to (batch, n_combos, 1, d_model)
+        g1_phys_tok = self.group_physics_proj(
+            g1_intra.reshape(batch_size * n_combos, self.n_intra_physics)
+        ).reshape(batch_size, n_combos, 1, self.d_model)
+        g2_phys_tok = self.group_physics_proj(
+            g2_intra.reshape(batch_size * n_combos, self.n_intra_physics)
+        ).reshape(batch_size, n_combos, 1, self.d_model)
+
+        # Append physics conditioning token: [jet₁, jet₂, jet₃, phys_cond]
+        g1_input = torch.cat([g1_jets_emb, g1_phys_tok], dim=2)  # (batch, n_combos, 4, d_model)
+        g2_input = torch.cat([g2_jets_emb, g2_phys_tok], dim=2)
+
+        # ── GroupTransformer over 4-token sequences ────────────────────────
         g1_pooled = self.group_transformer(
-            g1_jets_emb.contiguous().reshape(batch_size * n_combos, 3, self.d_model)
+            g1_input.contiguous().reshape(batch_size * n_combos, 4, self.d_model)
         ).reshape(batch_size, n_combos, self.d_model)
         g2_pooled = self.group_transformer(
-            g2_jets_emb.contiguous().reshape(batch_size * n_combos, 3, self.d_model)
+            g2_input.contiguous().reshape(batch_size * n_combos, 4, self.d_model)
         ).reshape(batch_size, n_combos, self.d_model)
 
         sym_sum = g1_pooled + g2_pooled
         sym_prod = g1_pooled * g2_pooled
         sym_diff = (g1_pooled - g2_pooled).abs()
 
-        physics = self._group_physics_factored(four_momenta)  # (batch, n_combos, n_group_physics)
+        # ── full 24-feature physics (computed from already-gathered 4-momenta) ──
+        g1_4vec = g1_jets_4mom.sum(dim=2)   # (batch, n_combos, 4)
+        g2_4vec = g2_jets_4mom.sum(dim=2)
+        physics = self._mass_features(g1_4vec, g2_4vec, g1_jets_4mom, g2_jets_4mom)
+        # (batch, n_combos, n_group_physics=24)
 
         # Extract raw mass sum and asymmetry BEFORE LayerNorm so that the
         # across-assignment ranking (argmin mass_asym = classical best assignment)
@@ -581,6 +647,11 @@ class JetAssignmentTransformer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Flat scoring for 6-jet mode.
 
+        Per-group intra-group physics observables are injected as a conditioning
+        token into the GroupTransformer sequence (same mechanism as
+        _compute_grouping_logits) so that intra-group attention can condition
+        on raw-kinematics-derived physics context.
+
         Returns:
             logits: (batch, num_assignments)
             mass_asym_flat: (batch, num_assignments)
@@ -589,29 +660,19 @@ class JetAssignmentTransformer(nn.Module):
         batch_size = jet_embeddings.shape[0]
         na = self.num_assignments
 
+        # ── gather jet embeddings ──────────────────────────────────────────
         je = jet_embeddings.unsqueeze(1).expand(-1, na, -1, -1)
-        g1_idx = self.group1_indices.unsqueeze(0).unsqueeze(-1).expand(
+        g1_idx_emb = self.group1_indices.unsqueeze(0).unsqueeze(-1).expand(
             batch_size, -1, -1, self.d_model
         )
-        g2_idx = self.group2_indices.unsqueeze(0).unsqueeze(-1).expand(
+        g2_idx_emb = self.group2_indices.unsqueeze(0).unsqueeze(-1).expand(
             batch_size, -1, -1, self.d_model
         )
 
-        g1_jets_emb = torch.gather(je, 2, g1_idx)   # (batch, na, 3, d_model)
-        g2_jets_emb = torch.gather(je, 2, g2_idx)
+        g1_jets_emb = torch.gather(je, 2, g1_idx_emb)   # (batch, na, 3, d_model)
+        g2_jets_emb = torch.gather(je, 2, g2_idx_emb)
 
-        # Intra-group attention pooling via shared GroupTransformer
-        g1_pooled = self.group_transformer(
-            g1_jets_emb.contiguous().reshape(batch_size * na, 3, self.d_model)
-        ).reshape(batch_size, na, self.d_model)
-        g2_pooled = self.group_transformer(
-            g2_jets_emb.contiguous().reshape(batch_size * na, 3, self.d_model)
-        ).reshape(batch_size, na, self.d_model)
-
-        sym_sum = g1_pooled + g2_pooled
-        sym_prod = g1_pooled * g2_pooled
-        sym_diff = (g1_pooled - g2_pooled).abs()
-
+        # ── gather raw 4-momenta ──────────────────────────────────────────
         fm = four_momenta[:, :, :4].unsqueeze(1).expand(-1, na, -1, -1)
         g1_4idx = self.group1_indices.unsqueeze(0).unsqueeze(-1).expand(
             batch_size, -1, -1, 4
@@ -621,6 +682,38 @@ class JetAssignmentTransformer(nn.Module):
         )
         g1_jets = torch.gather(fm, 2, g1_4idx)      # (batch, na, 3, 4)
         g2_jets = torch.gather(fm, 2, g2_4idx)
+
+        # ── intra physics → conditioning token (BEFORE GroupTransformer) ───
+        g1_intra = self.intra_group_features(
+            g1_jets.reshape(batch_size * na, 3, 4)
+        ).reshape(batch_size, na, self.n_intra_physics)
+        g2_intra = self.intra_group_features(
+            g2_jets.reshape(batch_size * na, 3, 4)
+        ).reshape(batch_size, na, self.n_intra_physics)
+
+        g1_phys_tok = self.group_physics_proj(
+            g1_intra.reshape(batch_size * na, self.n_intra_physics)
+        ).reshape(batch_size, na, 1, self.d_model)
+        g2_phys_tok = self.group_physics_proj(
+            g2_intra.reshape(batch_size * na, self.n_intra_physics)
+        ).reshape(batch_size, na, 1, self.d_model)
+
+        # Append physics conditioning token: [jet₁, jet₂, jet₃, phys_cond]
+        g1_input = torch.cat([g1_jets_emb, g1_phys_tok], dim=2)  # (batch, na, 4, d_model)
+        g2_input = torch.cat([g2_jets_emb, g2_phys_tok], dim=2)
+
+        # ── GroupTransformer over 4-token sequences ────────────────────────
+        g1_pooled = self.group_transformer(
+            g1_input.contiguous().reshape(batch_size * na, 4, self.d_model)
+        ).reshape(batch_size, na, self.d_model)
+        g2_pooled = self.group_transformer(
+            g2_input.contiguous().reshape(batch_size * na, 4, self.d_model)
+        ).reshape(batch_size, na, self.d_model)
+
+        sym_sum = g1_pooled + g2_pooled
+        sym_prod = g1_pooled * g2_pooled
+        sym_diff = (g1_pooled - g2_pooled).abs()
+
         g1_4vec = g1_jets.sum(dim=2)
         g2_4vec = g2_jets.sum(dim=2)
 

@@ -7,13 +7,15 @@ Given 7 leading jets per event, the model identifies which jet is ISR and assign
 ## Architecture
 
 - **Input**: 7 jets as (E, px, py, pz) four-vectors, normalized by event HT
-- **Encoder**: Transformer with self-attention over jet tokens (4 layers, 8 heads, d=128) plus per-head learnable pT-hierarchy attention bias (log pT_i/pT_j)
-- **GroupTransformer**: Shared mini-Transformer (1 layer, 4 heads) replaces sum-pooling for group embeddings, preserving intra-group angular ordering and multi-particle correlations
-- **Scorer**: Enumerates all 70 possible (ISR, group1, group2) assignments, pools jet embeddings per group with the GroupTransformer, scores with an MLP. Group symmetry is handled via sum and Hadamard product of the two group embeddings.
-- **Extended physics features** (`n_group_physics=24`) per assignment:
+- **Encoder**: Transformer with self-attention over jet tokens (6 layers, 8 heads, d=256) plus per-head learnable pT-hierarchy attention bias (log pT_i/pT_j)
+- **Physics-Conditioned GroupTransformer** *(inspired by [arXiv:2202.03772](https://arxiv.org/abs/2202.03772))*: Shared mini-Transformer (2 layers, 4 heads) for intra-group attention pooling. Before each GroupTransformer call the 9 per-group intra-group physics observables (pT hierarchy, Lund kT, ECF₂/ECF₃/D₂, Dalitz ratios) are computed directly from raw kinematics, projected to `d_model` via a shared `group_physics_proj` (Linear→GELU), and appended as a 4th conditioning token to the 3 jet-embedding tokens. The intra-group self-attention therefore sees **[jet₁, jet₂, jet₃, phys_cond]** and can condition on physics-derived context while those features remain anchored to the raw four-momenta rather than the latent space.
+- **Scorer**: Enumerates all 70 possible (ISR, group1, group2) assignments, pools jet embeddings per group with the GroupTransformer, scores with an MLP. Group symmetry is handled via sum, Hadamard product, and absolute difference of the two group embeddings.
+- **Extended physics features** (`n_group_physics=24`) per assignment (also fed to scorer MLP after LayerNorm):
   - *6 inter-group*: mass sum, mass asymmetry |m1-m2|/(m1+m2), mass ratio, m1, m2, ΔR between group CoM
   - *9 intra-group × 2 groups = 18*: max pT ratio, pT coefficient of variation, minimum Lund splitting fraction z, maximum Lund kT, ECF₂(β=1), ECF₃(β=1), D₂ = ECF₃/ECF₂², max and min Dalitz pairwise mass ratio
 - **Adversarial head**: Gradient-reversed MLP predicts parent mass from jet embeddings — penalizes the encoder if mass information leaks, preventing sculpting of the m_avg distribution.
+
+See [`architecture_diagram.pdf`](architecture_diagram.pdf) for a full data-flow diagram.
 
 ## Training Losses
 

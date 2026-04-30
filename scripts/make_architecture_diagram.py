@@ -1,356 +1,459 @@
 """
-Generate a PDF diagram of the JetAssignmentTransformer network architecture.
-
-Illustrates the data flow, where physics features are computed, and how the
-GroupTransformer can access that information – as discussed in arXiv:2202.03772.
+Professional architecture diagram for JetAssignmentTransformer.
+Physics-conditioned GroupTransformer (arXiv:2202.03772-inspired).
 """
-
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
+from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+from matplotlib.colors import LinearSegmentedColormap
+import matplotlib.patheffects as pe
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Colour palette
-# ---------------------------------------------------------------------------
-C_INPUT    = "#AED6F1"   # light blue
-C_ENCODER  = "#A9DFBF"   # light green
-C_GROUP    = "#F9E79F"   # light yellow – GroupTransformer
-C_PHYSICS  = "#F1948A"   # light red   – physics features
-C_SCORER   = "#D7BDE2"   # light purple – scorer MLPs
-C_OUTPUT   = "#D5D8DC"   # light grey   – outputs
-C_ISR      = "#FAD7A0"   # light orange – ISR head
-C_ADV      = "#FDFEFE"   # white-ish    – adversary
+# ── palette (dark-theme scientific) ─────────────────────────────────────────
+BG          = "#0D1117"   # page background
+PANEL_BG    = "#161B22"   # module panel background
+BORDER      = "#30363D"   # panel border
+ACCENT_BLUE = "#58A6FF"   # main accent
+ACCENT_GRN  = "#3FB950"   # secondary accent
+ACCENT_ORG  = "#F0883E"   # physics / warm accent
+ACCENT_RED  = "#FF7B72"   # new feature / highlight
+ACCENT_PUR  = "#BC8CFF"   # ISR / output
+ACCENT_TEA  = "#39D353"   # outputs
+TEXT_MAIN   = "#E6EDF3"
+TEXT_DIM    = "#8B949E"
+TEXT_TINY   = "#6E7681"
+ARROW_CLR   = "#8B949E"
+NEW_CLR     = "#FF7B72"   # the new physics-conditioning path
 
-ARROW_KW = dict(arrowstyle="-|>", color="#333333", lw=1.5,
-                connectionstyle="arc3,rad=0.0",
-                mutation_scale=14)
-CURVED_KW = dict(arrowstyle="-|>", color="#E74C3C", lw=1.5,
-                 connectionstyle="arc3,rad=0.35",
-                 mutation_scale=14)
-
-def box(ax, x, y, w, h, label, sublabel="", color="#FFFFFF",
-        fontsize=8, sublabel_fontsize=6.5, radius=0.03):
-    """Draw a rounded rectangle with centred label and optional sublabel."""
-    patch = FancyBboxPatch(
-        (x - w / 2, y - h / 2), w, h,
-        boxstyle=f"round,pad={radius}",
-        facecolor=color, edgecolor="#555555", linewidth=1.2, zorder=3,
-    )
-    ax.add_patch(patch)
-    if sublabel:
-        ax.text(x, y + h * 0.13, label, ha="center", va="center",
-                fontsize=fontsize, fontweight="bold", zorder=4)
-        ax.text(x, y - h * 0.25, sublabel, ha="center", va="center",
-                fontsize=sublabel_fontsize, color="#555555", zorder=4,
-                style="italic")
-    else:
-        ax.text(x, y, label, ha="center", va="center",
-                fontsize=fontsize, fontweight="bold", zorder=4)
-    return (x, y, w, h)
-
-def arrow(ax, x0, y0, x1, y1, curved=False, label="", color="#333333", rad=0.0):
-    style = f"arc3,rad={rad}"
-    kw = dict(arrowstyle="-|>", color=color, lw=1.5,
-              connectionstyle=style, mutation_scale=14, zorder=5)
-    ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
-                arrowprops=kw)
-    if label:
-        mx, my = (x0 + x1) / 2, (y0 + y1) / 2
-        ax.text(mx + 0.04, my, label, fontsize=5.5, color=color, zorder=6,
-                ha="left", va="center",
-                bbox=dict(boxstyle="round,pad=0.15", fc="white",
-                          ec="none", alpha=0.8))
-
-# ---------------------------------------------------------------------------
-# Figure layout
-# ---------------------------------------------------------------------------
-fig, ax = plt.subplots(figsize=(14, 18))
-ax.set_xlim(0, 14)
-ax.set_ylim(0, 18)
+fig_w, fig_h = 22, 30
+fig = plt.figure(figsize=(fig_w, fig_h), facecolor=BG)
+ax  = fig.add_axes([0, 0, 1, 1])
+ax.set_xlim(0, fig_w)
+ax.set_ylim(0, fig_h)
+ax.set_facecolor(BG)
 ax.axis("off")
-fig.patch.set_facecolor("#FAFAFA")
 
-# Column centres
-XL   = 3.5    # left column  (main flow)
-XR   = 10.5   # right column (grouping / scoring detail)
-XM   = 7.0    # middle – links / physics
+# ── helpers ──────────────────────────────────────────────────────────────────
+def rbox(ax, cx, cy, w, h, title, body="", accent=ACCENT_BLUE,
+         title_size=10, body_size=7.5, alpha_face=0.12):
+    """Rounded box with coloured left-edge accent strip."""
+    x0, y0 = cx - w / 2, cy - h / 2
+    # shadow
+    shadow = FancyBboxPatch((x0 + 0.06, y0 - 0.06), w, h,
+                            boxstyle="round,pad=0.15",
+                            fc="#000000", ec="none", alpha=0.35, zorder=2)
+    ax.add_patch(shadow)
+    # main fill
+    face = FancyBboxPatch((x0, y0), w, h,
+                          boxstyle="round,pad=0.15",
+                          fc=accent, ec=accent, alpha=alpha_face, zorder=3,
+                          linewidth=0)
+    ax.add_patch(face)
+    # border
+    border = FancyBboxPatch((x0, y0), w, h,
+                            boxstyle="round,pad=0.15",
+                            fc="none", ec=accent, alpha=0.7, zorder=4,
+                            linewidth=1.4)
+    ax.add_patch(border)
+    # accent left strip
+    strip = FancyBboxPatch((x0, y0 + h * 0.05), 0.12, h * 0.9,
+                           boxstyle="round,pad=0.04",
+                           fc=accent, ec="none", alpha=0.9, zorder=5)
+    ax.add_patch(strip)
+    # title
+    ax.text(cx + 0.1, cy if not body else cy + h * 0.22,
+            title, ha="center", va="center",
+            fontsize=title_size, color=TEXT_MAIN, fontweight="bold",
+            fontfamily="monospace", zorder=6)
+    if body:
+        ax.text(cx + 0.1, cy - h * 0.18,
+                body, ha="center", va="center",
+                fontsize=body_size, color=TEXT_DIM,
+                fontfamily="monospace", linespacing=1.5, zorder=6)
 
-# ---------------------------------------------------------------------------
-# ── INPUT ──────────────────────────────────────────────────────────────────
-# ---------------------------------------------------------------------------
-Y_INPUT = 16.8
-box(ax, XL, Y_INPUT, 4.5, 0.7,
-    "7 Jets  (E, px, py, pz)",
-    sublabel="normalized by event HT",
-    color=C_INPUT, fontsize=9)
 
-# Input projection
-Y_PROJ = 15.6
-box(ax, XL, Y_PROJ, 4.5, 0.7,
-    "Linear Projection  +  Positional Embedding",
-    sublabel="(E,px,py,pz)  →  d_model = 256",
-    color=C_INPUT)
-arrow(ax, XL, Y_INPUT - 0.35, XL, Y_PROJ + 0.35)
+def dim_tag(ax, cx, cy, txt, color=TEXT_TINY, size=6.5):
+    """Small dimension annotation."""
+    ax.text(cx, cy, txt, ha="center", va="center",
+            fontsize=size, color=color, fontfamily="monospace",
+            bbox=dict(boxstyle="round,pad=0.2", fc=PANEL_BG, ec=BORDER,
+                      linewidth=0.8, alpha=0.92),
+            zorder=10)
 
-# ---------------------------------------------------------------------------
-# ── TRANSFORMER ENCODER ─────────────────────────────────────────────────────
-# ---------------------------------------------------------------------------
-Y_ENC = 14.2
-box(ax, XL, Y_ENC, 4.5, 0.9,
-    "Transformer Encoder",
-    sublabel="6 layers, 8 heads, d=256  ·  pT-hierarchy attention bias",
-    color=C_ENCODER, fontsize=9)
-arrow(ax, XL, Y_PROJ - 0.35, XL, Y_ENC + 0.45)
 
-# ---------------------------------------------------------------------------
-# ── ENUMERATE 70 ASSIGNMENTS ────────────────────────────────────────────────
-# ---------------------------------------------------------------------------
-Y_ENUM = 12.85
-box(ax, XL, Y_ENUM, 4.5, 0.7,
-    "Enumerate All 70 Assignments",
-    sublabel="(ISR jet j) × (grouping k)  →  n_combos = 7 × 10",
-    color=C_ENCODER)
-arrow(ax, XL, Y_ENC - 0.45, XL, Y_ENUM + 0.35)
+def arr(ax, x0, y0, x1, y1, color=ARROW_CLR, lw=1.5, rad=0.0,
+        style="-|>", label="", label_side="right", lbl_size=6.5,
+        dashed=False):
+    ls = (0, (4, 3)) if dashed else "solid"
+    ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                arrowprops=dict(
+                    arrowstyle=style, color=color, lw=lw,
+                    connectionstyle=f"arc3,rad={rad}",
+                    mutation_scale=16, linestyle=ls),
+                zorder=7)
+    if label:
+        mx = (x0 + x1) / 2 + (0.15 if label_side == "right" else -0.15)
+        my = (y0 + y1) / 2
+        ax.text(mx, my, label, fontsize=lbl_size, color=color,
+                ha="left" if label_side == "right" else "right",
+                va="center", fontfamily="monospace",
+                bbox=dict(boxstyle="round,pad=0.2", fc=PANEL_BG, ec="none", alpha=0.8),
+                zorder=9)
 
-# Dashed split line into two streams
-Y_SPLIT = 12.35
-ax.plot([XL], [Y_SPLIT], marker=".", ms=8, color="#555", zorder=6)
-# Left stream → GroupTransformer
-arrow(ax, XL, Y_SPLIT, XL - 1.8, Y_SPLIT - 0.15)
-# Right stream → Physics
-arrow(ax, XL, Y_SPLIT, XR - 2.5, Y_SPLIT - 0.15)
 
-# ---------------------------------------------------------------------------
-# ── GROUP TRANSFORMER  (left branch) ────────────────────────────────────────
-# ---------------------------------------------------------------------------
-Y_GT = 11.2
-box(ax, XL - 1.8, Y_GT, 4.0, 1.1,
-    "GroupTransformer  (shared)",
-    sublabel="2 layers, 4 heads\nSelf-attention over 3-jet embeddings per group\n→ mean-pool  →  (g1_emb, g2_emb)",
-    color=C_GROUP, fontsize=8.5)
-arrow(ax, XL - 1.8, Y_SPLIT - 0.15, XL - 1.8, Y_GT + 0.55)
+def section_bg(ax, x0, y0, w, h, label="", color=ACCENT_BLUE, alpha=0.04):
+    """Subtle background panel for a logical section."""
+    p = FancyBboxPatch((x0, y0), w, h,
+                       boxstyle="round,pad=0.2",
+                       fc=color, ec=color, alpha=alpha,
+                       linewidth=0.8, zorder=1)
+    ax.add_patch(p)
+    if label:
+        ax.text(x0 + 0.3, y0 + h - 0.35, label,
+                fontsize=7, color=color, alpha=0.7,
+                fontfamily="monospace", fontweight="bold", zorder=2)
 
-# Symmetric combination
-Y_SYM = 9.85
-box(ax, XL - 1.8, Y_SYM, 4.0, 0.7,
-    "Symmetric Combination",
-    sublabel="sym_sum = g1+g2  ·  sym_prod = g1⊙g2  ·  sym_diff = |g1−g2|",
-    color=C_GROUP)
-arrow(ax, XL - 1.8, Y_GT - 0.55, XL - 1.8, Y_SYM + 0.35)
 
-# ---------------------------------------------------------------------------
-# ── PHYSICS FEATURES  (right branch) ────────────────────────────────────────
-# ---------------------------------------------------------------------------
-Y_PHYS = 11.2
-box(ax, XR, Y_PHYS, 5.0, 1.8,
-    "Physics Features  (per assignment)",
-    sublabel=(
-        "Computed from raw 4-momenta  ← LATE in network\n"
-        "─────────────────────────────────────────────\n"
-        "Inter-group (6):  m₁, m₂, m_sum, m_asym, m_ratio, ΔR\n"
-        "Intra-group ×2 (9+9):\n"
-        "  pT_max/pT_min, pT-CV, min-z_Lund, max-kT_Lund\n"
-        "  ECF₂, ECF₃, D₂=ECF₃/ECF₂²\n"
-        "  Dalitz max/min  →  total 24 features"
-    ),
-    color=C_PHYSICS, fontsize=7.5)
-arrow(ax, XR - 2.5, Y_SPLIT - 0.15, XR, Y_PHYS + 0.9)
+# ═══════════════════════════════════════════════════════════════════════════
+# TITLE BLOCK
+# ═══════════════════════════════════════════════════════════════════════════
+ax.text(fig_w / 2, 29.3,
+        "JetAssignmentTransformer — Architecture",
+        ha="center", va="center",
+        fontsize=18, color=TEXT_MAIN, fontweight="bold",
+        fontfamily="monospace")
+ax.text(fig_w / 2, 28.8,
+        "Physics-Conditioned GroupTransformer  ·  Inspired by arXiv:2202.03772",
+        ha="center", va="center",
+        fontsize=10, color=ACCENT_ORG, fontfamily="monospace")
+ax.axhline(28.55, xmin=0.05, xmax=0.95, color=BORDER, linewidth=0.8)
 
-# LayerNorm on physics
-Y_LN = 9.85
-box(ax, XR, Y_LN, 3.5, 0.7,
-    "LayerNorm  (physics_norm)",
-    sublabel="stabilises mixed-scale physics features before scorer",
-    color=C_PHYSICS)
-arrow(ax, XR, Y_PHYS - 0.9, XR, Y_LN + 0.35)
+# ═══════════════════════════════════════════════════════════════════════════
+# LEFT / MAIN COLUMN  (x ≈ 6)
+# RIGHT / DETAILS     (x ≈ 16)
+# ═══════════════════════════════════════════════════════════════════════════
+XL = 6.2    # left column centre
+XR = 16.0   # right column centre
+XM = 11.1   # merge / middle
 
-# ---------------------------------------------------------------------------
-# ── FEEDBACK:  physics → GroupTransformer  (the key innovation arrow) ───────
-# ---------------------------------------------------------------------------
-# Horizontal dashed arrow from physics box to GroupTransformer
-ax.annotate(
-    "",
-    xy   =(XL - 1.8 + 2.0, Y_GT + 0.0),   # right edge of GT box
-    xytext=(XR - 2.5, Y_PHYS - 0.2),
-    arrowprops=dict(
-        arrowstyle="-|>", color="#E74C3C", lw=2.0,
-        connectionstyle="arc3,rad=-0.25",
-        mutation_scale=16, linestyle="dashed",
-    ),
-    zorder=7,
-)
-ax.text(6.2, 10.5,
-        "Physics info\nfed to GroupTransformer\n(proposed – arXiv:2202.03772)",
-        fontsize=6.5, color="#C0392B", ha="center", va="center",
-        fontweight="bold",
-        bbox=dict(boxstyle="round,pad=0.3", fc="#FDEBD0", ec="#E74C3C",
-                  alpha=0.95))
+# ── INPUT ────────────────────────────────────────────────────────────────────
+section_bg(ax, 0.5, 27.1, fig_w - 1, 1.2, "INPUT", ACCENT_BLUE, 0.05)
+rbox(ax, XL, 27.55, 8, 0.75,
+     "7 Jets  ·  (E, px, py, pz)₄",
+     body="normalized by event HT  ·  pT-sorted",
+     accent=ACCENT_BLUE, title_size=11, body_size=8)
 
-# ---------------------------------------------------------------------------
-# ── CONCAT  → GROUPING SCORER ───────────────────────────────────────────────
-# ---------------------------------------------------------------------------
-Y_CAT = 8.7
-box(ax, XM, Y_CAT, 6.5, 0.65,
-    "Concatenate  [sym_sum | sym_prod | sym_diff | physics_normed]",
-    sublabel="shape: (batch, n_combos, 3·d_model + 24)",
-    color=C_SCORER)
-# arrows from both branches into concat
-arrow(ax, XL - 1.8, Y_SYM - 0.35, XL - 1.8, Y_CAT + 0.32)
-ax.annotate("", xy=(XM - 3.25 + 0.3, Y_CAT + 0.0),
-            xytext=(XM - 3.25 + 0.3, Y_CAT + 0.32),
-            arrowprops=dict(arrowstyle="-", color="#555", lw=1))
-arrow(ax, XR, Y_LN - 0.35, XR, Y_CAT + 0.32)
-ax.annotate("", xy=(XM + 3.25 - 0.3, Y_CAT + 0.0),
-            xytext=(XM + 3.25 - 0.3, Y_CAT + 0.32),
-            arrowprops=dict(arrowstyle="-", color="#555", lw=1))
+# ── PROJECTION ───────────────────────────────────────────────────────────────
+Y_PROJ = 26.0
+rbox(ax, XL, Y_PROJ, 8, 0.65,
+     "Linear Projection  +  Positional Embedding",
+     body="R⁴ → R^{d}    ·    d_model = 256",
+     accent=ACCENT_BLUE)
+arr(ax, XL, 27.18, XL, Y_PROJ + 0.33)
+dim_tag(ax, XL + 4.3, Y_PROJ, "(B, 7, 256)")
 
-Y_GSCORER = 7.6
-box(ax, XM, Y_GSCORER, 5.5, 0.75,
-    "Grouping Scorer MLP",
-    sublabel="Linear→GELU→Drop→Linear→GELU→Drop→Linear(1)\n→ grouping_logits (batch, 7, 10)",
-    color=C_SCORER)
-arrow(ax, XM, Y_CAT - 0.32, XM, Y_GSCORER + 0.375)
+# ── ENCODER ──────────────────────────────────────────────────────────────────
+section_bg(ax, 0.5, 24.6, fig_w - 1, 1.25, "ENCODER", ACCENT_GRN, 0.05)
+Y_ENC = 25.15
+rbox(ax, XL, Y_ENC, 8, 0.75,
+     "Transformer Encoder",
+     body="6 layers  ·  8 heads  ·  d_ff = 1024  ·  pre-LN  ·  pT-hierarchy attn bias: w·log(pTᵢ/pTⱼ)",
+     accent=ACCENT_GRN, title_size=11, body_size=7.8)
+arr(ax, XL, Y_PROJ - 0.33, XL, Y_ENC + 0.38)
+dim_tag(ax, XL + 4.3, Y_ENC, "(B, 7, 256)")
 
-# ---------------------------------------------------------------------------
-# ── ISR HEAD ────────────────────────────────────────────────────────────────
-# ---------------------------------------------------------------------------
-Y_GSUM = 6.5
-box(ax, XL - 0.5, Y_GSUM, 4.5, 0.75,
-    "Attention-Pooled Grouping Summary",
-    sublabel="softmax(grp_logits) · combined  →  proj d_model\n→ grouping_summary (batch, 7, d_model)",
-    color=C_GROUP)
-arrow(ax, XM - 2.5, Y_GSCORER - 0.375, XL - 0.5, Y_GSUM + 0.375, rad=-0.2)
+# ── ENUMERATE ────────────────────────────────────────────────────────────────
+Y_ENUM = 23.55
+rbox(ax, XL, Y_ENUM, 8, 0.65,
+     "Enumerate All 70 Assignments",
+     body="(ISR jet j)  ×  (grouping k ∈ C₆³/2)    →    n_combos = 7 × 10 = 70",
+     accent=ACCENT_GRN)
+arr(ax, XL, Y_ENC - 0.38, XL, Y_ENUM + 0.33)
 
-Y_ISR = 5.4
-box(ax, XL - 0.5, Y_ISR, 4.5, 0.9,
-    "ISR Head",
-    sublabel=(
-        "Input: [jet_emb | LOO_ctx | isr_physics | grp_summary]\n"
-        "= d_model + d_model + 3 + d_model\n"
-        "Linear→GELU→Drop×2 → isr_logits (batch, 7)"
-    ),
-    color=C_ISR, fontsize=8)
-arrow(ax, XL - 0.5, Y_GSUM - 0.375, XL - 0.5, Y_ISR + 0.45)
+# ── FORK: two branches  ───────────────────────────────────────────────────────
+# branch point
+BP_X, BP_Y = XL, Y_ENUM - 0.33 - 0.2
+ax.plot(BP_X, BP_Y, "o", ms=6, color=ACCENT_GRN, zorder=8)
+ax.text(BP_X - 0.3, BP_Y, "fork", fontsize=6.5, color=TEXT_DIM,
+        ha="right", va="center", fontfamily="monospace")
 
-# Jet embeddings feed ISR head from encoder
-ax.annotate("",
-    xy=(XL - 0.5 - 2.25 + 0.05, Y_ISR + 0.0),
-    xytext=(XL, Y_ENC - 0.45),
-    arrowprops=dict(arrowstyle="-|>", color="#888", lw=1.2,
-                    connectionstyle="arc3,rad=0.35",
-                    mutation_scale=12, linestyle="dotted"),
-    zorder=5)
-ax.text(1.5, 9.5, "jet_emb\n(encoder out)",
-        fontsize=5.5, color="#666", ha="center",
-        bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.7))
+XB_L = 5.0    # left branch (GroupTransformer)
+XB_R = 14.5   # right branch (physics features)
 
-# ---------------------------------------------------------------------------
-# ── COMBINE LOGITS ──────────────────────────────────────────────────────────
-# ---------------------------------------------------------------------------
-Y_COMB = 4.1
-box(ax, XM, Y_COMB, 6.0, 0.75,
-    "Combine Logits",
-    sublabel=(
-        "log P(assign) = scale · isr_logits + grouping_logits\n"
-        "→ flat_logits (batch, 70)  ←  canonical assignment ordering"
-    ),
-    color=C_SCORER)
-arrow(ax, XL - 0.5, Y_ISR - 0.45, XM, Y_COMB + 0.375)
-arrow(ax, XM, Y_GSCORER - 0.375, XM, Y_COMB + 0.375)
+# ═══════════════════════════════════════════════════════════════════════════
+# LEFT BRANCH — GroupTransformer
+# ═══════════════════════════════════════════════════════════════════════════
+section_bg(ax, 0.4, 14.8, 10.2, 8.5, "GROUP TRANSFORMER", ACCENT_ORG, 0.04)
 
-# ---------------------------------------------------------------------------
-# ── ADVERSARIAL HEAD ─────────────────────────────────────────────────────────
-# ---------------------------------------------------------------------------
-Y_ADV = 6.2
-box(ax, XR + 0.3, Y_ADV, 3.2, 1.1,
-    "Adversarial Head",
-    sublabel=(
-        "Gradient Reversal Layer\nmean(jet_emb) →\nLinear→GELU→Linear(1)\n"
-        "→ mass_pred  (decorrelate mass)"
-    ),
-    color=C_ADV, fontsize=7.5)
-ax.annotate("",
-    xy=(XR + 0.3 - 1.6, Y_ADV + 0.3),
-    xytext=(XL + 0.5, Y_ENC - 0.45),
-    arrowprops=dict(arrowstyle="-|>", color="#888", lw=1.2,
-                    connectionstyle="arc3,rad=-0.3",
-                    mutation_scale=12, linestyle="dotted"),
-    zorder=5)
+# arrow down to GT area
+arr(ax, BP_X, BP_Y, XB_L, 22.35, color=TEXT_DIM, rad=-0.15)
 
-# ---------------------------------------------------------------------------
-# ── OUTPUTS ──────────────────────────────────────────────────────────────────
-# ---------------------------------------------------------------------------
-Y_OUT = 2.8
-out_labels = [
-    ("logits\n(70)", 2.5),
-    ("isr_logits\n(7)", 5.0),
-    ("grp_logits\n(7×10)", 7.5),
-    ("mass_asym\nmass_sum", 10.0),
-    ("mass_pred\n(adversary)", 12.5),
+# ── RAW 4-MOM GATHER ─────────────────────────────────────────────────────────
+Y_GATHER = 22.1
+rbox(ax, XB_L, Y_GATHER, 7.5, 0.65,
+     "Gather Per-Group Jet 4-Momenta  (raw)",
+     body="gather(four_momenta, g1_idx)  →  g1_jets  ·  g2_jets    shape (B, 70, 3, 4)",
+     accent=ACCENT_ORG, body_size=7.2)
+dim_tag(ax, XB_L + 3.85, Y_GATHER, "(B,70,3,4)")
+
+# ── INTRA PHYSICS ────────────────────────────────────────────────────────────
+Y_INTRA = 20.85
+rbox(ax, XB_L, Y_INTRA, 7.5, 1.0,
+     "Intra-Group Physics  (LATE, from raw kinematics)",
+     body=(
+         "intra_group_features(g_jets)  →  9 observables per group\n"
+         "  • max pT ratio  ·  pT coeff of variation\n"
+         "  • min Lund z  ·  max Lund kT\n"
+         "  • ECF₂  ·  ECF₃  ·  D₂ = ECF₃/ECF₂²\n"
+         "  • Dalitz max/min pairwise mass ratio"
+     ),
+     accent=ACCENT_ORG, title_size=9.5, body_size=7, alpha_face=0.18)
+arr(ax, XB_L, Y_GATHER - 0.33, XB_L, Y_INTRA + 0.5)
+dim_tag(ax, XB_L + 3.85, Y_INTRA, "(B,70,9)")
+
+# ── PHYSICS PROJ ─────────────────────────────────────────────────────────────
+Y_PROJ2 = 19.45
+rbox(ax, XB_L, Y_PROJ2, 7.5, 0.65,
+     "group_physics_proj  ·  Linear(9→d) + GELU",
+     body="projects intra physics to d_model  →  conditioning token per group",
+     accent=NEW_CLR, title_size=9, body_size=7.5)
+arr(ax, XB_L, Y_INTRA - 0.5, XB_L, Y_PROJ2 + 0.33, color=NEW_CLR)
+dim_tag(ax, XB_L + 3.85, Y_PROJ2, "(B,70,1,256)")
+
+# ── APPEND TOKEN ─────────────────────────────────────────────────────────────
+Y_APPEND = 18.3
+rbox(ax, XB_L, Y_APPEND, 7.5, 0.65,
+     "Append Conditioning Token",
+     body="[jet₁ · jet₂ · jet₃ · phys_cond]    seq_len = 3+1 = 4 tokens",
+     accent=NEW_CLR, title_size=9.5, body_size=7.5)
+arr(ax, XB_L, Y_PROJ2 - 0.33, XB_L, Y_APPEND + 0.33, color=NEW_CLR)
+dim_tag(ax, XB_L + 3.85, Y_APPEND, "(B,70,4,256)")
+
+# also bring down jet embeddings from encoder
+arr(ax, BP_X, BP_Y, XB_L - 3.3, 18.3, color=ACCENT_GRN, rad=0.3,
+    label="jet_emb", label_side="left")
+
+# ── GROUP TRANSFORMER ────────────────────────────────────────────────────────
+Y_GT = 16.95
+rbox(ax, XB_L, Y_GT, 7.5, 1.1,
+     "GroupTransformer  (shared, intra-group attn)",
+     body=(
+         "2 layers  ·  4 heads  ·  pre-LN  ·  d_ff = 2×d\n"
+         "Self-attention over [jet₁, jet₂, jet₃, phys_cond]\n"
+         "→ mean-pool over 4 tokens  →  group embedding"
+     ),
+     accent=ACCENT_ORG, title_size=10, body_size=7.8, alpha_face=0.2)
+arr(ax, XB_L, Y_APPEND - 0.33, XB_L, Y_GT + 0.55, color=ACCENT_ORG)
+dim_tag(ax, XB_L + 3.85, Y_GT, "(B,70,256)")
+
+# highlight box around new feature
+hl = FancyBboxPatch((XB_L - 3.9, 18.0 - 0.85), 7.9, 2.9,
+                    boxstyle="round,pad=0.12",
+                    fc="none", ec=NEW_CLR, alpha=0.6, linewidth=2,
+                    linestyle="--", zorder=8)
+ax.add_patch(hl)
+ax.text(XB_L + 3.7, 18.0 - 0.72, "NEW", fontsize=7.5,
+        color=NEW_CLR, fontweight="bold", fontfamily="monospace",
+        bbox=dict(boxstyle="round,pad=0.2", fc=BG, ec=NEW_CLR, linewidth=1),
+        zorder=9)
+
+# ── SYMMETRIC COMBINATION ────────────────────────────────────────────────────
+Y_SYM = 15.65
+rbox(ax, XB_L, Y_SYM, 7.5, 0.75,
+     "Symmetric Group Combination",
+     body="sym_sum = g1+g2  ·  sym_prod = g1⊙g2  ·  sym_diff = |g1−g2|",
+     accent=ACCENT_ORG)
+arr(ax, XB_L, Y_GT - 0.55, XB_L, Y_SYM + 0.38, color=ACCENT_ORG)
+dim_tag(ax, XB_L + 3.85, Y_SYM, "3×(B,70,256)")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RIGHT BRANCH — Full Physics Features
+# ═══════════════════════════════════════════════════════════════════════════
+section_bg(ax, 10.8, 14.8, 10.8, 8.5, "FULL PHYSICS FEATURES  (24)", ACCENT_RED, 0.04)
+
+arr(ax, BP_X, BP_Y, XB_R, 22.35, color=TEXT_DIM, rad=0.22)
+
+Y_PHYS = 20.5
+rbox(ax, XB_R, Y_PHYS, 8, 2.5,
+     "Full Physics Features  (24 per assignment)",
+     body=(
+         "Computed from raw 4-momenta  —  LATE, not from latent space\n"
+         "─────────────────────────────────────────────────────────\n"
+         "Inter-group (6):\n"
+         "  mass_sum · mass_asym · mass_ratio · m₁ · m₂ · ΔR\n"
+         "\n"
+         "Intra-group × 2 groups (9+9=18):\n"
+         "  pT_max/pT_min · pT-CV · min Lund-z · max Lund-kT\n"
+         "  ECF₂ · ECF₃ · D₂=ECF₃/ECF₂²\n"
+         "  Dalitz max ratio · Dalitz min ratio"
+     ),
+     accent=ACCENT_RED, title_size=10, body_size=7.5, alpha_face=0.15)
+arr(ax, XB_R, 22.35, XB_R, Y_PHYS + 1.25, color=TEXT_DIM)
+dim_tag(ax, XB_R + 4.2, Y_PHYS, "(B,70,24)")
+
+Y_LN = 17.85
+rbox(ax, XB_R, Y_LN, 6.5, 0.65,
+     "LayerNorm  (physics_norm)",
+     body="stabilises mixed-scale features  (ratios · masses · angles)",
+     accent=ACCENT_RED, body_size=7.5)
+arr(ax, XB_R, Y_PHYS - 1.25, XB_R, Y_LN + 0.33, color=ACCENT_RED)
+dim_tag(ax, XB_R + 3.35, Y_LN, "(B,70,24)")
+
+# extract mass_sum / mass_asym before LN (dashed side arrow)
+arr(ax, XB_R + 3.3, Y_PHYS - 0.5, XB_R + 5.2, Y_PHYS - 0.5,
+    color=TEXT_DIM, lw=1.2, dashed=True,
+    label="raw mass_sum\nmass_asym", label_side="right")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MERGE — CONCAT + SCORER
+# ═══════════════════════════════════════════════════════════════════════════
+section_bg(ax, 0.4, 10.2, 21.2, 4.45, "GROUPING SCORER + ISR HEAD", ACCENT_PUR, 0.04)
+
+Y_CAT = 14.65
+rbox(ax, XM, Y_CAT, 12, 0.75,
+     "Concatenate  [sym_sum | sym_prod | sym_diff | physics_normed]",
+     body="shape: (B, 70, 3·d + 24)    ·    d = 256   →   (B, 70, 792)",
+     accent=ACCENT_PUR, title_size=10)
+# arrows from both branches
+arr(ax, XB_L, Y_SYM - 0.38, XM - 5.5, Y_CAT + 0.18, color=ACCENT_ORG, rad=0.1)
+arr(ax, XB_R, Y_LN - 0.33, XM + 5.5, Y_CAT + 0.18, color=ACCENT_RED, rad=-0.1)
+
+Y_GSCORER = 13.35
+rbox(ax, XM, Y_GSCORER, 10, 0.85,
+     "Grouping Scorer MLP",
+     body=(
+         "Linear(792→512) → GELU → Dropout\n"
+         "→ Linear(512→256) → GELU → Dropout → Linear(256→1)\n"
+         "→ grouping_logits    (B, 7, 10)"
+     ),
+     accent=ACCENT_PUR, title_size=10, body_size=7.5)
+arr(ax, XM, Y_CAT - 0.38, XM, Y_GSCORER + 0.43, color=ACCENT_PUR)
+
+Y_GSUM = 11.95
+rbox(ax, XM - 1.5, Y_GSUM, 8, 0.75,
+     "Attention-Pooled Grouping Summary",
+     body="softmax(grp_logits) · combined  →  grouping_summary_proj  →  (B, 7, d)",
+     accent=ACCENT_PUR, body_size=7.5)
+arr(ax, XM, Y_GSCORER - 0.43, XM - 1.5, Y_GSUM + 0.38,
+    color=ACCENT_PUR, rad=-0.15)
+
+Y_ISR = 10.6
+rbox(ax, XM - 1.5, Y_ISR, 8, 0.9,
+     "ISR Head",
+     body=(
+         "input: [jet_emb | LOO_ctx | isr_physics | grp_summary]\n"
+         "Linear(3d+3→2d) → GELU → Drop → Linear → GELU → Drop → Linear(→1)\n"
+         "→ isr_logits    (B, 7)"
+     ),
+     accent=ACCENT_PUR, title_size=10, body_size=7.5)
+arr(ax, XM - 1.5, Y_GSUM - 0.38, XM - 1.5, Y_ISR + 0.45, color=ACCENT_PUR)
+
+# jet_emb feed (dotted) into ISR head
+arr(ax, XL, Y_ENC - 0.38, XM - 1.5 - 4.1, Y_ISR + 0.0,
+    color=ACCENT_GRN, rad=0.4, lw=1.2, dashed=True, label="jet_emb",
+    label_side="left", lbl_size=6)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMBINE LOGITS
+# ═══════════════════════════════════════════════════════════════════════════
+Y_COMB = 9.15
+rbox(ax, XM, Y_COMB, 10.5, 0.75,
+     "Combine Logits",
+     body=(
+         "log P(assign) = scale · isr_logits + grouping_logits\n"
+         "→ flat_logits    (B, 70)    canonical assignment ordering"
+     ),
+     accent=ACCENT_PUR, title_size=10)
+arr(ax, XM - 1.5, Y_ISR - 0.45, XM, Y_COMB + 0.38, color=ACCENT_PUR, rad=0.1)
+arr(ax, XM, Y_GSCORER - 0.43, XM + 0.2, Y_COMB + 0.38, color=ACCENT_PUR, rad=0.15)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ADVERSARIAL HEAD (right side)
+# ═══════════════════════════════════════════════════════════════════════════
+Y_ADV = 11.8
+rbox(ax, 20.3, Y_ADV, 3.5, 1.2,
+     "Adversarial\nHead",
+     body=(
+         "Gradient Reversal\n"
+         "mean(jet_emb)\n"
+         "→ Linear→GELU→Lin(1)\n"
+         "→ mass_pred"
+     ),
+     accent=ACCENT_RED, title_size=8.5, body_size=7)
+arr(ax, XL + 2, Y_ENC - 0.2, 20.3, Y_ADV + 0.6,
+    color=ACCENT_RED, rad=-0.4, lw=1.2, dashed=True, label="GRL", lbl_size=6)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OUTPUTS
+# ═══════════════════════════════════════════════════════════════════════════
+section_bg(ax, 0.4, 6.8, 21.2, 2.1, "OUTPUTS", ACCENT_TEA, 0.04)
+
+out_specs = [
+    ("logits\n(B, 70)",      3.3,  ACCENT_PUR),
+    ("isr_logits\n(B, 7)",   7.0,  ACCENT_PUR),
+    ("grp_logits\n(B,7,10)", 10.7, ACCENT_PUR),
+    ("mass_asym\nmass_sum",  14.4, ACCENT_RED),
+    ("mass_pred",            18.0, ACCENT_RED),
 ]
-for lbl, xc in out_labels:
-    box(ax, xc, Y_OUT, 2.2, 0.65, lbl, color=C_OUTPUT, fontsize=7)
-arrow(ax, XM, Y_COMB - 0.375, XM, Y_OUT + 0.325)
+arr(ax, XM, Y_COMB - 0.38, XM, 8.7, color=ACCENT_TEA)
 
-# mass_asym/mass_sum from physics
-ax.annotate("",
-    xy=(10.0, Y_OUT + 0.325),
-    xytext=(XR, Y_LN - 0.35),
-    arrowprops=dict(arrowstyle="-|>", color="#888", lw=1.2,
-                    connectionstyle="arc3,rad=0.2",
-                    mutation_scale=12, linestyle="dotted"),
-    zorder=5)
-# mass_pred from adversary
-ax.annotate("",
-    xy=(12.5, Y_OUT + 0.325),
-    xytext=(XR + 0.3, Y_ADV - 0.55),
-    arrowprops=dict(arrowstyle="-|>", color="#888", lw=1.2,
-                    connectionstyle="arc3,rad=0.0",
-                    mutation_scale=12),
-    zorder=5)
+for lbl, xc, clr in out_specs:
+    rbox(ax, xc, 7.65, 3.2, 0.75, lbl, accent=clr, title_size=8, alpha_face=0.2)
 
-# ---------------------------------------------------------------------------
-# ── LEGEND ───────────────────────────────────────────────────────────────────
-# ---------------------------------------------------------------------------
+# arrows from combine to output boxes
+for xc, _ in [(3.3, 0), (7.0, 0), (10.7, 0)]:
+    arr(ax, XM, 8.37, xc, 8.03, color=ACCENT_PUR, lw=1.2)
+arr(ax, XB_R + 5.2, Y_PHYS - 0.5, 14.4, 8.03, color=ACCENT_RED, lw=1.2, rad=0.3)
+arr(ax, 20.3, Y_ADV - 0.6, 18.0, 8.03, color=ACCENT_RED, lw=1.2)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAINING LOSSES (bottom)
+# ═══════════════════════════════════════════════════════════════════════════
+section_bg(ax, 0.4, 4.5, 21.2, 2.05, "TRAINING LOSSES", ACCENT_ORG, 0.04)
+
+losses = [
+    ("CrossEntropy\n(assignment)", 2.7,  ACCENT_PUR),
+    ("CrossEntropy\n(ISR)",        6.0,  ACCENT_PUR),
+    ("λ_sym · E[mass_asym]",       9.4,  ACCENT_ORG),
+    ("λ_qcd · (−E[H·m_asym])",    13.0,  ACCENT_ORG),
+    ("λ_adv · MSE\n(adversary)",  16.5,  ACCENT_RED),
+    ("KL distill\n(Phase 1→2)",   19.8,  ACCENT_RED),
+]
+for lbl, xc, clr in losses:
+    rbox(ax, xc, 5.4, 3.0, 0.75, lbl, accent=clr, title_size=7.5, alpha_face=0.2)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LEGEND
+# ═══════════════════════════════════════════════════════════════════════════
 legend_items = [
-    mpatches.Patch(color=C_INPUT,   label="Input / Projection"),
-    mpatches.Patch(color=C_ENCODER, label="Transformer Encoder"),
-    mpatches.Patch(color=C_GROUP,   label="GroupTransformer"),
-    mpatches.Patch(color=C_PHYSICS, label="Physics Features  ← computed LATE"),
-    mpatches.Patch(color=C_SCORER,  label="Scorer / Combination MLP"),
-    mpatches.Patch(color=C_ISR,     label="ISR Head"),
-    mpatches.Patch(color=C_ADV,     label="Adversarial Head"),
-    mpatches.Patch(color=C_OUTPUT,  label="Network Outputs"),
-    mpatches.Patch(facecolor="white", edgecolor="#E74C3C", linewidth=2,
-                   label="Proposed: physics → GroupTransformer feed"),
+    mpatches.Patch(facecolor=ACCENT_BLUE, alpha=0.7,  label="Input / Projection"),
+    mpatches.Patch(facecolor=ACCENT_GRN,  alpha=0.7,  label="Transformer Encoder"),
+    mpatches.Patch(facecolor=ACCENT_ORG,  alpha=0.7,  label="GroupTransformer"),
+    mpatches.Patch(facecolor=ACCENT_RED,  alpha=0.7,  label="Physics Features (raw kinematics)"),
+    mpatches.Patch(facecolor=NEW_CLR,     alpha=0.7,  label="★ NEW: Physics→GroupTransformer conditioning"),
+    mpatches.Patch(facecolor=ACCENT_PUR,  alpha=0.7,  label="Scorer / ISR / Combination"),
+    mpatches.Patch(facecolor=ACCENT_TEA,  alpha=0.7,  label="Outputs"),
+    plt.Line2D([0], [0], color=ARROW_CLR, lw=1.5, linestyle="--",
+               label="Dotted: auxiliary / skip connection"),
 ]
-ax.legend(handles=legend_items, loc="lower right", fontsize=7,
-          framealpha=0.9, edgecolor="#999",
-          bbox_to_anchor=(0.99, 0.01))
+leg = ax.legend(handles=legend_items, loc="lower left",
+                fontsize=8, framealpha=0.92, edgecolor=BORDER,
+                facecolor=PANEL_BG,
+                labelcolor=TEXT_DIM,
+                bbox_to_anchor=(0.01, 0.005))
+for txt in leg.get_texts():
+    txt.set_fontfamily("monospace")
 
-# ---------------------------------------------------------------------------
-# ── TITLE & ANNOTATIONS ──────────────────────────────────────────────────────
-# ---------------------------------------------------------------------------
-ax.set_title(
-    "JetAssignmentTransformer  –  Network Architecture\n"
-    "Physics features computed LATE (from raw 4-momenta) · GroupTransformer access point highlighted",
-    fontsize=11, fontweight="bold", pad=12,
-)
+# ── footer ───────────────────────────────────────────────────────────────────
+ax.text(fig_w / 2, 0.25,
+        "lawrenceleejr/CombinatorialSolver  ·  GroupTransformer physics conditioning  ·  "
+        "Inspired by PELICAN (arXiv:2202.03772)",
+        ha="center", va="center", fontsize=7, color=TEXT_TINY,
+        fontfamily="monospace")
 
-ax.text(
-    0.01, 0.01,
-    "Inspiration: arXiv:2202.03772  –  Late-stage physics observables with transformer feedback",
-    transform=ax.transAxes, fontsize=6.5, color="#777",
-    va="bottom",
-)
-
-# ---------------------------------------------------------------------------
-# ── SAVE ─────────────────────────────────────────────────────────────────────
-# ---------------------------------------------------------------------------
-out_path = "architecture_diagram.pdf"
-fig.savefig(out_path, bbox_inches="tight", dpi=200, facecolor=fig.get_facecolor())
-print(f"Saved: {out_path}")
+out = "/home/runner/work/CombinatorialSolver/CombinatorialSolver/architecture_diagram.pdf"
+fig.savefig(out, bbox_inches="tight", dpi=200, facecolor=BG)
+print(f"Saved: {out}  ({__import__('os').path.getsize(out)//1024} KB)")
 plt.close(fig)
