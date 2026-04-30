@@ -464,339 +464,343 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 f"LR capped at {phase1_lr_fraction * base_lr:.1e} before Phase 2)."
             )
 
-    for epoch in range(tc["num_epochs"]):
-        cosine_with_warmup(
-            optimizer, epoch, tc["num_epochs"], tc["warmup_epochs"],
-            restart_period=tc.get("restart_period", 0),
-        )
+    try:
+        for epoch in range(tc["num_epochs"]):
+            cosine_with_warmup(
+                optimizer, epoch, tc["num_epochs"], tc["warmup_epochs"],
+                restart_period=tc.get("restart_period", 0),
+            )
 
-        # During Phase 1, clamp LR to phase1_lr_fraction × initial_lr.
-        # Phase 1 uses a pure 10-class grouping-CE pseudolabel loss (no
-        # sym/qcd/adversary/distillation terms), which is stable at the full
-        # cosine LR. phase1_max_lr_fraction defaults to 1.0 (no cap) so Phase 1
-        # can converge in the ~15-20 epochs before phase1_patience fires.
-        # Reduce if Phase 1 shows training-loss divergence.
-        if training_phase == 1 and phase1_active:
-            for pg in optimizer.param_groups:
-                pg["lr"] = min(pg["lr"], pg["initial_lr"] * phase1_lr_fraction)
+            # During Phase 1, clamp LR to phase1_lr_fraction × initial_lr.
+            # Phase 1 uses a pure 10-class grouping-CE pseudolabel loss (no
+            # sym/qcd/adversary/distillation terms), which is stable at the full
+            # cosine LR. phase1_max_lr_fraction defaults to 1.0 (no cap) so Phase 1
+            # can converge in the ~15-20 epochs before phase1_patience fires.
+            # Reduce if Phase 1 shows training-loss divergence.
+            if training_phase == 1 and phase1_active:
+                for pg in optimizer.param_groups:
+                    pg["lr"] = min(pg["lr"], pg["initial_lr"] * phase1_lr_fraction)
 
-        current_lr = optimizer.param_groups[0]["lr"]
+            current_lr = optimizer.param_groups[0]["lr"]
 
-        if use_adversary and training_phase == 2:
-            rampup = tc.get("lambda_adv_rampup", 10)
-            phase2_epoch = epoch - (phase2_start_epoch or 0)
-            if rampup > 0:
-                adv_scale = min(1.0, phase2_epoch / rampup)
+            if use_adversary and training_phase == 2:
+                rampup = tc.get("lambda_adv_rampup", 10)
+                phase2_epoch = epoch - (phase2_start_epoch or 0)
+                if rampup > 0:
+                    adv_scale = min(1.0, phase2_epoch / rampup)
+                else:
+                    adv_scale = 1.0
+                lambda_adv = tc["lambda_adv"] * adv_scale
+                model.gradient_reversal.set_lambda(lambda_adv)
             else:
-                adv_scale = 1.0
-            lambda_adv = tc["lambda_adv"] * adv_scale
-            model.gradient_reversal.set_lambda(lambda_adv)
-        else:
-            lambda_adv = 0.0
-            model.gradient_reversal.set_lambda(0.0)
+                lambda_adv = 0.0
+                model.gradient_reversal.set_lambda(0.0)
 
-        if training_phase == 1:
-            # Phase 1: full-strength distillation, no decay, no other losses
-            lambda_distill = lambda_distill_max
-            tf_ratio = 0.0          # irrelevant (CE loss is skipped)
-            lambda_sym = 0.0
-            lambda_qcd = 0.0
-            lambda_isr_direct = 0.0
-            lambda_entropy_asym = 0.0
-            lambda_entropy_mass = 0.0
-            phase1_only_train = True
-        else:
-            # Phase 2: teacher forcing, auxiliary losses, decaying distillation
-            phase2_epoch = epoch - phase2_start_epoch
-
-            # Teacher forcing ratio: linearly decay from tf_start to tf_end
-            if phase2_epoch < tf_decay_epochs:
-                tf_ratio = tf_start + (tf_end - tf_start) * phase2_epoch / tf_decay_epochs
+            if training_phase == 1:
+                # Phase 1: full-strength distillation, no decay, no other losses
+                lambda_distill = lambda_distill_max
+                tf_ratio = 0.0          # irrelevant (CE loss is skipped)
+                lambda_sym = 0.0
+                lambda_qcd = 0.0
+                lambda_isr_direct = 0.0
+                lambda_entropy_asym = 0.0
+                lambda_entropy_mass = 0.0
+                phase1_only_train = True
             else:
-                tf_ratio = tf_end
+                # Phase 2: teacher forcing, auxiliary losses, decaying distillation
+                phase2_epoch = epoch - phase2_start_epoch
 
-            # Ramp up auxiliary losses from Phase 2 start
-            if lambda_sym_rampup > 0:
-                lambda_sym = lambda_sym_max * min(1.0, phase2_epoch / lambda_sym_rampup)
-            else:
-                lambda_sym = lambda_sym_max
+                # Teacher forcing ratio: linearly decay from tf_start to tf_end
+                if phase2_epoch < tf_decay_epochs:
+                    tf_ratio = tf_start + (tf_end - tf_start) * phase2_epoch / tf_decay_epochs
+                else:
+                    tf_ratio = tf_end
 
-            if lambda_qcd_rampup > 0:
-                lambda_qcd = lambda_qcd_max * min(1.0, phase2_epoch / lambda_qcd_rampup)
-            else:
-                lambda_qcd = lambda_qcd_max
+                # Ramp up auxiliary losses from Phase 2 start
+                if lambda_sym_rampup > 0:
+                    lambda_sym = lambda_sym_max * min(1.0, phase2_epoch / lambda_sym_rampup)
+                else:
+                    lambda_sym = lambda_sym_max
 
-            if lambda_isr_direct_rampup > 0:
-                lambda_isr_direct = lambda_isr_direct_max * min(
-                    1.0, phase2_epoch / lambda_isr_direct_rampup
-                )
-            else:
-                lambda_isr_direct = lambda_isr_direct_max
+                if lambda_qcd_rampup > 0:
+                    lambda_qcd = lambda_qcd_max * min(1.0, phase2_epoch / lambda_qcd_rampup)
+                else:
+                    lambda_qcd = lambda_qcd_max
 
-            if lambda_entropy_asym_rampup > 0:
-                lambda_entropy_asym = lambda_entropy_asym_max * min(
-                    1.0, phase2_epoch / lambda_entropy_asym_rampup
-                )
-            else:
-                lambda_entropy_asym = lambda_entropy_asym_max
+                if lambda_isr_direct_rampup > 0:
+                    lambda_isr_direct = lambda_isr_direct_max * min(
+                        1.0, phase2_epoch / lambda_isr_direct_rampup
+                    )
+                else:
+                    lambda_isr_direct = lambda_isr_direct_max
 
-            if lambda_entropy_mass_rampup > 0:
-                lambda_entropy_mass = lambda_entropy_mass_max * min(
-                    1.0, phase2_epoch / lambda_entropy_mass_rampup
-                )
-            else:
-                lambda_entropy_mass = lambda_entropy_mass_max
+                if lambda_entropy_asym_rampup > 0:
+                    lambda_entropy_asym = lambda_entropy_asym_max * min(
+                        1.0, phase2_epoch / lambda_entropy_asym_rampup
+                    )
+                else:
+                    lambda_entropy_asym = lambda_entropy_asym_max
 
-            # Distillation decays from max to zero over lambda_distill_epochs
-            if lambda_distill_epochs > 0:
-                lambda_distill = lambda_distill_max * max(
-                    0.0, 1.0 - phase2_epoch / lambda_distill_epochs
-                )
-            else:
-                lambda_distill = 0.0
+                if lambda_entropy_mass_rampup > 0:
+                    lambda_entropy_mass = lambda_entropy_mass_max * min(
+                        1.0, phase2_epoch / lambda_entropy_mass_rampup
+                    )
+                else:
+                    lambda_entropy_mass = lambda_entropy_mass_max
 
-            phase1_only_train = False
+                # Distillation decays from max to zero over lambda_distill_epochs
+                if lambda_distill_epochs > 0:
+                    lambda_distill = lambda_distill_max * max(
+                        0.0, 1.0 - phase2_epoch / lambda_distill_epochs
+                    )
+                else:
+                    lambda_distill = 0.0
 
-        # Training
-        model.train()
-        train_metrics = _run_epoch(
-            model, train_loader, ce_loss_fn, mse_loss_fn,
-            lambda_adv, device, optimizer=optimizer,
-            tf_ratio=tf_ratio, lambda_sym=lambda_sym, lambda_qcd=lambda_qcd,
-            lambda_isr=lambda_isr, lambda_isr_direct=lambda_isr_direct,
-            lambda_distill=lambda_distill, distill_temperature=distill_temperature,
-            lambda_entropy_asym=lambda_entropy_asym,
-            lambda_entropy_mass=lambda_entropy_mass,
-            phase1_only=phase1_only_train,
-            pt_smear_frac=dc.get("pt_smear_frac", 0.0),
-        )
+                phase1_only_train = False
 
-        # Validation (no φ/η augmentation, no teacher forcing: tf_ratio=0 = pure
-        # end-to-end; pT smearing is applied if configured, matching training conditions)
-        model.eval()
-        with torch.no_grad():
-            val_metrics = _run_epoch(
-                model, val_loader, ce_loss_fn, mse_loss_fn,
-                lambda_adv, device, optimizer=None,
-                tf_ratio=0.0, lambda_sym=0.0, lambda_qcd=0.0,
-                lambda_isr=lambda_isr, lambda_isr_direct=0.0,
-                lambda_distill=0.0, distill_temperature=distill_temperature,
-                lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
+            # Training
+            model.train()
+            train_metrics = _run_epoch(
+                model, train_loader, ce_loss_fn, mse_loss_fn,
+                lambda_adv, device, optimizer=optimizer,
+                tf_ratio=tf_ratio, lambda_sym=lambda_sym, lambda_qcd=lambda_qcd,
+                lambda_isr=lambda_isr, lambda_isr_direct=lambda_isr_direct,
+                lambda_distill=lambda_distill, distill_temperature=distill_temperature,
+                lambda_entropy_asym=lambda_entropy_asym,
+                lambda_entropy_mass=lambda_entropy_mass,
+                phase1_only=phase1_only_train,
                 pt_smear_frac=dc.get("pt_smear_frac", 0.0),
             )
 
-        # Accumulate per-event validation mass-asymmetry distribution for GIF
-        if "pred_asym_values" in val_metrics:
-            val_asym_history.append((
-                epoch + 1, training_phase,
-                val_metrics["pred_asym_values"],
-                val_metrics.get("pred_correct_values"),  # bool array or None
-            ))
+            # Validation (no φ/η augmentation, no teacher forcing: tf_ratio=0 = pure
+            # end-to-end; pT smearing is applied if configured, matching training conditions)
+            model.eval()
+            with torch.no_grad():
+                val_metrics = _run_epoch(
+                    model, val_loader, ce_loss_fn, mse_loss_fn,
+                    lambda_adv, device, optimizer=None,
+                    tf_ratio=0.0, lambda_sym=0.0, lambda_qcd=0.0,
+                    lambda_isr=lambda_isr, lambda_isr_direct=0.0,
+                    lambda_distill=0.0, distill_temperature=distill_temperature,
+                    lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
+                    pt_smear_frac=dc.get("pt_smear_frac", 0.0),
+                )
 
-        # Accumulate per-event validation mass-sum distribution for GIF
-        if "pred_mass_sum_values" in val_metrics:
-            val_mass_sum_history.append((
-                epoch + 1, training_phase,
-                val_metrics["pred_mass_sum_values"],
-                val_metrics.get("pred_correct_values"),  # bool array or None
-            ))
+            # Accumulate per-event validation mass-asymmetry distribution for GIF
+            if "pred_asym_values" in val_metrics:
+                val_asym_history.append((
+                    epoch + 1, training_phase,
+                    val_metrics["pred_asym_values"],
+                    val_metrics.get("pred_correct_values"),  # bool array or None
+                ))
 
-        # Accumulate per-event validation max-triplet scalar-pT distribution for GIF
-        if "pred_max_triplet_pt_values" in val_metrics:
-            val_max_triplet_pt_history.append((
-                epoch + 1, training_phase,
-                val_metrics["pred_max_triplet_pt_values"],
-                val_metrics.get("pred_correct_values"),  # bool array or None
-            ))
+            # Accumulate per-event validation mass-sum distribution for GIF
+            if "pred_mass_sum_values" in val_metrics:
+                val_mass_sum_history.append((
+                    epoch + 1, training_phase,
+                    val_metrics["pred_mass_sum_values"],
+                    val_metrics.get("pred_correct_values"),  # bool array or None
+                ))
 
-        # Accumulate per-event validation ΔΦ distribution for GIF
-        if "pred_delta_phi_values" in val_metrics:
-            val_delta_phi_history.append((
-                epoch + 1, training_phase,
-                val_metrics["pred_delta_phi_values"],
-                val_metrics.get("pred_correct_values"),  # bool array or None
-            ))
+            # Accumulate per-event validation max-triplet scalar-pT distribution for GIF
+            if "pred_max_triplet_pt_values" in val_metrics:
+                val_max_triplet_pt_history.append((
+                    epoch + 1, training_phase,
+                    val_metrics["pred_max_triplet_pt_values"],
+                    val_metrics.get("pred_correct_values"),  # bool array or None
+                ))
 
-        # Accumulate per-event validation pT-democracy distribution for GIF
-        if "pred_democracy_values" in val_metrics:
-            val_democracy_history.append((
-                epoch + 1, training_phase,
-                val_metrics["pred_democracy_values"],
-                val_metrics.get("pred_correct_values"),  # bool array or None
-            ))
+            # Accumulate per-event validation ΔΦ distribution for GIF
+            if "pred_delta_phi_values" in val_metrics:
+                val_delta_phi_history.append((
+                    epoch + 1, training_phase,
+                    val_metrics["pred_delta_phi_values"],
+                    val_metrics.get("pred_correct_values"),  # bool array or None
+                ))
 
-        # Log
-        phase_tag = f"[P{training_phase}]" if phase1_active else ""
-        adv_str = f" | Adv R²={val_metrics['adv_r2']:.3f}" if use_adversary else ""
-        isr_str = ""
-        if "isr_acc" in val_metrics:
-            isr_str = (
-                f" | ISR={val_metrics['isr_acc']:.3f}"
-                f" Grp={val_metrics['grp_acc']:.3f}"
-            )
-        asym_str = (
-            f" | AvgAsym={val_metrics['avg_mass_asym']:.4f}"
-            f"±{val_metrics['std_mass_asym']:.4f}"
-            if "avg_mass_asym" in val_metrics
-            else ""
-        )
+            # Accumulate per-event validation pT-democracy distribution for GIF
+            if "pred_democracy_values" in val_metrics:
+                val_democracy_history.append((
+                    epoch + 1, training_phase,
+                    val_metrics["pred_democracy_values"],
+                    val_metrics.get("pred_correct_values"),  # bool array or None
+                ))
 
-        print(
-            f"Epoch {epoch+1:3d}/{tc['num_epochs']} {phase_tag} | "
-            f"Train loss={train_metrics['loss']:.4f} acc={train_metrics['acc']:.3f} | "
-            f"Val loss={val_metrics['loss']:.4f} acc={val_metrics['acc']:.3f}"
-            f"{isr_str}{adv_str}{asym_str} | "
-            f"LR={current_lr:.2e}"
-        )
-
-        with open(log_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                epoch + 1,
-                f"{train_metrics['loss']:.6f}",
-                f"{train_metrics['acc']:.4f}",
-                f"{train_metrics['acc5']:.4f}",
-                f"{val_metrics['loss']:.6f}",
-                f"{val_metrics['acc']:.4f}",
-                f"{val_metrics['acc5']:.4f}",
-                f"{train_metrics.get('isr_acc', 0):.4f}",
-                f"{train_metrics.get('grp_acc', 0):.4f}",
-                f"{val_metrics.get('isr_acc', 0):.4f}",
-                f"{val_metrics.get('grp_acc', 0):.4f}",
-                f"{val_metrics['adv_r2']:.4f}",
-                f"{current_lr:.6e}",
-                training_phase,
-                f"{train_metrics['avg_mass_asym']:.6f}" if "avg_mass_asym" in train_metrics else "",
-                f"{train_metrics['std_mass_asym']:.6f}" if "std_mass_asym" in train_metrics else "",
-                f"{val_metrics['avg_mass_asym']:.6f}" if "avg_mass_asym" in val_metrics else "",
-                f"{val_metrics['std_mass_asym']:.6f}" if "std_mass_asym" in val_metrics else "",
-                f"{train_metrics['avg_max_triplet_pt']:.6f}" if "avg_max_triplet_pt" in train_metrics else "",
-                f"{train_metrics['std_max_triplet_pt']:.6f}" if "std_max_triplet_pt" in train_metrics else "",
-                f"{val_metrics['avg_max_triplet_pt']:.6f}" if "avg_max_triplet_pt" in val_metrics else "",
-                f"{val_metrics['std_max_triplet_pt']:.6f}" if "std_max_triplet_pt" in val_metrics else "",
-                f"{train_metrics['avg_delta_phi']:.6f}" if "avg_delta_phi" in train_metrics else "",
-                f"{train_metrics['std_delta_phi']:.6f}" if "std_delta_phi" in train_metrics else "",
-                f"{val_metrics['avg_delta_phi']:.6f}" if "avg_delta_phi" in val_metrics else "",
-                f"{val_metrics['std_delta_phi']:.6f}" if "std_delta_phi" in val_metrics else "",
-                f"{train_metrics['avg_democracy']:.6f}" if "avg_democracy" in train_metrics else "",
-                f"{train_metrics['std_democracy']:.6f}" if "std_democracy" in train_metrics else "",
-                f"{val_metrics['avg_democracy']:.6f}" if "avg_democracy" in val_metrics else "",
-                f"{val_metrics['std_democracy']:.6f}" if "std_democracy" in val_metrics else "",
-            ])
-
-        # Per-epoch live-monitoring plots (overwrite fixed "latest" files so a
-        # viewer that auto-refreshes (e.g. an open PDF) always shows current progress).
-        _plot_training_curves(log_path, phase2_start_epoch=phase2_start_epoch, tag="latest")
-        if val_asym_history:
-            _make_mass_asym_gif(
-                val_asym_history,
-                phase2_start_epoch=phase2_start_epoch,
-                gif_path=Path("plots") / "mass_asym_anim_latest.gif",
-            )
-        if val_mass_sum_history:
-            _make_mass_sum_gif(
-                val_mass_sum_history,
-                phase2_start_epoch=phase2_start_epoch,
-                gif_path=Path("plots") / "mass_sum_anim_latest.gif",
-            )
-        if val_max_triplet_pt_history:
-            _make_max_triplet_pt_gif(
-                val_max_triplet_pt_history,
-                phase2_start_epoch=phase2_start_epoch,
-                gif_path=Path("plots") / "max_triplet_pt_anim_latest.gif",
-            )
-        if val_delta_phi_history:
-            _make_delta_phi_gif(
-                val_delta_phi_history,
-                phase2_start_epoch=phase2_start_epoch,
-                gif_path=Path("plots") / "delta_phi_anim_latest.gif",
-            )
-        if val_democracy_history:
-            _make_democracy_gif(
-                val_democracy_history,
-                phase2_start_epoch=phase2_start_epoch,
-                gif_path=Path("plots") / "democracy_anim_latest.gif",
+            # Log
+            phase_tag = f"[P{training_phase}]" if phase1_active else ""
+            adv_str = f" | Adv R²={val_metrics['adv_r2']:.3f}" if use_adversary else ""
+            isr_str = ""
+            if "isr_acc" in val_metrics:
+                isr_str = (
+                    f" | ISR={val_metrics['isr_acc']:.3f}"
+                    f" Grp={val_metrics['grp_acc']:.3f}"
+                )
+            asym_str = (
+                f" | AvgAsym={val_metrics['avg_mass_asym']:.4f}"
+                f"±{val_metrics['std_mass_asym']:.4f}"
+                if "avg_mass_asym" in val_metrics
+                else ""
             )
 
-        # ---------------------------------------------------------------
-        # Phase 1 plateau detection → trigger Phase 2
-        # ---------------------------------------------------------------
-        if training_phase == 1 and phase1_active:
-            # Use grouping accuracy (given truth ISR) as the Phase 1 plateau
-            # signal.  During Phase 1 the ISR head is frozen at random initial
-            # weights, so the *combined* assignment accuracy (acc) stays near
-            # 1/70 ≈ 1.4% regardless of how well the grouping scorer is
-            # learning — using acc would trigger Phase 2 prematurely after
-            # just a few epochs.  grp_acc measures "given the truth ISR, how
-            # often does the grouping head pick the right 3+3 split?", which
-            # is exactly what Phase 1 is training.  For 6-jet (no-ISR) models,
-            # grp_acc is not reported, so fall back to acc.
-            phase1_monitor = val_metrics.get("grp_acc", val_metrics["acc"])
-            if phase1_monitor > phase1_best_acc:
-                phase1_best_acc = phase1_monitor
-                phase1_no_improve = 0
+            print(
+                f"Epoch {epoch+1:3d}/{tc['num_epochs']} {phase_tag} | "
+                f"Train loss={train_metrics['loss']:.4f} acc={train_metrics['acc']:.3f} | "
+                f"Val loss={val_metrics['loss']:.4f} acc={val_metrics['acc']:.3f}"
+                f"{isr_str}{adv_str}{asym_str} | "
+                f"LR={current_lr:.2e}"
+            )
+
+            with open(log_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    epoch + 1,
+                    f"{train_metrics['loss']:.6f}",
+                    f"{train_metrics['acc']:.4f}",
+                    f"{train_metrics['acc5']:.4f}",
+                    f"{val_metrics['loss']:.6f}",
+                    f"{val_metrics['acc']:.4f}",
+                    f"{val_metrics['acc5']:.4f}",
+                    f"{train_metrics.get('isr_acc', 0):.4f}",
+                    f"{train_metrics.get('grp_acc', 0):.4f}",
+                    f"{val_metrics.get('isr_acc', 0):.4f}",
+                    f"{val_metrics.get('grp_acc', 0):.4f}",
+                    f"{val_metrics['adv_r2']:.4f}",
+                    f"{current_lr:.6e}",
+                    training_phase,
+                    f"{train_metrics['avg_mass_asym']:.6f}" if "avg_mass_asym" in train_metrics else "",
+                    f"{train_metrics['std_mass_asym']:.6f}" if "std_mass_asym" in train_metrics else "",
+                    f"{val_metrics['avg_mass_asym']:.6f}" if "avg_mass_asym" in val_metrics else "",
+                    f"{val_metrics['std_mass_asym']:.6f}" if "std_mass_asym" in val_metrics else "",
+                    f"{train_metrics['avg_max_triplet_pt']:.6f}" if "avg_max_triplet_pt" in train_metrics else "",
+                    f"{train_metrics['std_max_triplet_pt']:.6f}" if "std_max_triplet_pt" in train_metrics else "",
+                    f"{val_metrics['avg_max_triplet_pt']:.6f}" if "avg_max_triplet_pt" in val_metrics else "",
+                    f"{val_metrics['std_max_triplet_pt']:.6f}" if "std_max_triplet_pt" in val_metrics else "",
+                    f"{train_metrics['avg_delta_phi']:.6f}" if "avg_delta_phi" in train_metrics else "",
+                    f"{train_metrics['std_delta_phi']:.6f}" if "std_delta_phi" in train_metrics else "",
+                    f"{val_metrics['avg_delta_phi']:.6f}" if "avg_delta_phi" in val_metrics else "",
+                    f"{val_metrics['std_delta_phi']:.6f}" if "std_delta_phi" in val_metrics else "",
+                    f"{train_metrics['avg_democracy']:.6f}" if "avg_democracy" in train_metrics else "",
+                    f"{train_metrics['std_democracy']:.6f}" if "std_democracy" in train_metrics else "",
+                    f"{val_metrics['avg_democracy']:.6f}" if "avg_democracy" in val_metrics else "",
+                    f"{val_metrics['std_democracy']:.6f}" if "std_democracy" in val_metrics else "",
+                ])
+
+            # Per-epoch live-monitoring plots (overwrite fixed "latest" files so a
+            # viewer that auto-refreshes (e.g. an open PDF) always shows current progress).
+            _plot_training_curves(log_path, phase2_start_epoch=phase2_start_epoch, tag="latest")
+            if val_asym_history:
+                _make_mass_asym_gif(
+                    val_asym_history,
+                    phase2_start_epoch=phase2_start_epoch,
+                    gif_path=Path("plots") / "mass_asym_anim_latest.gif",
+                )
+            if val_mass_sum_history:
+                _make_mass_sum_gif(
+                    val_mass_sum_history,
+                    phase2_start_epoch=phase2_start_epoch,
+                    gif_path=Path("plots") / "mass_sum_anim_latest.gif",
+                )
+            if val_max_triplet_pt_history:
+                _make_max_triplet_pt_gif(
+                    val_max_triplet_pt_history,
+                    phase2_start_epoch=phase2_start_epoch,
+                    gif_path=Path("plots") / "max_triplet_pt_anim_latest.gif",
+                )
+            if val_delta_phi_history:
+                _make_delta_phi_gif(
+                    val_delta_phi_history,
+                    phase2_start_epoch=phase2_start_epoch,
+                    gif_path=Path("plots") / "delta_phi_anim_latest.gif",
+                )
+            if val_democracy_history:
+                _make_democracy_gif(
+                    val_democracy_history,
+                    phase2_start_epoch=phase2_start_epoch,
+                    gif_path=Path("plots") / "democracy_anim_latest.gif",
+                )
+
+            # ---------------------------------------------------------------
+            # Phase 1 plateau detection → trigger Phase 2
+            # ---------------------------------------------------------------
+            if training_phase == 1 and phase1_active:
+                # Use grouping accuracy (given truth ISR) as the Phase 1 plateau
+                # signal.  During Phase 1 the ISR head is frozen at random initial
+                # weights, so the *combined* assignment accuracy (acc) stays near
+                # 1/70 ≈ 1.4% regardless of how well the grouping scorer is
+                # learning — using acc would trigger Phase 2 prematurely after
+                # just a few epochs.  grp_acc measures "given the truth ISR, how
+                # often does the grouping head pick the right 3+3 split?", which
+                # is exactly what Phase 1 is training.  For 6-jet (no-ISR) models,
+                # grp_acc is not reported, so fall back to acc.
+                phase1_monitor = val_metrics.get("grp_acc", val_metrics["acc"])
+                if phase1_monitor > phase1_best_acc:
+                    phase1_best_acc = phase1_monitor
+                    phase1_no_improve = 0
+                    torch.save(
+                        {
+                            "epoch": epoch + 1,
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "val_acc": phase1_best_acc,
+                            "config": config,
+                        },
+                        "checkpoints/phase1_best_model.pt",
+                    )
+                else:
+                    phase1_no_improve += 1
+
+                if phase1_no_improve >= phase1_patience:
+                    training_phase = 2
+                    phase2_start_epoch = epoch + 1
+                    print(
+                        f"\n*** Phase 1 plateau at epoch {epoch+1} "
+                        f"(best grp_acc={phase1_best_acc:.4f}, "
+                        f"no improvement for {phase1_patience} epochs). "
+                        f"Entering Phase 2: full supervised training. ***\n"
+                    )
+                    _export_phase1_snapshot(
+                        checkpoint_path="checkpoints/phase1_best_model.pt",
+                        num_jets=dc["num_jets"],
+                        val_acc=phase1_best_acc,
+                    )
+                    if model.has_isr:
+                        for p in model.isr_head.parameters():
+                            p.requires_grad_(True)
+                        for p in model.grouping_summary_proj.parameters():
+                            p.requires_grad_(True)
+                        print("  ISR head unfrozen.")
+                    # Reset the Phase 2 early-stopping counter independently.
+                    no_improve = 0
+                    best_val_acc = 0.0  # let Phase 2 build its own best checkpoint
+                # In Phase 1 we do not apply early stopping — only the plateau
+                # detector (phase1_no_improve) controls the transition.
+                continue
+
+            # Checkpoint (Phase 2 or single-phase)
+            if val_metrics["acc"] > best_val_acc:
+                best_val_acc = val_metrics["acc"]
+                best_epoch = epoch + 1
+                no_improve = 0
                 torch.save(
                     {
                         "epoch": epoch + 1,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
-                        "val_acc": phase1_best_acc,
+                        "val_acc": best_val_acc,
                         "config": config,
                     },
-                    "checkpoints/phase1_best_model.pt",
+                    "checkpoints/best_model.pt",
                 )
+                print(f"  -> Saved best model (val_acc={best_val_acc:.4f})")
             else:
-                phase1_no_improve += 1
+                no_improve += 1
 
-            if phase1_no_improve >= phase1_patience:
-                training_phase = 2
-                phase2_start_epoch = epoch + 1
-                print(
-                    f"\n*** Phase 1 plateau at epoch {epoch+1} "
-                    f"(best grp_acc={phase1_best_acc:.4f}, "
-                    f"no improvement for {phase1_patience} epochs). "
-                    f"Entering Phase 2: full supervised training. ***\n"
-                )
-                _export_phase1_snapshot(
-                    checkpoint_path="checkpoints/phase1_best_model.pt",
-                    num_jets=dc["num_jets"],
-                    val_acc=phase1_best_acc,
-                )
-                if model.has_isr:
-                    for p in model.isr_head.parameters():
-                        p.requires_grad_(True)
-                    for p in model.grouping_summary_proj.parameters():
-                        p.requires_grad_(True)
-                    print("  ISR head unfrozen.")
-                # Reset the Phase 2 early-stopping counter independently.
-                no_improve = 0
-                best_val_acc = 0.0  # let Phase 2 build its own best checkpoint
-            # In Phase 1 we do not apply early stopping — only the plateau
-            # detector (phase1_no_improve) controls the transition.
-            continue
+            if no_improve >= patience:
+                print(f"Early stopping at epoch {epoch+1} (no improvement for {patience} epochs)")
+                break
 
-        # Checkpoint (Phase 2 or single-phase)
-        if val_metrics["acc"] > best_val_acc:
-            best_val_acc = val_metrics["acc"]
-            best_epoch = epoch + 1
-            no_improve = 0
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "val_acc": best_val_acc,
-                    "config": config,
-                },
-                "checkpoints/best_model.pt",
-            )
-            print(f"  -> Saved best model (val_acc={best_val_acc:.4f})")
-        else:
-            no_improve += 1
-
-        if no_improve >= patience:
-            print(f"Early stopping at epoch {epoch+1} (no improvement for {patience} epochs)")
-            break
+    except KeyboardInterrupt:
+        print("\n\nTraining interrupted by user. Exporting best model...")
 
     print(f"\nTraining complete. Best val accuracy: {best_val_acc:.4f} at epoch {best_epoch}")
 
