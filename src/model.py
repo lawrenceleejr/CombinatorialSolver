@@ -594,10 +594,12 @@ class JetAssignmentTransformer(nn.Module):
         sym_diff = (g1_pooled - g2_pooled).abs()
 
         # ── full 24-feature physics (computed from already-gathered 4-momenta) ──
+        # _mass_features returns (..., 24): 6 inter-group features
+        # [mass_sum, mass_asym, mass_ratio, m1, m2, deltaR] followed by
+        # 9 intra-group features for group 1 and 9 for group 2 (18 total).
         g1_4vec = g1_jets_4mom.sum(dim=2)   # (batch, n_combos, 4)
         g2_4vec = g2_jets_4mom.sum(dim=2)
         physics = self._mass_features(g1_4vec, g2_4vec, g1_jets_4mom, g2_jets_4mom)
-        # (batch, n_combos, n_group_physics=24)
 
         # Extract raw mass sum and asymmetry BEFORE LayerNorm so that the
         # across-assignment ranking (argmin mass_asym = classical best assignment)

@@ -1,7 +1,14 @@
 """
 Professional architecture diagram for JetAssignmentTransformer.
 Physics-conditioned GroupTransformer (arXiv:2202.03772-inspired).
+
+Usage:
+    python scripts/make_architecture_diagram.py [output_path]
+
+Default output: architecture_diagram.pdf in the repository root.
 """
+import argparse
+import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -453,7 +460,18 @@ ax.text(fig_w / 2, 0.25,
         ha="center", va="center", fontsize=7, color=TEXT_TINY,
         fontfamily="monospace")
 
-out = "/home/runner/work/CombinatorialSolver/CombinatorialSolver/architecture_diagram.pdf"
+_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+parser = argparse.ArgumentParser(description="Generate architecture diagram PDF")
+parser.add_argument(
+    "output",
+    nargs="?",
+    default=os.path.join(_repo_root, "architecture_diagram.pdf"),
+    help="Output PDF path (default: <repo_root>/architecture_diagram.pdf)",
+)
+args = parser.parse_args()
+
+out = args.output
 fig.savefig(out, bbox_inches="tight", dpi=200, facecolor=BG)
-print(f"Saved: {out}  ({__import__('os').path.getsize(out)//1024} KB)")
+print(f"Saved: {out}  ({os.path.getsize(out)//1024} KB)")
 plt.close(fig)
