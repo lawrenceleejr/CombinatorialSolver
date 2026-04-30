@@ -1703,10 +1703,27 @@ def _plot_training_curves(
     #     the truth label (which encodes the complete ISR + group1 + group2 triple).
     #   - ISR accuracy (factored models only): fraction where the ISR jet is correctly
     #     identified, independent of whether the grouping is also correct.
+    #
+    # Phase 1 scaling: during Phase 1 the ISR head is frozen (random, ~1/7 chance),
+    # acting as an oracle crutch — the model only has to solve the grouping subproblem.
+    # Multiplying Phase 1 accuracy by 7 removes this unfair advantage and puts both
+    # phases on a comparable scale, making the performance drop at the Phase 1→2
+    # transition visible as the oracle crutch is removed.
     import math as _math
+    _ISR_SCALE = 7  # number of ISR candidate jets (scale factor for Phase 1)
+    has_phase1 = phase2_start_epoch is not None and any(p == 1 for p in phases)
+    def _scale_acc(acc_list):
+        """Scale Phase 1 accuracy values by _ISR_SCALE; leave Phase 2 unchanged."""
+        if not has_phase1:
+            return acc_list
+        return [v * _ISR_SCALE if p == 1 else v for v, p in zip(acc_list, phases)]
+
+    plot_train_acc = _scale_acc(train_acc)
+    plot_val_acc   = _scale_acc(val_acc)
+
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(epochs, train_acc, label="Train: full assignment acc", color="steelblue")
-    ax.plot(epochs, val_acc,   label="Val:   full assignment acc", color="darkorange")
+    ax.plot(epochs, plot_train_acc, label="Train: full assignment acc", color="steelblue")
+    ax.plot(epochs, plot_val_acc,   label="Val:   full assignment acc", color="darkorange")
     # Add ISR accuracy curves when the model is factored (ISR + grouping) and the
     # CSV columns are present and non-zero (non-factored runs log 0 for these).
     isr_has_data = any(v > 0 for v in val_isr_acc if not _math.isnan(v))
@@ -1717,11 +1734,18 @@ def _plot_training_curves(
                 color="darkorange", linestyle="--", alpha=0.7)
     _add_phase_lines(ax)
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Fraction of events correct")
-    ax.set_title(
-        "Assignment Accuracy vs Epoch\n"
-        "(full assignment = correct ISR jet + correct 3+3 grouping)"
-    )
+    if has_phase1:
+        ax.set_ylabel(f"Fraction of events correct (×{_ISR_SCALE} in Phase 1)")
+        ax.set_title(
+            "Assignment Accuracy vs Epoch\n"
+            f"(Phase 1 acc ×{_ISR_SCALE} to remove ISR oracle crutch; Phase 2 unscaled)"
+        )
+    else:
+        ax.set_ylabel("Fraction of events correct")
+        ax.set_title(
+            "Assignment Accuracy vs Epoch\n"
+            "(full assignment = correct ISR jet + correct 3+3 grouping)"
+        )
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
