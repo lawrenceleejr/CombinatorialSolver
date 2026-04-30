@@ -70,6 +70,8 @@ def export_ml_model(
         dim_feedforward=mc["dim_feedforward"],
         dropout=mc.get("dropout", 0.1),
         num_jets=num_jets,
+        input_dim=dc.get("input_dim", 4),
+        group_num_layers=mc.get("group_num_layers", 1),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
