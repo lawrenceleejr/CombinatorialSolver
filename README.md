@@ -2,6 +2,37 @@
 
 Transformer-based neural network for combinatorial jet assignment in pair-produced resonance searches at the LHC.
 
+## TL;DR — Quick-start commands
+
+```bash
+# 0. Generate mock data (for testing without real data)
+python scripts/generate_mock_data.py --output data/mock_data.h5 --n-events 10000
+
+# 1. Train
+python -m src.train --config configs/default.yaml --data "data/*.h5"
+
+# 2. Evaluate
+python -m src.evaluate --checkpoint checkpoints/best_model.pt --data "data/test*.h5" --output results/
+
+# 3. Export to ONNX (ML model)
+python -m src.export_onnx --checkpoint checkpoints/best_model.pt --output-dir onnx_models/
+
+# 3a. Export classical solver to ONNX (no checkpoint needed)
+python -m src.export_onnx --classical-only --output-dir onnx_models/
+
+# 4. Diagnose failures (ML model, HT-normalised inputs)
+python scripts/diagnose_onnx.py \
+    --model onnx_models/ml_model.onnx \
+    --data "data/test*.h5" \
+    --num-jets 7 --n-examples 30 --output results/
+
+# 4a. Diagnose failures (classical solver, raw inputs)
+python scripts/diagnose_onnx.py \
+    --model onnx_models/classical_mass_asymmetry.onnx \
+    --data "data/test*.h5" \
+    --no-normalize
+```
+
 Given 7 leading jets per event, the model identifies which jet is ISR and assigns the remaining 6 jets into two groups of 3, each corresponding to a parent particle. The predicted grouping yields a reconstructed mass variable for bump-hunt analysis.
 
 ## Architecture
