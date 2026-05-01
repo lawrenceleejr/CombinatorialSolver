@@ -4,6 +4,15 @@ Evaluation and mass reconstruction for the jet assignment model.
 Loads a trained model, predicts jet assignments on a test set,
 reconstructs invariant masses from the predicted triplets, and
 outputs results for bump-hunt analysis.
+
+Failure diagnostics (--diagnose-failures):
+  After normal evaluation, groups wrong predictions by failure mode
+  (ISR wrong, grouping wrong, or both) and prints a summary table
+  of mean ± std for key kinematic features (pT hierarchy, D₂,
+  Dalitz ratios, mass asymmetry, model confidence) for each mode.
+  Also prints the N most-confident wrong predictions as individual
+  event snapshots and writes a failure_diagnostics.csv.  This makes
+  it easy to identify kinematic regimes where the model struggles.
 """
 
 import argparse
@@ -20,6 +29,277 @@ from .model import JetAssignmentTransformer, MassAsymmetryClassicalSolver
 from .utils import compute_invariant_mass, get_config, get_device
 
 
+def _compute_group_kinematics(
+    raw_4mom: torch.Tensor,
+    jet_indices: tuple | list,
+) -> dict[str, float]:
+    """Compute kinematic summary for one triplet of jets.
+
+    Args:
+        raw_4mom: (num_jets, 4) un-normalised (E, px, py, pz) tensor.
+        jet_indices: 3 jet indices that form the group.
+
+    Returns:
+        Dict of named scalar kinematic quantities.
+    """
+    jets = raw_4mom[list(jet_indices)]   # (3, 4)
+    E   = jets[:, 0].clamp(min=1e-8)
+    px  = jets[:, 1]
+    py  = jets[:, 2]
+    pz  = jets[:, 3]
+    pt  = torch.sqrt(px**2 + py**2).clamp(min=1e-8)
+
+    pt_sorted, _ = pt.sort(descending=True)
+    pt_max_ratio = (pt_sorted[0] / pt_sorted[2].clamp(min=1e-8)).item()
+    pt_cv = (pt.std() / pt.mean().clamp(min=1e-8)).item()
+
+    p_group = jets.sum(dim=0)
+    m2_group = (p_group[0]**2 - p_group[1]**2 - p_group[2]**2 - p_group[3]**2)
+    m_group = m2_group.clamp(min=0).sqrt().item()
+
+    # Pairwise sub-masses (Dalitz ratios)
+    pairs = [(0, 1), (0, 2), (1, 2)]
+    sub_masses = []
+    for i, j in pairs:
+        p_ij = jets[i] + jets[j]
+        m2_ij = p_ij[0]**2 - p_ij[1]**2 - p_ij[2]**2 - p_ij[3]**2
+        sub_masses.append(m2_ij.clamp(min=0).sqrt().item())
+    sub_masses_norm = sorted(
+        [m / max(m_group, 1e-8) for m in sub_masses]
+    )
+
+    # D₂ approximation via ECF
+    eta = torch.asinh(pz / pt)
+    phi = torch.atan2(py, px)
+    E_sum = E.sum().clamp(min=1e-8)
+    z_E = E / E_sum
+    dr_list = []
+    ecf2 = 0.0
+    for i, j in pairs:
+        deta = (eta[i] - eta[j]).item()
+        dphi_raw = (phi[i] - phi[j]).item()
+        # wrap to [-pi, pi]
+        dphi = (dphi_raw + np.pi) % (2 * np.pi) - np.pi
+        dr = np.sqrt(deta**2 + dphi**2)
+        dr_list.append(dr)
+        ecf2 += (z_E[i] * z_E[j]).item() * dr
+    ecf3 = (z_E[0] * z_E[1] * z_E[2]).item() * dr_list[0] * dr_list[1] * dr_list[2]
+    d2 = ecf3 / max(ecf2, 1e-8) ** 2
+
+    return {
+        "m_group": m_group,
+        "pt_max_ratio": pt_max_ratio,
+        "pt_cv": pt_cv,
+        "d2": d2,
+        "dalitz_min": sub_masses_norm[0],
+        "dalitz_mid": sub_masses_norm[1],
+        "dalitz_max": sub_masses_norm[2],
+    }
+
+
+def diagnose_failures(
+    raw_four_mom: torch.Tensor,
+    all_preds: torch.Tensor,
+    all_labels: torch.Tensor,
+    all_logits: torch.Tensor,
+    assignments: list,
+    has_isr: bool,
+    flat_to_factored: torch.Tensor | None = None,
+    n_examples: int = 20,
+    output_dir: str = "results",
+) -> None:
+    """Diagnose kinematic features of mis-classified events.
+
+    Prints:
+      - Counts and fraction for each failure mode.
+      - Feature summary table (mean ± std) per failure mode vs correct events.
+      - Individual event snapshots for the N most-confident wrong predictions.
+    Writes ``failure_diagnostics.csv`` to *output_dir*.
+
+    Args:
+        raw_four_mom: (N, num_jets, 4) un-normalised (E, px, py, pz).
+        all_preds: (N,) predicted flat assignment indices.
+        all_labels: (N,) truth flat assignment indices.
+        all_logits: (N, num_assignments) raw model logits.
+        assignments: list of (isr_or_None, g1_tuple, g2_tuple) from
+            ``enumerate_assignments``.
+        has_isr: whether the model uses a factored ISR head.
+        flat_to_factored: (num_assignments, 2) tensor mapping flat index to
+            (isr_idx, grouping_idx).  Required when has_isr=True.
+        n_examples: number of most-confident wrong events to print in full.
+        output_dir: directory for ``failure_diagnostics.csv``.
+    """
+    N = len(all_preds)
+    correct_mask = (all_preds == all_labels)
+
+    probs = all_logits.softmax(dim=-1)
+    confidence = probs.max(dim=-1).values   # (N,) model confidence in its prediction
+
+    # ---------- failure mode classification ----------
+    if has_isr and flat_to_factored is not None:
+        truth_isr = flat_to_factored[all_labels, 0]
+        pred_isr  = flat_to_factored[all_preds,  0]
+        truth_grp = flat_to_factored[all_labels, 1]
+        pred_grp  = flat_to_factored[all_preds,  1]
+        isr_wrong = (pred_isr != truth_isr)
+        grp_wrong = (pred_grp != truth_grp)
+        # mode labels for each event
+        mode = np.full(N, "correct", dtype=object)
+        mode[(~correct_mask).numpy() & isr_wrong.numpy() & ~grp_wrong.numpy()] = "ISR-wrong"
+        mode[(~correct_mask).numpy() & ~isr_wrong.numpy() & grp_wrong.numpy()] = "grp-wrong"
+        mode[(~correct_mask).numpy() & isr_wrong.numpy() & grp_wrong.numpy()]  = "both-wrong"
+    else:
+        mode = np.where(correct_mask.numpy(), "correct", "wrong")
+        isr_wrong = grp_wrong = None
+
+    # ---------- per-event kinematic features ----------
+    print("\n" + "=" * 72)
+    print("FAILURE DIAGNOSTICS")
+    print("=" * 72)
+    print(f"Total events: {N}  |  Correct: {correct_mask.sum().item()}  "
+          f"({correct_mask.float().mean().item():.1%})")
+    print()
+
+    feature_keys = [
+        "m_pred_g1", "m_pred_g2", "mass_asym_pred",
+        "pt_max_ratio_g1", "pt_max_ratio_g2",
+        "pt_cv_g1", "pt_cv_g2",
+        "d2_g1", "d2_g2",
+        "dalitz_min_g1", "dalitz_mid_g1", "dalitz_max_g1",
+        "dalitz_min_g2", "dalitz_mid_g2", "dalitz_max_g2",
+        "confidence",
+    ]
+    if has_isr:
+        feature_keys.insert(0, "isr_pt")
+
+    rows = []     # for CSV
+    feature_matrix = {k: [] for k in feature_keys}
+    feature_matrix["mode"] = []
+
+    for i in range(N):
+        p_idx = all_preds[i].item()
+        isr_p, g1_p, g2_p = assignments[p_idx]
+
+        raw = raw_four_mom[i]   # (num_jets, 4)
+
+        feat: dict[str, float] = {}
+
+        if has_isr and isr_p is not None:
+            isr_jet = raw[isr_p]
+            isr_pT = torch.sqrt(isr_jet[1]**2 + isr_jet[2]**2).item()
+            feat["isr_pt"] = isr_pT
+
+        gk1 = _compute_group_kinematics(raw, g1_p)
+        gk2 = _compute_group_kinematics(raw, g2_p)
+        mass_asym = abs(gk1["m_group"] - gk2["m_group"]) / max(
+            gk1["m_group"] + gk2["m_group"], 1e-8
+        )
+
+        feat["m_pred_g1"]        = gk1["m_group"]
+        feat["m_pred_g2"]        = gk2["m_group"]
+        feat["mass_asym_pred"]   = mass_asym
+        feat["pt_max_ratio_g1"]  = gk1["pt_max_ratio"]
+        feat["pt_max_ratio_g2"]  = gk2["pt_max_ratio"]
+        feat["pt_cv_g1"]         = gk1["pt_cv"]
+        feat["pt_cv_g2"]         = gk2["pt_cv"]
+        feat["d2_g1"]            = gk1["d2"]
+        feat["d2_g2"]            = gk2["d2"]
+        feat["dalitz_min_g1"]    = gk1["dalitz_min"]
+        feat["dalitz_mid_g1"]    = gk1["dalitz_mid"]
+        feat["dalitz_max_g1"]    = gk1["dalitz_max"]
+        feat["dalitz_min_g2"]    = gk2["dalitz_min"]
+        feat["dalitz_mid_g2"]    = gk2["dalitz_mid"]
+        feat["dalitz_max_g2"]    = gk2["dalitz_max"]
+        feat["confidence"]       = confidence[i].item()
+
+        feature_matrix["mode"].append(mode[i])
+        for k in feature_keys:
+            feature_matrix[k].append(feat.get(k, float("nan")))
+
+        row = {"event_idx": i, "mode": mode[i]}
+        row.update(feat)
+        rows.append(row)
+
+    # ---------- summary table ----------
+    unique_modes = ["correct"] + sorted(
+        set(m for m in mode if m != "correct")
+    )
+    print(f"{'Feature':<22}", end="")
+    for m in unique_modes:
+        print(f"  {m:>26}", end="")
+    print()
+    print("-" * (22 + 28 * len(unique_modes)))
+
+    for k in feature_keys:
+        vals_by_mode = {}
+        for m in unique_modes:
+            mask_m = np.array(feature_matrix["mode"]) == m
+            vals = np.array(feature_matrix[k])[mask_m]
+            vals = vals[np.isfinite(vals)]
+            if len(vals) > 0:
+                vals_by_mode[m] = (np.mean(vals), np.std(vals), len(vals))
+            else:
+                vals_by_mode[m] = (float("nan"), float("nan"), 0)
+
+        print(f"{k:<22}", end="")
+        for m in unique_modes:
+            mu, sigma, n = vals_by_mode[m]
+            print(f"  {mu:>10.3f} ± {sigma:<8.3f} (n={n})", end="")
+        print()
+
+    # ---------- mode counts ----------
+    print()
+    for m in unique_modes:
+        n_m = (np.array(feature_matrix["mode"]) == m).sum()
+        print(f"  {m:<15}: {n_m:>6} events  ({n_m/N:.1%})")
+
+    # ---------- most-confident wrong events ----------
+    wrong_indices = np.where(np.array(feature_matrix["mode"]) != "correct")[0]
+    if len(wrong_indices) == 0:
+        print("\nNo wrong events found — model is perfectly correct on this dataset.")
+    else:
+        wrong_conf = confidence[wrong_indices].numpy()
+        # sort by descending confidence (most confidently wrong first)
+        order = wrong_conf.argsort()[::-1]
+        top_n = wrong_indices[order[:n_examples]]
+
+        print(f"\n--- {min(n_examples, len(wrong_indices))} most-confident wrong predictions ---")
+        for rank, i in enumerate(top_n, 1):
+            p_idx = all_preds[i].item()
+            t_idx = all_labels[i].item()
+            isr_p, g1_p, g2_p = assignments[p_idx]
+            isr_t, g1_t, g2_t = assignments[t_idx]
+            print(f"\n[{rank}] event {i:>6}  mode={mode[i]:<12}  conf={confidence[i].item():.3f}")
+            print(f"     pred : ISR={isr_p}  g1={list(g1_p)}  g2={list(g2_p)}")
+            print(f"     truth: ISR={isr_t}  g1={list(g1_t)}  g2={list(g2_t)}")
+            r = rows[i]
+            if "isr_pt" in r:
+                print(f"     ISR pT                = {r['isr_pt']:.1f} GeV")
+            print(f"     pred masses           = {r['m_pred_g1']:.1f} / {r['m_pred_g2']:.1f} GeV"
+                  f"  (asym={r['mass_asym_pred']:.3f})")
+            print(f"     pT hierarchy (g1/g2)  = {r['pt_max_ratio_g1']:.2f} / {r['pt_max_ratio_g2']:.2f}")
+            print(f"     pT CoV       (g1/g2)  = {r['pt_cv_g1']:.3f} / {r['pt_cv_g2']:.3f}")
+            print(f"     D₂           (g1/g2)  = {r['d2_g1']:.4f} / {r['d2_g2']:.4f}")
+            print(f"     Dalitz g1 (min/mid/max)= "
+                  f"{r['dalitz_min_g1']:.3f} / {r['dalitz_mid_g1']:.3f} / {r['dalitz_max_g1']:.3f}")
+            print(f"     Dalitz g2 (min/mid/max)= "
+                  f"{r['dalitz_min_g2']:.3f} / {r['dalitz_mid_g2']:.3f} / {r['dalitz_max_g2']:.3f}")
+
+    # ---------- CSV export ----------
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    csv_path = Path(output_dir) / "failure_diagnostics.csv"
+    fieldnames = ["event_idx", "mode"] + (["isr_pt"] if has_isr else []) + [
+        k for k in feature_keys if k != "isr_pt"
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({k: f"{v:.6g}" if isinstance(v, float) else v for k, v in r.items()})
+    print(f"\nFailure diagnostics written to {csv_path}")
+    print("=" * 72)
+
+
 def evaluate(
     checkpoint_path: str,
     data_path: str,
@@ -27,6 +307,8 @@ def evaluate(
     config_path: str | None = None,
     include_classical: bool = True,
     physics_blend_alpha: float = 0.0,
+    diagnose: bool = False,
+    n_examples: int = 20,
 ):
     """Evaluate model and reconstruct masses.
 
@@ -361,6 +643,21 @@ def evaluate(
     print(f"Mass avg (truth):         mean={np.nanmean(mass_avg_truth):.1f} GeV, "
           f"std={np.nanstd(mass_avg_truth):.1f} GeV")
 
+    # Optional kinematic failure diagnostics
+    if diagnose:
+        f2f = model.flat_to_factored if has_isr_model else None
+        diagnose_failures(
+            raw_four_mom=raw_four_mom,
+            all_preds=all_preds,
+            all_labels=all_labels,
+            all_logits=all_logits,
+            assignments=assignments,
+            has_isr=has_isr_model,
+            flat_to_factored=f2f,
+            n_examples=n_examples,
+            output_dir=output_dir,
+        )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate jet assignment model")
@@ -383,9 +680,30 @@ if __name__ == "__main__":
             "low-mass assignments without retraining. Typical values: 0.5–2.0."
         ),
     )
+    parser.add_argument(
+        "--diagnose-failures",
+        action="store_true",
+        help=(
+            "After normal evaluation, print a kinematic breakdown of wrong "
+            "predictions grouped by failure mode (ISR wrong / grouping wrong / "
+            "both wrong) and write failure_diagnostics.csv.  Useful for "
+            "identifying kinematic regimes where the model struggles."
+        ),
+    )
+    parser.add_argument(
+        "--n-examples",
+        type=int,
+        default=20,
+        help=(
+            "Number of most-confident wrong predictions to print as individual "
+            "event snapshots when --diagnose-failures is active (default: 20)."
+        ),
+    )
     args = parser.parse_args()
     evaluate(
         args.checkpoint, args.data, args.output, args.config,
         not args.no_classical,
         physics_blend_alpha=args.physics_blend_alpha,
+        diagnose=args.diagnose_failures,
+        n_examples=args.n_examples,
     )
