@@ -1703,7 +1703,7 @@ def _plot_training_curves(
     # --- Learning-rate plot ---
     lr_epochs = [e for e, v in zip(epochs, lr_values) if not math.isnan(v)]
     if lr_epochs:
-        lr_vals = [v for v in lr_values if not _math_lr.isnan(v)]
+        lr_vals = [v for v in lr_values if not math.isnan(v)]
         fig, ax = plt.subplots(figsize=(9, 5))
         ax.plot(lr_epochs, lr_vals, color="mediumorchid", label="Learning rate")
         _add_phase_lines(ax)
