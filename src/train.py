@@ -1006,7 +1006,7 @@ def _make_mass_asym_gif(
     anim = animation.FuncAnimation(
         fig,
         _draw_frame,
-        frames=len(val_asym_history),
+        frames=[0] * 4 + list(range(len(val_asym_history))),
         interval=200,
         repeat=False,
     )
@@ -1146,7 +1146,7 @@ def _make_mass_sum_gif(
     anim = animation.FuncAnimation(
         fig,
         _draw_frame,
-        frames=len(val_mass_sum_history),
+        frames=[0] * 4 + list(range(len(val_mass_sum_history))),
         interval=200,
         repeat=False,
     )
@@ -1285,7 +1285,7 @@ def _make_max_triplet_pt_gif(
     anim = animation.FuncAnimation(
         fig,
         _draw_frame,
-        frames=len(val_max_triplet_pt_history),
+        frames=[0] * 4 + list(range(len(val_max_triplet_pt_history))),
         interval=200,
         repeat=False,
     )
@@ -1414,7 +1414,7 @@ def _make_delta_phi_gif(
     anim = animation.FuncAnimation(
         fig,
         _draw_frame,
-        frames=len(val_delta_phi_history),
+        frames=[0] * 4 + list(range(len(val_delta_phi_history))),
         interval=200,
         repeat=False,
     )
@@ -1545,7 +1545,7 @@ def _make_democracy_gif(
     anim = animation.FuncAnimation(
         fig,
         _draw_frame,
-        frames=len(val_democracy_history),
+        frames=[0] * 4 + list(range(len(val_democracy_history))),
         interval=200,
         repeat=False,
     )
