@@ -464,11 +464,17 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 f"LR capped at {phase1_lr_fraction * base_lr:.1e} before Phase 2)."
             )
 
+    # If restart_period is 0 (or not set), default to patience so the cosine
+    # cycle length scales with the early-stopping window.  This ensures the LR
+    # stays near its minimum for roughly one full patience window before the
+    # next warm restart, preventing premature kicks out of a good minimum.
+    _restart_period = tc.get("restart_period", 0) or patience
+
     try:
         for epoch in range(tc["num_epochs"]):
             cosine_with_warmup(
                 optimizer, epoch, tc["num_epochs"], tc["warmup_epochs"],
-                restart_period=tc.get("restart_period", 0),
+                restart_period=_restart_period,
             )
 
             # During Phase 1, clamp LR to phase1_lr_fraction × initial_lr.
@@ -1561,10 +1567,11 @@ def _plot_training_curves(
     phase2_start_epoch: int | None = None,
     tag: str | None = None,
 ) -> "list[Path]":
-    """Generate loss, accuracy, and mass-asymmetry plots from the training log CSV.
+    """Generate loss, accuracy, learning-rate, and mass-asymmetry plots from the training log CSV.
 
-    Creates three PDF files in a ``plots/`` directory:
+    Creates PDF files in a ``plots/`` directory:
       - ``loss_{tag}.pdf``         – train and validation loss vs epoch
+      - ``lr_{tag}.pdf``           – learning rate vs epoch
       - ``accuracy_{tag}.pdf``     – train and validation accuracy vs epoch
       - ``mass_asym_{tag}.pdf``    – mean ± 1σ mass asymmetry of the chosen
                                      interpretation vs epoch (train and val)
@@ -1606,6 +1613,7 @@ def _plot_training_curves(
     train_avg_mpt, train_std_mpt, val_avg_mpt, val_std_mpt = [], [], [], []
     train_avg_dphi, train_std_dphi, val_avg_dphi, val_std_dphi = [], [], [], []
     train_avg_dem, train_std_dem, val_avg_dem, val_std_dem = [], [], [], []
+    lr_values: list[float] = []
     with open(log_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -1615,10 +1623,11 @@ def _plot_training_curves(
             train_acc.append(float(row["train_acc"]))
             val_acc.append(float(row["val_acc"]))
             phases.append(int(row["phase"]))
-            # Mass-asymmetry columns are present only in logs from this version onward;
-            # older logs will have an empty string which we convert to NaN.
+            # LR column – present in all logs; guard against missing entries in
+            # very old CSV files that pre-date the "lr" column.
             def _parse_float(s):
                 return float(s) if s else float("nan")
+            lr_values.append(_parse_float(row.get("lr", "")))
             train_avg_asym.append(_parse_float(row.get("train_avg_mass_asym", "")))
             train_std_asym.append(_parse_float(row.get("train_std_mass_asym", "")))
             val_avg_asym.append(_parse_float(row.get("val_avg_mass_asym", "")))
@@ -1690,6 +1699,27 @@ def _plot_training_curves(
     plt.close(fig)
     print(f"  -> Saved loss plot     : {loss_path}")
     saved_paths.append(loss_path)
+
+    # --- Learning-rate plot ---
+    import math as _math_lr
+    lr_epochs = [e for e, v in zip(epochs, lr_values) if not _math_lr.isnan(v)]
+    if lr_epochs:
+        lr_vals = [v for v in lr_values if not _math_lr.isnan(v)]
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.plot(lr_epochs, lr_vals, color="mediumorchid", label="Learning rate")
+        _add_phase_lines(ax)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Learning rate")
+        ax.set_yscale("log")
+        ax.set_title("Learning Rate vs Epoch")
+        ax.legend()
+        ax.grid(True, alpha=0.3, which="both")
+        fig.tight_layout()
+        lr_path = plots_dir / f"lr_{tag}.pdf"
+        fig.savefig(lr_path)
+        plt.close(fig)
+        print(f"  -> Saved LR plot       : {lr_path}")
+        saved_paths.append(lr_path)
 
     # --- Accuracy plot ---
     fig, ax = plt.subplots(figsize=(9, 5))

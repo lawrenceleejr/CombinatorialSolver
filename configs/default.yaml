@@ -13,7 +13,7 @@ training:
   weight_decay: 1.0e-4
   num_epochs: 200
   warmup_epochs: 5
-  restart_period: 50
+  restart_period: 0  # 0 = use patience as the cosine cycle length
   patience: 40
   lambda_adv: 0.0
   lambda_adv_rampup: 50
