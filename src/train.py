@@ -1623,8 +1623,8 @@ def _plot_training_curves(
             train_acc.append(float(row["train_acc"]))
             val_acc.append(float(row["val_acc"]))
             phases.append(int(row["phase"]))
-            # LR column – present in all logs; guard against missing entries in
-            # very old CSV files that pre-date the "lr" column.
+            # LR column – present in all current logs; guard against very old
+            # CSV files (pre-dating this column) where the field may be absent.
             def _parse_float(s):
                 return float(s) if s else float("nan")
             lr_values.append(_parse_float(row.get("lr", "")))
@@ -1701,8 +1701,7 @@ def _plot_training_curves(
     saved_paths.append(loss_path)
 
     # --- Learning-rate plot ---
-    import math as _math_lr
-    lr_epochs = [e for e, v in zip(epochs, lr_values) if not _math_lr.isnan(v)]
+    lr_epochs = [e for e, v in zip(epochs, lr_values) if not math.isnan(v)]
     if lr_epochs:
         lr_vals = [v for v in lr_values if not _math_lr.isnan(v)]
         fig, ax = plt.subplots(figsize=(9, 5))
