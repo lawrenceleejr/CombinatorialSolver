@@ -17,10 +17,11 @@ Architecture:
   6. GroupTransformer: intra-group mini-Transformer replaces sum-pooling to capture
      multi-particle angular correlations within each candidate 3-jet group
   7. Extended physics features per assignment:
-     - 6 inter-group features (mass sum/asymmetry/ratio, deltaR, individual masses)
+     - 12 inter-group features (mass sum/asym/ratio, individual masses, ΔR, Δη,
+       |Δφ|, pT balance, |cos θ*|, di-parent invariant mass, log γ_rel)
      - 9 intra-group features per group (pT hierarchy, Lund-plane kT, ECF₂/ECF₃/D₂,
        Dalitz pairwise masses) × 2 groups = 18 additional features
-     Total n_group_physics = 24
+     Total n_group_physics = 30
 """
 
 import torch
@@ -107,8 +108,8 @@ class JetAssignmentTransformer(nn.Module):
     Group pooling uses a shared GroupTransformer (mini-Transformer) rather than
     sum-pooling to preserve intra-group angular structure.
 
-    Physics features per assignment include 6 inter-group features plus 9
-    intra-group features per group (18 total), giving n_group_physics=24.
+    Physics features per assignment include 12 inter-group features plus 9
+    intra-group features per group (18 total), giving n_group_physics=30.
     """
 
     def __init__(
@@ -159,11 +160,11 @@ class JetAssignmentTransformer(nn.Module):
             dropout=dropout,
         )
 
-        # 6 inter-group features + 9 intra-group features per group × 2 groups = 24
-        self.n_group_physics = 24
+        # 12 inter-group features + 9 intra-group features per group × 2 groups = 30
+        self.n_group_physics = 30
 
         # Normalize physics features before feeding to scorer MLPs.
-        # The 24 features span very different scales (ratios ∈ [0,1] vs masses
+        # The 30 features span very different scales (ratios ∈ [0,1] vs masses
         # vs angular quantities), so LayerNorm stabilises the scorer inputs.
         self.physics_norm = nn.LayerNorm(self.n_group_physics)
 
@@ -449,12 +450,33 @@ class JetAssignmentTransformer(nn.Module):
     ) -> torch.Tensor:
         """Compute physics features from two group four-vectors.
 
-        Returns (..., 24) when individual jet 4-vectors are provided:
-          - 6 inter-group features: mass_sum, mass_asym, mass_ratio, m1, m2, deltaR
+        Returns (..., 30) when individual jet 4-vectors are provided:
+          - 12 inter-group features (see below)
           - 9 intra-group features for group 1 (pT hierarchy, Lund, ECFs, Dalitz)
           - 9 intra-group features for group 2
 
-        Returns (..., 6) when g1_jets / g2_jets are omitted (fallback).
+        Returns (..., 12) when g1_jets / g2_jets are omitted (fallback).
+
+        Inter-group feature order (indices 0–11):
+          0  mass_sum                — m1 + m2
+          1  mass_asym               — |m1-m2| / (m1+m2)
+          2  mass_ratio              — min(m1,m2)/max(m1,m2)
+          3  m1
+          4  m2
+          5  delta_r                 — ΔR between parent CoMs
+          6  delta_eta               — |η1-η2|
+          7  abs_dphi                — |Δφ| (wrapped, ∈ [0,π])
+          8  pt_balance              — |pT1-pT2|/(pT1+pT2)
+          9  cos_theta_star          — |cos θ*|, decay angle of g1 in (g1+g2)
+                                       rest frame relative to the di-parent
+                                       boost direction
+          10 m_diparent              — invariant mass of (g1+g2)
+          11 log_gamma_rel           — log of γ_rel = (p1·p2)/(m1·m2),
+                                       Lorentz-invariant rapidity gap between
+                                       the two parents
+
+        Indices 0 and 1 (mass_sum, mass_asym) are stable and used as raw
+        physical scales by callers that read physics[..., 0] / physics[..., 1].
         """
 
         def inv_mass(p):
@@ -467,24 +489,70 @@ class JetAssignmentTransformer(nn.Module):
         mass_asym = torch.abs(m1 - m2) / mass_sum.clamp(min=1e-8)
         mass_ratio = torch.min(m1, m2) / torch.max(m1, m2).clamp(min=1e-8)
 
-        def eta_phi(p):
+        def eta_phi_pt(p):
             px, py, pz = p[..., 1], p[..., 2], p[..., 3]
             pt = torch.sqrt(px**2 + py**2).clamp(min=1e-8)
-            return torch.asinh(pz / pt), torch.atan2(py, px)
+            return torch.asinh(pz / pt), torch.atan2(py, px), pt
 
-        eta1, phi1 = eta_phi(g1_4vec)
-        eta2, phi2 = eta_phi(g2_4vec)
+        eta1, phi1, pt1 = eta_phi_pt(g1_4vec)
+        eta2, phi2, pt2 = eta_phi_pt(g2_4vec)
         dphi = JetAssignmentTransformer.wrap_dphi(phi1 - phi2)
         delta_r = torch.sqrt((eta1 - eta2) ** 2 + dphi**2)
+        delta_eta = (eta1 - eta2).abs()
+        abs_dphi = dphi.abs()
+        pt_balance = (pt1 - pt2).abs() / (pt1 + pt2).clamp(min=1e-8)
 
-        inter = torch.stack([mass_sum, mass_asym, mass_ratio, m1, m2, delta_r], dim=-1)
+        # Di-parent system (g1+g2) — 4-vector and invariant mass.
+        P = g1_4vec + g2_4vec
+        P_spatial2 = P[..., 1] ** 2 + P[..., 2] ** 2 + P[..., 3] ** 2
+        P_mag = torch.sqrt(P_spatial2.clamp(min=1e-12))
+        M2_dipar = P[..., 0] ** 2 - P_spatial2
+        m_diparent = torch.sqrt(M2_dipar.clamp(min=1e-8))
+
+        # |cos θ*|: angle of g1 in the (g1+g2) rest frame, vs the di-parent
+        # lab boost direction.  Computed by Lorentz-boosting only the
+        # component of g1's momentum parallel to β; the perpendicular
+        # component is unchanged by the boost.
+        g1_spatial2 = g1_4vec[..., 1] ** 2 + g1_4vec[..., 2] ** 2 + g1_4vec[..., 3] ** 2
+        p1_par_lab = (
+            P[..., 1] * g1_4vec[..., 1]
+            + P[..., 2] * g1_4vec[..., 2]
+            + P[..., 3] * g1_4vec[..., 3]
+        ) / P_mag.clamp(min=1e-8)
+        p1_perp2 = (g1_spatial2 - p1_par_lab ** 2).clamp(min=0.0)
+        beta_P = (P_mag / P[..., 0].clamp(min=1e-8)).clamp(max=0.999999)
+        gamma_P = P[..., 0] / m_diparent.clamp(min=1e-8)
+        p1_star_par = gamma_P * (p1_par_lab - beta_P * g1_4vec[..., 0])
+        p1_star_mag = torch.sqrt((p1_star_par ** 2 + p1_perp2).clamp(min=1e-8))
+        cos_theta_star = (p1_star_par / p1_star_mag).abs().clamp(max=1.0)
+
+        # Lorentz-invariant rapidity gap between the two parent candidates.
+        # γ_rel = p1·p2/(m1 m2) ≥ 1; log compresses the dynamic range so
+        # boosted topologies don't dominate the LayerNorm scale.
+        p1_dot_p2 = (
+            g1_4vec[..., 0] * g2_4vec[..., 0]
+            - g1_4vec[..., 1] * g2_4vec[..., 1]
+            - g1_4vec[..., 2] * g2_4vec[..., 2]
+            - g1_4vec[..., 3] * g2_4vec[..., 3]
+        )
+        gamma_rel = p1_dot_p2 / (m1 * m2).clamp(min=1e-8)
+        log_gamma_rel = torch.log(gamma_rel.clamp(min=1.0))
+
+        inter = torch.stack(
+            [
+                mass_sum, mass_asym, mass_ratio, m1, m2, delta_r,
+                delta_eta, abs_dphi, pt_balance, cos_theta_star,
+                m_diparent, log_gamma_rel,
+            ],
+            dim=-1,
+        )
 
         if g1_jets is not None and g2_jets is not None:
             intra1 = JetAssignmentTransformer.intra_group_features(g1_jets)
             intra2 = JetAssignmentTransformer.intra_group_features(g2_jets)
-            return torch.cat([inter, intra1, intra2], dim=-1)   # (..., 24)
+            return torch.cat([inter, intra1, intra2], dim=-1)   # (..., 30)
 
-        return inter                                             # (..., 6)
+        return inter                                             # (..., 12)
 
     def _compute_grouping_logits(
         self, jet_embeddings: torch.Tensor, four_momenta: torch.Tensor

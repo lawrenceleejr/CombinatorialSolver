@@ -10,8 +10,8 @@ Given 7 leading jets per event, the model identifies which jet is ISR and assign
 - **Encoder**: Transformer with self-attention over jet tokens (4 layers, 8 heads, d=128) plus per-head learnable pT-hierarchy attention bias (log pT_i/pT_j)
 - **GroupTransformer**: Shared mini-Transformer (1 layer, 4 heads) replaces sum-pooling for group embeddings, preserving intra-group angular ordering and multi-particle correlations
 - **Scorer**: Enumerates all 70 possible (ISR, group1, group2) assignments, pools jet embeddings per group with the GroupTransformer, scores with an MLP. Group symmetry is handled via sum and Hadamard product of the two group embeddings.
-- **Extended physics features** (`n_group_physics=24`) per assignment:
-  - *6 inter-group*: mass sum, mass asymmetry |m1-m2|/(m1+m2), mass ratio, m1, m2, ΔR between group CoM
+- **Extended physics features** (`n_group_physics=30`) per assignment:
+  - *12 inter-group*: mass sum, mass asymmetry |m1-m2|/(m1+m2), mass ratio, m1, m2, ΔR between group CoM, Δη, |Δφ|, parent pT balance |pT1-pT2|/(pT1+pT2), |cos θ*| (decay angle of g1 in the (g1+g2) rest frame relative to the di-parent boost direction), m(g1+g2), log γ_rel = log[(p1·p2)/(m1·m2)] (Lorentz-invariant rapidity gap between parents)
   - *9 intra-group × 2 groups = 18*: max pT ratio, pT coefficient of variation, minimum Lund splitting fraction z, maximum Lund kT, ECF₂(β=1), ECF₃(β=1), D₂ = ECF₃/ECF₂², max and min Dalitz pairwise mass ratio
 - **Adversarial head**: Gradient-reversed MLP predicts parent mass from jet embeddings — penalizes the encoder if mass information leaks, preventing sculpting of the m_avg distribution.
 
