@@ -26,10 +26,27 @@ event, directly comparable between the two models.
 import argparse
 from pathlib import Path
 
+import onnx
 import torch
 
 from .model import JetAssignmentTransformer, MassAsymmetryClassicalSolver
 from .utils import get_config, get_device
+
+
+def _consolidate_external_data(onnx_path: str) -> None:
+    """Re-save the ONNX model with all weights embedded in the protobuf.
+
+    Torch may externalize tensors at export time; downstream consumers that
+    only receive the ``.onnx`` file then fail to load it. Round-tripping
+    through ``onnx.load`` / ``onnx.save`` inlines the weights and removes
+    any ``.onnx.data`` sidecar.
+    """
+    path = Path(onnx_path)
+    model = onnx.load(str(path), load_external_data=True)
+    onnx.save(model, str(path), save_as_external_data=False)
+    sidecar = path.with_suffix(path.suffix + ".data")
+    if sidecar.exists():
+        sidecar.unlink()
 
 
 class _LogitsOnly(torch.nn.Module):
@@ -91,6 +108,7 @@ def export_ml_model(
         dynamic_axes={"four_momenta": {0: "batch"}, "logits": {0: "batch"}},
         opset_version=17,
     )
+    _consolidate_external_data(output_path)
     print(f"ML model exported → {output_path}")
 
 
@@ -125,6 +143,7 @@ def export_classical_solver(
         dynamic_axes={"four_momenta": {0: "batch"}, "logits": {0: "batch"}},
         opset_version=17,
     )
+    _consolidate_external_data(output_path)
     print(f"Classical solver exported → {output_path}")
 
 
