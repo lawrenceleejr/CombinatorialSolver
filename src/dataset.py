@@ -58,6 +58,13 @@ class JetAssignmentDataset(Dataset):
             may be incorrect for some topologies (e.g. when the generator stores
             jets in an ordering that does not reflect parent-decay membership).
             Set to False to fall back to the TARGETS-based labelling.
+        is_background: If True, every event in these files is treated as QCD
+            multijet background.  Background events have no true combinatorial
+            assignment, so their argmin-|m1-m2| label is meaningless and is
+            excluded from the supervised cross-entropy during training; instead
+            they drive the background-rejection loss (see ``_run_epoch`` in
+            train.py).  Their ``parent_mass`` is zeroed so the adversarial mass
+            head ignores them.  Default False (signal sample).
     """
 
     def __init__(
@@ -67,11 +74,13 @@ class JetAssignmentDataset(Dataset):
         normalize_by_ht: bool = True,
         pt_smear_frac: float = 0.0,
         use_mass_asymmetry_labels: bool = True,
+        is_background: bool = False,
     ):
         self.num_jets = num_jets
         self.normalize_by_ht = normalize_by_ht
         self.pt_smear_frac = pt_smear_frac
         self.use_mass_asymmetry_labels = use_mass_asymmetry_labels
+        self.is_background_flag = bool(is_background)
 
         # Resolve file paths
         if isinstance(data_paths, str):
@@ -99,8 +108,19 @@ class JetAssignmentDataset(Dataset):
         self.parent_masses = torch.cat(all_masses, dim=0)
         self.ht = torch.cat(all_ht, dim=0)
 
+        # Per-event background tag.  Every event in this dataset is signal or
+        # QCD background depending on the is_background constructor flag.
+        self.is_background = torch.full(
+            (self.labels.shape[0],), self.is_background_flag, dtype=torch.bool
+        )
+
         # Normalize parent masses to TeV scale for stable adversarial training
         self.parent_masses = self.parent_masses / 1000.0
+
+        # QCD/background events carry no physical parent mass; zero them so the
+        # adversarial mass head (mass_mask = parent_mass > 0) ignores them.
+        if self.is_background_flag:
+            self.parent_masses = torch.zeros_like(self.parent_masses)
 
         # Filter out events with invalid labels
         valid = self.labels >= 0
@@ -109,6 +129,7 @@ class JetAssignmentDataset(Dataset):
         self.labels = self.labels[valid]
         self.parent_masses = self.parent_masses[valid]
         self.ht = self.ht[valid]
+        self.is_background = self.is_background[valid]
         n_after = len(self.labels)
 
         if n_after < n_before:
@@ -493,4 +514,5 @@ class JetAssignmentDataset(Dataset):
             "four_momenta": self.four_momenta[idx],
             "label": self.labels[idx],
             "parent_mass": self.parent_masses[idx],
+            "is_background": self.is_background[idx],
         }

@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.onnx
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import ConcatDataset, DataLoader, random_split
 
 from .dataset import JetAssignmentDataset
 from .export_onnx import export_classical_solver, export_ml_model
@@ -247,16 +247,51 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
     # Data
     if data_path is None:
-        data_path = "data/*.h5"
+        data_path = dc.get("data_path", "data/*.h5")
 
-    dataset = JetAssignmentDataset(
+    sig_dataset = JetAssignmentDataset(
         data_paths=data_path,
         num_jets=dc["num_jets"],
         normalize_by_ht=dc["normalize_by_ht"],
         pt_smear_frac=dc.get("pt_smear_frac", 0.0),
         use_mass_asymmetry_labels=dc.get("use_mass_asymmetry_labels", True),
+        is_background=False,
     )
-    print(f"Dataset size: {len(dataset)} events")
+    print(f"Signal dataset size: {len(sig_dataset)} events")
+
+    # Optional QCD/background sample.  Tagged is_background=True so its events
+    # drive the background-rejection loss (push to low average mass OR high
+    # asymmetry) instead of the supervised assignment loss.  The glob is read
+    # from data.qcd_data_path; if unset or no files match, training is
+    # signal-only and behaves exactly as before.
+    qcd_path = dc.get("qcd_data_path")
+    qcd_dataset = None
+    if qcd_path:
+        try:
+            qcd_dataset = JetAssignmentDataset(
+                data_paths=qcd_path,
+                num_jets=dc["num_jets"],
+                normalize_by_ht=dc["normalize_by_ht"],
+                pt_smear_frac=dc.get("pt_smear_frac", 0.0),
+                use_mass_asymmetry_labels=dc.get("use_mass_asymmetry_labels", True),
+                is_background=True,
+            )
+            print(f"QCD background dataset size: {len(qcd_dataset)} events")
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            print(f"QCD background sample not loaded ({qcd_path}): {exc}")
+            qcd_dataset = None
+
+    if qcd_dataset is not None and len(qcd_dataset) > 0:
+        dataset = ConcatDataset([sig_dataset, qcd_dataset])
+        n_bkg = len(qcd_dataset)
+        print(
+            f"Combined dataset size: {len(dataset)} events "
+            f"({len(sig_dataset)} signal + {n_bkg} background, "
+            f"{100.0 * n_bkg / max(len(dataset), 1):.1f}% background)"
+        )
+    else:
+        dataset = sig_dataset
+        print(f"Dataset size: {len(dataset)} events (signal only)")
 
     # Train/val split (90/10)
     n_val = max(1, int(0.1 * len(dataset)))
@@ -336,8 +371,9 @@ def train(config_path: str | None = None, data_path: str | None = None):
         print(f"Label smoothing: {label_smoothing}")
     mse_loss_fn = nn.MSELoss()
 
-    # Check if adversarial training is useful
-    mass_std = dataset.parent_masses.std().item()
+    # Check if adversarial training is useful (signal mass spread only;
+    # background events carry zeroed parent_mass and are excluded).
+    mass_std = sig_dataset.parent_masses.std().item()
     use_adversary = tc["lambda_adv"] > 0 and mass_std > 0.01
     if tc["lambda_adv"] == 0:
         print("Adversary disabled: lambda_adv=0")
@@ -400,6 +436,23 @@ def train(config_path: str | None = None, data_path: str | None = None):
     lambda_entropy_mass_max = tc.get("lambda_entropy_mass", 0.0)
     lambda_entropy_asym_rampup = tc.get("lambda_entropy_asym_rampup", 0)
     lambda_entropy_mass_rampup = tc.get("lambda_entropy_mass_rampup", 0)
+    # Background-rejection loss (requires a QCD sample loaded with is_background=True).
+    # For each background event, supervise the assignment toward the one that
+    # maximises bg = mass_asym - beta_bg * mass_sum — the most QCD-like (low average
+    # mass OR high asymmetry) interpretation.  This drives the QCD average-mass
+    # distribution to fall at least as steeply as the classical mass-asymmetry
+    # solver, while leaving signal untouched (the term is masked to background
+    # events only).  beta_bg -> inf is pure average-mass minimisation (steepest
+    # background); beta_bg -> 0 is pure asymmetry maximisation.  Ramps up from
+    # Phase 2 start like lambda_sym/qcd.
+    lambda_bg_max = tc.get("lambda_bg", 0.0)
+    lambda_bg_rampup = tc.get("lambda_bg_rampup", 0)
+    beta_bg = tc.get("beta_bg", 1.0)
+    if lambda_bg_max > 0:
+        print(
+            f"Background-rejection loss: lambda_bg={lambda_bg_max} "
+            f"(rampup={lambda_bg_rampup}), beta_bg={beta_bg}"
+        )
     if lambda_entropy_asym_max > 0 or lambda_entropy_mass_max > 0:
         print(
             f"Entropy-weighted physics prior: "
@@ -505,6 +558,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 lambda_isr_direct = 0.0
                 lambda_entropy_asym = 0.0
                 lambda_entropy_mass = 0.0
+                lambda_bg = 0.0
                 phase1_only_train = True
             else:
                 # Phase 2: teacher forcing, auxiliary losses, decaying distillation
@@ -548,6 +602,11 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 else:
                     lambda_entropy_mass = lambda_entropy_mass_max
 
+                if lambda_bg_rampup > 0:
+                    lambda_bg = lambda_bg_max * min(1.0, phase2_epoch / lambda_bg_rampup)
+                else:
+                    lambda_bg = lambda_bg_max
+
                 # Distillation decays from max to zero over lambda_distill_epochs
                 if lambda_distill_epochs > 0:
                     lambda_distill = lambda_distill_max * max(
@@ -568,6 +627,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 lambda_distill=lambda_distill, distill_temperature=distill_temperature,
                 lambda_entropy_asym=lambda_entropy_asym,
                 lambda_entropy_mass=lambda_entropy_mass,
+                lambda_bg=lambda_bg, beta_bg=beta_bg,
                 phase1_only=phase1_only_train,
                 pt_smear_frac=dc.get("pt_smear_frac", 0.0),
             )
@@ -583,6 +643,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                     lambda_isr=lambda_isr, lambda_isr_direct=0.0,
                     lambda_distill=0.0, distill_temperature=distill_temperature,
                     lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
+                    lambda_bg=0.0, beta_bg=beta_bg,
                     pt_smear_frac=dc.get("pt_smear_frac", 0.0),
                 )
 
@@ -600,6 +661,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                     epoch + 1, training_phase,
                     val_metrics["pred_mass_sum_values"],
                     val_metrics.get("pred_correct_values"),  # bool array or None
+                    val_metrics.get("pred_is_bkg_values"),   # bool array or None
                 ))
 
             # Accumulate per-event validation max-triplet scalar-pT distribution for GIF
@@ -1071,14 +1133,16 @@ def _make_mass_sum_gif(
 
     import numpy as np
 
-    # Unpack history: support both 3-tuple (legacy) and 4-tuple (with correct mask).
+    # Unpack history: tolerate 3-tuple (legacy), 4-tuple (with correct mask) and
+    # 5-tuple (with per-event background flag) entries.
     def _unpack(entry):
-        if len(entry) == 4:
-            return entry
-        return entry[0], entry[1], entry[2], None
+        epoch, phase, values = entry[0], entry[1], entry[2]
+        correct_mask = entry[3] if len(entry) >= 4 else None
+        is_bkg = entry[4] if len(entry) >= 5 else None
+        return epoch, phase, values, correct_mask, is_bkg
 
     # The average mass per candidate is mass_sum / 2.
-    all_avg_mass = [v / 2.0 for *_, v, _ in [_unpack(e) for e in val_mass_sum_history]]
+    all_avg_mass = [u[2] / 2.0 for u in (_unpack(e) for e in val_mass_sum_history)]
 
     # Fixed x-axis determined from the global data range (1st–99th percentile).
     all_concat = np.concatenate(all_avg_mass)
@@ -1102,12 +1166,23 @@ def _make_mass_sum_gif(
     centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 
     def _draw_frame(frame_idx):
-        epoch, phase, values, correct_mask = _unpack(val_mass_sum_history[frame_idx])
+        epoch, phase, values, correct_mask, is_bkg = _unpack(val_mass_sum_history[frame_idx])
         avg_mass = values / 2.0
         ax.cla()
         mean_val = float(avg_mass.mean())
 
-        if correct_mask is not None:
+        if is_bkg is not None and bool(is_bkg.any()):
+            # Signal vs QCD-background overlay — more informative than
+            # correct/incorrect when a background sample is present.  The QCD
+            # distribution should fall steeply toward low average mass.
+            counts_sig, _ = np.histogram(avg_mass[~is_bkg], bins=bin_edges)
+            counts_bkg, _ = np.histogram(avg_mass[is_bkg],  bins=bin_edges)
+            ax.bar(centers, counts_sig, width=bar_width,
+                   color="steelblue", alpha=0.85, align="center", label="Signal")
+            ax.bar(centers, counts_bkg, width=bar_width,
+                   color="indianred", alpha=0.85, align="center", label="QCD background",
+                   bottom=counts_sig)
+        elif correct_mask is not None:
             avg_correct   = avg_mass[correct_mask]
             avg_incorrect = avg_mass[~correct_mask]
             counts_correct,   _ = np.histogram(avg_correct,   bins=bin_edges)
@@ -1895,6 +1970,7 @@ def _run_epoch(
     tf_ratio=1.0, lambda_sym=0.0, lambda_qcd=0.0, lambda_isr=1.0, lambda_isr_direct=0.0,
     lambda_distill=0.0, distill_temperature=4.0,
     lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
+    lambda_bg=0.0, beta_bg=1.0,
     phase1_only=False,
     pt_smear_frac=0.0,
 ):
@@ -1923,12 +1999,35 @@ def _run_epoch(
     all_pred_democracy = []
     all_mass_pred = []
     all_mass_true = []
+    all_pred_is_bkg = []
+    total_sig_samples = 0
     factored = model.has_isr
+    # Label smoothing used by ce_loss_fn, replicated here so the per-event
+    # cross-entropies (needed for signal/background masking) match the
+    # scalar ce_loss_fn exactly when no background events are present.
+    label_smoothing = getattr(ce_loss_fn, "label_smoothing", 0.0)
+
+    def _masked_mean(per_event, mask):
+        """Mean of a per-event (B,) tensor over the events selected by *mask*.
+
+        Returns 0 (no loss contribution, no gradient) when the mask is empty,
+        so an all-signal or all-background batch is handled gracefully.
+        """
+        mask_f = mask.to(per_event.dtype)
+        return (per_event * mask_f).sum() / mask_f.sum().clamp(min=1.0)
 
     for batch in loader:
         four_mom = batch["four_momenta"].to(device)
         labels = batch["label"].to(device)
         parent_mass = batch["parent_mass"].to(device)
+        # Per-event signal/background tag.  Background (QCD) events have no truth
+        # assignment: they are excluded from the supervised loss and instead
+        # drive the background-rejection term.  Default all-signal when absent.
+        if "is_background" in batch:
+            is_bkg = batch["is_background"].to(device).bool()
+        else:
+            is_bkg = torch.zeros(labels.shape[0], dtype=torch.bool, device=device)
+        sig_mask = ~is_bkg
 
         # φ/η augmentation during training (hard symmetries of the problem)
         if optimizer is not None:
@@ -2020,8 +2119,8 @@ def _run_epoch(
                 batch_idx = torch.arange(labels.shape[0], device=device)
                 gt_grp_logits = grouping_logits[batch_idx, isr_labels]
                 grouping_labels = model.flat_to_factored[labels, 1]
-                total_isr_correct += (isr_logits.argmax(dim=-1) == isr_labels).sum().item()
-                total_grp_correct += (gt_grp_logits.argmax(dim=-1) == grouping_labels).sum().item()
+                total_isr_correct += ((isr_logits.argmax(dim=-1) == isr_labels) & sig_mask).sum().item()
+                total_grp_correct += ((gt_grp_logits.argmax(dim=-1) == grouping_labels) & sig_mask).sum().item()
         else:
             # ---------------------------------------------------------------
             # Phase 2 (or legacy single-phase) training: full loss.
@@ -2035,11 +2134,19 @@ def _run_epoch(
                 isr_labels = model.flat_to_factored[labels, 0]
                 grouping_labels = model.flat_to_factored[labels, 1]
 
-                loss_isr = ce_loss_fn(isr_logits, isr_labels)
+                # Per-event cross-entropies (reduction="none") so signal and
+                # background events can be combined with different objectives;
+                # reduced to a scalar with the signal mask below.  Equivalent to
+                # the original ce_loss_fn(...) when every event is signal.
+                loss_isr = F.cross_entropy(
+                    isr_logits, isr_labels, label_smoothing=label_smoothing, reduction="none"
+                )
 
                 batch_idx = torch.arange(labels.shape[0], device=device)
                 gt_grp_logits = grouping_logits[batch_idx, isr_labels]
-                loss_grp_tf = ce_loss_fn(gt_grp_logits, grouping_labels)
+                loss_grp_tf = F.cross_entropy(
+                    gt_grp_logits, grouping_labels, label_smoothing=label_smoothing, reduction="none"
+                )
 
                 # Blend teacher-forced factored loss with flat end-to-end loss
                 # tf_ratio=1: fully teacher-forced (original); tf_ratio=0: flat CE only
@@ -2048,11 +2155,15 @@ def _run_epoch(
                 # produces num_groupings gradient paths per signal jet while the ISR jet
                 # (excluded from every group) receives gradient only from loss_isr.
                 # Scaling loss_isr by lambda_isr partially rebalances this asymmetry.
-                loss_flat = ce_loss_fn(logits, labels)
+                loss_flat = F.cross_entropy(
+                    logits, labels, label_smoothing=label_smoothing, reduction="none"
+                )
+                # loss_ce is kept per-event (B,) and reduced with the signal mask
+                # below; background events feed only the bg-rejection term.
                 loss_ce = tf_ratio * (lambda_isr * loss_isr + loss_grp_tf) + (1.0 - tf_ratio) * loss_flat
 
-                total_isr_correct += (isr_logits.argmax(dim=-1) == isr_labels).sum().item()
-                total_grp_correct += (gt_grp_logits.argmax(dim=-1) == grouping_labels).sum().item()
+                total_isr_correct += ((isr_logits.argmax(dim=-1) == isr_labels) & sig_mask).sum().item()
+                total_grp_correct += ((gt_grp_logits.argmax(dim=-1) == grouping_labels) & sig_mask).sum().item()
 
                 # Direct ISR supervision from flat logits: for each ISR candidate j, take
                 # the max grouping score assuming jet j is ISR.  This marginalises out the
@@ -2065,10 +2176,14 @@ def _run_epoch(
                         labels.shape[0], model.num_jets, model.num_groupings
                     )
                     isr_logits_direct = logits_fac.max(dim=2).values   # (batch, num_jets)
-                    loss_isr_direct = ce_loss_fn(isr_logits_direct, isr_labels)
+                    loss_isr_direct = F.cross_entropy(
+                        isr_logits_direct, isr_labels, label_smoothing=label_smoothing, reduction="none"
+                    )
                     loss_ce = loss_ce + lambda_isr_direct * loss_isr_direct
             else:
-                loss_ce = ce_loss_fn(logits, labels)
+                loss_ce = F.cross_entropy(
+                    logits, labels, label_smoothing=label_smoothing, reduction="none"
+                )
 
             # Classical distillation loss: pull NN logits toward the classical
             # mass-asymmetry solver (argmin |m1-m2|/(m1+m2) = argmax -mass_asym).
@@ -2091,14 +2206,18 @@ def _run_epoch(
                 # of 32, amplifying the gradient enough to oppose the CE signal
                 # (KL pushes student_prob toward uniform teacher ≈ 1/70) and cap
                 # the model at ~1.6% accuracy for the entire 20-epoch decay period.
-                loss_distill = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
+                # Per-event KL (summed over assignments); reduced with the signal
+                # mask below.  Equals reduction="batchmean" when all events are signal.
+                loss_distill = F.kl_div(
+                    student_log_probs, teacher_probs, reduction="none"
+                ).sum(dim=-1)                                  # (batch,)
                 loss_ce = loss_ce + lambda_distill * loss_distill
 
             # Mass symmetry auxiliary loss: minimize expected |m1-m2|/(m1+m2) over assignments
             if lambda_sym > 0 and "mass_asym_flat" in output:
                 mass_asym = output["mass_asym_flat"].detach()  # (batch, num_assignments)
                 probs = logits.softmax(dim=-1)
-                loss_sym = (probs * mass_asym).sum(dim=-1).mean()
+                loss_sym = (probs * mass_asym).sum(dim=-1)     # (batch,) per-event
                 loss_ce = loss_ce + lambda_sym * loss_sym
 
             # QCD hierarchy penalty: events with large pT hierarchies (QCD-like) are pushed
@@ -2122,7 +2241,7 @@ def _run_epoch(
                 probs_qcd = logits.softmax(dim=-1)
                 expected_asym = (probs_qcd * mass_asym_qcd).sum(dim=-1)    # (batch,)
                 # Negative sign: minimising drives H * expected_asym upward for high-H events
-                loss_qcd_term = -(H * expected_asym).mean()
+                loss_qcd_term = -(H * expected_asym)                       # (batch,) per-event
                 loss_ce = loss_ce + lambda_qcd * loss_qcd_term
 
             # Entropy-weighted physics prior losses.
@@ -2155,14 +2274,39 @@ def _run_epoch(
                 if lambda_entropy_asym > 0:
                     mass_asym_ent = output["mass_asym_flat"].detach()                    # (B, N)
                     expected_asym_ent = (probs_ent * mass_asym_ent).sum(dim=-1)         # (batch,)
-                    loss_entropy_asym = -(norm_entropy * expected_asym_ent).mean()
+                    loss_entropy_asym = -(norm_entropy * expected_asym_ent)             # (batch,)
                     loss_ce = loss_ce + lambda_entropy_asym * loss_entropy_asym
 
                 if lambda_entropy_mass > 0 and "mass_sum_flat" in output:
                     mass_sum_ent = output["mass_sum_flat"].detach()                      # (B, N)
                     expected_mass_sum = (probs_ent * mass_sum_ent).sum(dim=-1)          # (batch,)
-                    loss_entropy_mass_term = (norm_entropy * expected_mass_sum).mean()
+                    loss_entropy_mass_term = (norm_entropy * expected_mass_sum)         # (batch,)
                     loss_ce = loss_ce + lambda_entropy_mass * loss_entropy_mass_term
+
+            # Reduce the per-event supervised loss over SIGNAL events only.
+            # Background (QCD) events contribute nothing here; they are handled
+            # by the background-rejection term below.  When every event is signal
+            # this is identical to the previous batch-mean reductions.
+            loss_ce = _masked_mean(loss_ce, sig_mask)
+
+            # Background-rejection loss.  For each QCD/background event, supervise
+            # the assignment toward the most background-like interpretation —
+            # argmax(mass_asym - beta_bg * mass_sum), i.e. low average mass OR high
+            # asymmetry.  This pushes the QCD average-mass distribution to fall at
+            # least as steeply as the classical mass-asymmetry-minimisation solver.
+            # Masked to background events, so signal reconstruction is untouched.
+            if (
+                lambda_bg > 0
+                and is_bkg.any()
+                and "mass_sum_flat" in output
+                and "mass_asym_flat" in output
+            ):
+                asym_bg = output["mass_asym_flat"].detach()    # (batch, N) in [0, 1]
+                msum_bg = output["mass_sum_flat"].detach()     # (batch, N), HT units
+                bg_score = asym_bg - beta_bg * msum_bg         # higher = more bg-like
+                bg_target = bg_score.argmax(dim=-1)            # (batch,)
+                loss_bg = F.cross_entropy(logits, bg_target, reduction="none")  # (batch,)
+                loss_ce = loss_ce + lambda_bg * _masked_mean(loss_bg, is_bkg)
 
             # Adversarial mass loss
             mass_mask = parent_mass > 0
@@ -2183,12 +2327,19 @@ def _run_epoch(
         batch_size = labels.shape[0]
         total_loss += loss.item() * batch_size
         total_samples += batch_size
+        total_sig_samples += int(sig_mask.sum().item())
 
         preds = logits.argmax(dim=-1)
-        total_correct += (preds == labels).sum().item()
+        # Assignment accuracy is only defined for signal events (background/QCD
+        # events have no truth assignment), so restrict the counters to signal.
+        total_correct += ((preds == labels) & sig_mask).sum().item()
 
         _, top5 = logits.topk(5, dim=-1)
-        total_correct5 += (top5 == labels.unsqueeze(-1)).any(dim=-1).sum().item()
+        total_correct5 += ((top5 == labels.unsqueeze(-1)).any(dim=-1) & sig_mask).sum().item()
+
+        # Per-event background flag, aligned with the per-event distribution
+        # arrays below so downstream plotting can split signal vs QCD.
+        all_pred_is_bkg.append(is_bkg.detach().cpu())
 
         if "mass_asym_flat" in output:
             mass_asym_flat = output["mass_asym_flat"].detach()  # (batch, num_assignments)
@@ -2252,8 +2403,9 @@ def _run_epoch(
             all_mass_true.append(parent_mass[mass_mask].detach().cpu())
 
     avg_loss = total_loss / max(total_samples, 1)
-    acc = total_correct / max(total_samples, 1)
-    acc5 = total_correct5 / max(total_samples, 1)
+    # Accuracy is over signal events only (background events have no truth label).
+    acc = total_correct / max(total_sig_samples, 1)
+    acc5 = total_correct5 / max(total_sig_samples, 1)
 
     adv_r2 = 0.0
     if all_mass_pred:
@@ -2288,9 +2440,11 @@ def _run_epoch(
         result["pred_democracy_values"] = dem_cat.numpy()
         result["avg_democracy"] = dem_cat.mean().item()
         result["std_democracy"] = dem_cat.std().item()
+    if all_pred_is_bkg:
+        result["pred_is_bkg_values"] = torch.cat(all_pred_is_bkg).numpy()
     if factored:
-        result["isr_acc"] = total_isr_correct / max(total_samples, 1)
-        result["grp_acc"] = total_grp_correct / max(total_samples, 1)
+        result["isr_acc"] = total_isr_correct / max(total_sig_samples, 1)
+        result["grp_acc"] = total_grp_correct / max(total_sig_samples, 1)
     return result
 
 

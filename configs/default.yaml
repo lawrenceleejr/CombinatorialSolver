@@ -53,6 +53,27 @@ training:
   lambda_entropy_asym_rampup: 20
   lambda_entropy_mass: 0.05
   lambda_entropy_mass_rampup: 20
+  # --- Background (QCD) rejection ---------------------------------------------
+  # Requires a QCD sample provided via data.qcd_data_path (loaded as background).
+  # For every background event the assignment is supervised toward the most
+  # QCD-like interpretation: argmax(mass_asym - beta_bg * mass_sum), i.e. low
+  # average candidate mass OR high mass asymmetry.  This drives the QCD
+  # average-mass spectrum to fall at least as steeply as the classical
+  # mass-asymmetry-minimisation solver, while leaving signal untouched (the term
+  # is masked to background events only).  Disabled by default (lambda_bg: 0),
+  # so signal-only training is unchanged.
+  #
+  # When training WITH a QCD sample, the recommended settings are:
+  #     lambda_bg: 1.0
+  #     lambda_qcd: 0.0            # redundant pT-hierarchy proxy; would act on signal
+  #     lambda_entropy_asym: 0.0   # ditto (network-uncertainty proxy)
+  #     lambda_entropy_mass: 0.0   # ditto
+  # (keep lambda_sym so the signal stays a symmetric bump).  beta_bg trades off
+  # the two rejection routes: larger beta_bg => steeper background (toward pure
+  # average-mass minimisation); smaller => toward pure asymmetry maximisation.
+  lambda_bg: 0.0
+  lambda_bg_rampup: 20
+  beta_bg: 1.0
   # Distillation from the classical mass-asymmetry solver.
   # At Phase 2 epoch 0 this loss pulls the NN logits toward the assignment with
   # the smallest |m1-m2|/(m1+m2).  It decays linearly to zero over
@@ -100,6 +121,14 @@ data:
   normalize_by_ht: true
   num_jets: 7
   pt_smear_frac: 0.20
+  # Signal sample glob.  Overridden by the --data CLI flag when provided.
+  data_path: "data/*.h5"
+  # Optional QCD/background sample glob.  When set (and files match), these
+  # events are loaded with is_background=True and feed the background-rejection
+  # loss (training.lambda_bg) instead of the supervised assignment loss.  They
+  # should be MadGraphMLProducer-format h5 with is_signal=0 for every jet and no
+  # TARGETS group.  Leave null for signal-only training.
+  qcd_data_path: null
   # Compute truth labels as argmin |m1-m2| over all 70 interpretations (recommended).
   # This is the physically correct ground truth for equal-mass pair-produced resonances
   # and removes dependence on potentially incorrect TARGETS entries in the HDF5 file.
