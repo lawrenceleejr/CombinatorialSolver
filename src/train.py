@@ -233,7 +233,8 @@ def _check_optional_deps() -> None:
         )
 
 
-def train(config_path: str | None = None, data_path: str | None = None):
+def train(config_path: str | None = None, data_path: str | None = None,
+          qcd_data_path: str | None = None):
     """Main training function."""
     _check_optional_deps()
 
@@ -261,10 +262,10 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
     # Optional QCD/background sample.  Tagged is_background=True so its events
     # drive the background-rejection loss (push to low average mass OR high
-    # asymmetry) instead of the supervised assignment loss.  The glob is read
-    # from data.qcd_data_path; if unset or no files match, training is
-    # signal-only and behaves exactly as before.
-    qcd_path = dc.get("qcd_data_path")
+    # asymmetry) instead of the supervised assignment loss.  The glob comes from
+    # the --qcd-data CLI flag (preferred) or data.qcd_data_path; if unset or no
+    # files match, training is signal-only and behaves exactly as before.
+    qcd_path = qcd_data_path if qcd_data_path is not None else dc.get("qcd_data_path")
     qcd_dataset = None
     if qcd_path:
         try:
@@ -281,7 +282,8 @@ def train(config_path: str | None = None, data_path: str | None = None):
             print(f"QCD background sample not loaded ({qcd_path}): {exc}")
             qcd_dataset = None
 
-    if qcd_dataset is not None and len(qcd_dataset) > 0:
+    qcd_present = qcd_dataset is not None and len(qcd_dataset) > 0
+    if qcd_present:
         dataset = ConcatDataset([sig_dataset, qcd_dataset])
         n_bkg = len(qcd_dataset)
         print(
@@ -448,11 +450,24 @@ def train(config_path: str | None = None, data_path: str | None = None):
     lambda_bg_max = tc.get("lambda_bg", 0.0)
     lambda_bg_rampup = tc.get("lambda_bg_rampup", 0)
     beta_bg = tc.get("beta_bg", 1.0)
+    # Handing the trainer a QCD sample turns on the background-rejection objective
+    # automatically: if lambda_bg was left at its default 0, enable it so the QCD
+    # events actually penalise high-average-mass interpretations.  Set
+    # training.lambda_bg explicitly in the config to override (e.g. back to 0).
+    if qcd_present and lambda_bg_max <= 0:
+        lambda_bg_max = 1.0
+        print("QCD sample provided -> auto-enabling background-rejection loss "
+              "(lambda_bg=1.0; set training.lambda_bg to override).")
     if lambda_bg_max > 0:
         print(
             f"Background-rejection loss: lambda_bg={lambda_bg_max} "
             f"(rampup={lambda_bg_rampup}), beta_bg={beta_bg}"
         )
+        if qcd_present and (
+            lambda_qcd_max > 0 or lambda_entropy_asym_max > 0 or lambda_entropy_mass_max > 0
+        ):
+            print("  Note: lambda_qcd / lambda_entropy_* are signal-side QCD proxies; "
+                  "with a real QCD sample they are redundant — consider setting them to 0.")
     if lambda_entropy_asym_max > 0 or lambda_entropy_mass_max > 0:
         print(
             f"Entropy-weighted physics prior: "
@@ -2451,6 +2466,17 @@ def _run_epoch(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train jet assignment model")
     parser.add_argument("--config", type=str, default=None, help="Path to config YAML")
-    parser.add_argument("--data", type=str, default=None, help="Path to HDF5 data (glob pattern)")
+    parser.add_argument("--data", type=str, default=None, help="Path to signal HDF5 data (glob pattern)")
+    parser.add_argument(
+        "--qcd-data",
+        type=str,
+        default=None,
+        help=(
+            "Path to QCD/background HDF5 data (glob pattern).  Providing this "
+            "automatically turns on the background-rejection loss (lambda_bg), "
+            "training signal and QCD jointly in a single step.  Overrides "
+            "data.qcd_data_path in the config."
+        ),
+    )
     args = parser.parse_args()
-    train(config_path=args.config, data_path=args.data)
+    train(config_path=args.config, data_path=args.data, qcd_data_path=args.qcd_data)
