@@ -668,6 +668,7 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     epoch + 1, training_phase,
                     val_metrics["pred_asym_values"],
                     val_metrics.get("pred_correct_values"),  # bool array or None
+                    val_metrics.get("pred_is_bkg_values"),   # bool array or None
                 ))
 
             # Accumulate per-event validation mass-sum distribution for GIF
@@ -777,6 +778,30 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     phase2_start_epoch=phase2_start_epoch,
                     gif_path=Path("plots") / "mass_sum_anim_latest.gif",
                 )
+            # QCD-background-only diagnostics (skipped automatically when there is
+            # no QCD sample): mass-asymmetry and average-mass distributions per
+            # epoch, plus a mean-vs-epoch trend showing the loss pushing QCD to
+            # high asymmetry / low average mass.
+            if qcd_present:
+                if val_asym_history:
+                    _make_qcd_mass_asym_gif(
+                        val_asym_history,
+                        phase2_start_epoch=phase2_start_epoch,
+                        gif_path=Path("plots") / "qcd_mass_asym_anim_latest.gif",
+                    )
+                if val_mass_sum_history:
+                    _make_qcd_avg_mass_gif(
+                        val_mass_sum_history,
+                        phase2_start_epoch=phase2_start_epoch,
+                        gif_path=Path("plots") / "qcd_avg_mass_anim_latest.gif",
+                    )
+                if val_asym_history or val_mass_sum_history:
+                    _make_qcd_trend_plot(
+                        val_asym_history,
+                        val_mass_sum_history,
+                        phase2_start_epoch=phase2_start_epoch,
+                        out_path=Path("plots") / "qcd_trends_latest.pdf",
+                    )
             if val_max_triplet_pt_history:
                 _make_max_triplet_pt_gif(
                     val_max_triplet_pt_history,
@@ -928,6 +953,20 @@ def train(config_path: str | None = None, data_path: str | None = None,
         if mass_sum_gif is not None:
             plot_paths.append(mass_sum_gif)
 
+    # QCD-background-only diagnostics (no-ops when there is no QCD sample):
+    # mass-asymmetry and average-mass distributions per epoch + mean-vs-epoch trend.
+    qcd_asym_gif = _make_qcd_mass_asym_gif(val_asym_history, phase2_start_epoch=phase2_start_epoch)
+    if qcd_asym_gif is not None:
+        plot_paths.append(qcd_asym_gif)
+    qcd_avg_mass_gif = _make_qcd_avg_mass_gif(val_mass_sum_history, phase2_start_epoch=phase2_start_epoch)
+    if qcd_avg_mass_gif is not None:
+        plot_paths.append(qcd_avg_mass_gif)
+    qcd_trend = _make_qcd_trend_plot(
+        val_asym_history, val_mass_sum_history, phase2_start_epoch=phase2_start_epoch
+    )
+    if qcd_trend is not None:
+        plot_paths.append(qcd_trend)
+
     # Animated GIF of the validation max-triplet scalar-sum pT distribution.
     if val_max_triplet_pt_history:
         mpt_gif = _make_max_triplet_pt_gif(val_max_triplet_pt_history, phase2_start_epoch=phase2_start_epoch)
@@ -1010,11 +1049,12 @@ def _make_mass_asym_gif(
 
     import numpy as np
 
-    # Unpack history: support both 3-tuple (legacy) and 4-tuple (with correct mask).
+    # Unpack history: tolerate 3-tuple (legacy), 4-tuple (with correct mask) and
+    # 5-tuple (with per-event background flag, ignored here).
     def _unpack(entry):
-        if len(entry) == 4:
-            return entry
-        return entry[0], entry[1], entry[2], None
+        epoch, phase, values = entry[0], entry[1], entry[2]
+        correct_mask = entry[3] if len(entry) >= 4 else None
+        return epoch, phase, values, correct_mask
 
     # x-axis in log10 space: mass_asym ∈ (0, 1] → log10 ∈ (-∞, 0].
     # Clip values below 1e-4 to avoid -inf.
@@ -1242,6 +1282,236 @@ def _make_mass_sum_gif(
     except Exception as exc:
         print(f"  Warning: could not save mass-sum GIF ({exc}). "
               "Is pillow installed?  pip install pillow")
+        return None
+    finally:
+        plt.close(fig)
+
+
+def _make_qcd_distribution_gif(
+    history: list,
+    value_fn,
+    xlabel: str,
+    title_prefix: str,
+    short_name: str,
+    gif_path: str | Path | None = None,
+    phase2_start_epoch: int | None = None,
+    x_range: tuple[float, float] | None = None,
+    n_bins: int = 50,
+    color: str = "indianred",
+) -> "Path | None":
+    """Animated histogram of a per-event quantity for QCD-background events only.
+
+    *history* entries are ``(epoch, phase, values, correct_mask, is_bkg)`` tuples
+    (the trailing ``is_bkg`` boolean array selects background events).  Only
+    events with ``is_bkg == True`` are shown.  *value_fn* maps the raw per-event
+    values array to the plotted quantity (e.g. ``v / 2`` for average mass, or a
+    ``log10`` for asymmetry).  Returns ``None`` silently when no background
+    events are present (so signal-only runs produce no QCD plots).
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.animation as animation
+    except ImportError:
+        return None
+    if not history:
+        return None
+
+    import numpy as np
+
+    def _bkg_vals(entry):
+        is_bkg = entry[4] if len(entry) >= 5 else None
+        if is_bkg is None:
+            return None
+        is_bkg = np.asarray(is_bkg, dtype=bool)
+        if not is_bkg.any():
+            return None
+        return value_fn(np.asarray(entry[2])[is_bkg])
+
+    # Keep only frames (epochs) that actually contain background events.
+    frames = [(e[0], e[1], _bkg_vals(e)) for e in history]
+    frames = [f for f in frames if f[2] is not None and len(f[2]) > 0]
+    if not frames:
+        return None
+
+    plots_dir = Path("plots")
+    plots_dir.mkdir(exist_ok=True)
+    if gif_path is None:
+        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        commit = _get_git_commit_hash()
+        gif_path = plots_dir / f"{short_name}_{ts}_{commit}.gif"
+    gif_path = Path(gif_path)
+
+    all_concat = np.concatenate([f[2] for f in frames])
+    if x_range is not None:
+        x_min, x_max = x_range
+    else:
+        x_min = float(np.percentile(all_concat, 1))
+        x_max = float(np.percentile(all_concat, 99))
+        if x_min >= x_max:
+            x_min, x_max = float(all_concat.min()), float(all_concat.max()) + 1e-6
+    bin_edges = np.linspace(x_min, x_max, n_bins + 1)
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    bar_width = (x_max - x_min) / n_bins
+
+    max_count = 0
+    for _, _, v in frames:
+        counts, _ = np.histogram(v, bins=bin_edges)
+        if counts.size and counts.max() > max_count:
+            max_count = int(counts.max())
+    y_max = max(max_count * 1.1, 1)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    def _draw_frame(frame_idx):
+        epoch, phase, v = frames[frame_idx]
+        ax.cla()
+        counts, _ = np.histogram(v, bins=bin_edges)
+        ax.bar(centers, counts, width=bar_width, color=color, alpha=0.8, align="center")
+        mean_val = float(v.mean())
+        ax.axvline(mean_val, color="darkorange", linewidth=2.0, label=f"Mean = {mean_val:.3f}")
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(0, y_max)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("QCD background events")
+        phase_label = ""
+        if phase2_start_epoch is not None:
+            phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
+        elif phase == 2:
+            phase_label = " [Phase 2]"
+        ax.set_title(f"{title_prefix} — Epoch {epoch}{phase_label}")
+        ax.legend(loc="upper right")
+        ax.grid(True, alpha=0.3)
+
+    anim = animation.FuncAnimation(
+        fig, _draw_frame, frames=len(frames), interval=200, repeat=False
+    )
+    try:
+        anim.save(str(gif_path), writer="pillow", fps=5)
+        print(f"  -> Saved {title_prefix} GIF: {gif_path}")
+        return gif_path
+    except Exception as exc:
+        print(f"  Warning: could not save {title_prefix} GIF ({exc}).")
+        return None
+    finally:
+        plt.close(fig)
+
+
+def _make_qcd_mass_asym_gif(
+    val_asym_history: list,
+    phase2_start_epoch: int | None = None,
+    gif_path: str | Path | None = None,
+) -> "Path | None":
+    """Animated histogram of the QCD-background mass asymmetry, one frame/epoch."""
+    import numpy as np
+    return _make_qcd_distribution_gif(
+        val_asym_history,
+        value_fn=lambda v: np.log10(np.clip(v, 1e-4, 1.0)),
+        xlabel="log₁₀(mass asymmetry) — QCD background",
+        title_prefix="QCD mass asymmetry",
+        short_name="qcd_mass_asym_anim",
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
+        x_range=(-4.0, 0.0),
+    )
+
+
+def _make_qcd_avg_mass_gif(
+    val_mass_sum_history: list,
+    phase2_start_epoch: int | None = None,
+    gif_path: str | Path | None = None,
+) -> "Path | None":
+    """Animated histogram of the QCD-background average candidate mass, one frame/epoch."""
+    return _make_qcd_distribution_gif(
+        val_mass_sum_history,
+        value_fn=lambda v: v / 2.0,
+        xlabel="Average candidate mass (m₁+m₂)/2 — QCD background",
+        title_prefix="QCD average mass",
+        short_name="qcd_avg_mass_anim",
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
+        x_range=None,
+    )
+
+
+def _make_qcd_trend_plot(
+    val_asym_history: list,
+    val_mass_sum_history: list,
+    phase2_start_epoch: int | None = None,
+    out_path: str | Path | None = None,
+) -> "Path | None":
+    """Static plot of QCD-background mean mass asymmetry and mean average mass vs epoch.
+
+    Two panels show how the per-epoch mean (±1σ band) of the chosen-assignment
+    mass asymmetry and average candidate mass evolve over training for QCD events
+    only.  This is the key diagnostic that the background-rejection loss is
+    working: asymmetry should rise and/or average mass should fall with epoch.
+    Returns ``None`` when no background events are present.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
+
+    import numpy as np
+
+    def _series(history, transform):
+        xs, means, stds = [], [], []
+        for entry in history:
+            is_bkg = entry[4] if len(entry) >= 5 else None
+            if is_bkg is None:
+                continue
+            is_bkg = np.asarray(is_bkg, dtype=bool)
+            if not is_bkg.any():
+                continue
+            v = transform(np.asarray(entry[2])[is_bkg])
+            xs.append(entry[0])
+            means.append(float(v.mean()))
+            stds.append(float(v.std()))
+        return np.array(xs), np.array(means), np.array(stds)
+
+    ax_e, am_m, am_s = _series(val_asym_history, lambda v: v)            # asymmetry in [0,1]
+    mx_e, mm_m, mm_s = _series(val_mass_sum_history, lambda v: v / 2.0)  # average mass
+    if len(ax_e) == 0 and len(mx_e) == 0:
+        return None
+
+    plots_dir = Path("plots")
+    plots_dir.mkdir(exist_ok=True)
+    if out_path is None:
+        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        commit = _get_git_commit_hash()
+        out_path = plots_dir / f"qcd_trends_{ts}_{commit}.pdf"
+    out_path = Path(out_path)
+
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 5))
+    if len(ax_e):
+        a1.plot(ax_e, am_m, "-o", color="indianred", label="QCD mean")
+        a1.fill_between(ax_e, am_m - am_s, am_m + am_s, color="indianred", alpha=0.2, label="±1σ")
+    a1.set_xlabel("Epoch")
+    a1.set_ylabel("Mass asymmetry |m₁−m₂|/(m₁+m₂)")
+    a1.set_title("QCD background mass asymmetry vs epoch")
+    if len(mx_e):
+        a2.plot(mx_e, mm_m, "-o", color="indianred", label="QCD mean")
+        a2.fill_between(mx_e, mm_m - mm_s, mm_m + mm_s, color="indianred", alpha=0.2, label="±1σ")
+    a2.set_xlabel("Epoch")
+    a2.set_ylabel("Average candidate mass (m₁+m₂)/2")
+    a2.set_title("QCD background average mass vs epoch")
+    for a in (a1, a2):
+        if phase2_start_epoch is not None:
+            a.axvline(phase2_start_epoch, color="gray", linestyle="--", alpha=0.7,
+                      label="Phase 2 start")
+        a.grid(True, alpha=0.3)
+        a.legend(loc="best")
+    fig.tight_layout()
+    try:
+        fig.savefig(str(out_path))
+        print(f"  -> Saved QCD trend plot: {out_path}")
+        return out_path
+    except Exception as exc:
+        print(f"  Warning: could not save QCD trend plot ({exc}).")
         return None
     finally:
         plt.close(fig)
