@@ -54,26 +54,43 @@ training:
   lambda_entropy_mass: 0.05
   lambda_entropy_mass_rampup: 20
   # --- Background (QCD) rejection ---------------------------------------------
-  # Requires a QCD sample provided via data.qcd_data_path (loaded as background).
-  # For every background event the assignment is supervised toward the most
-  # QCD-like interpretation: argmax(mass_asym - beta_bg * mass_sum), i.e. low
-  # average candidate mass OR high mass asymmetry.  This drives the QCD
-  # average-mass spectrum to fall at least as steeply as the classical
-  # mass-asymmetry-minimisation solver, while leaving signal untouched (the term
-  # is masked to background events only).  Disabled by default (lambda_bg: 0),
-  # so signal-only training is unchanged.
+  # Requires a QCD sample provided via data.qcd_data_path (or --qcd-data), loaded
+  # as background.  For every background event the network is driven to COMMIT to
+  # the interpretation that is most obviously not signal-like and duck out of the
+  # signal region.  The per-assignment anti-signal score is an OR of two
+  # normalised extremes (each in [0,1]): high mass asymmetry, OR low average mass
+  # relative to what the event can achieve -- i.e. max(asym, beta_bg * mass_low).
+  # Three pieces act on background events only (signal is untouched):
+  #   (a) hard cross-entropy toward argmax(anti-signal score) -- commit to the
+  #       single most blatantly-non-signal interpretation;
+  #   (b) a soft term (bg_soft_weight) maximising the expected anti-signal score
+  #       so the *bulk* of the QCD probability moves to the extreme, not just the
+  #       argmax;
+  #   (c) an optional asymmetry cut (bg_asym_cut) that explicitly evacuates the
+  #       signal region by penalising probability left below the cut.
+  # Disabled by default (lambda_bg: 0); providing a QCD sample auto-enables it.
   #
   # When training WITH a QCD sample, the recommended settings are:
   #     lambda_bg: 1.0
   #     lambda_qcd: 0.0            # redundant pT-hierarchy proxy; would act on signal
   #     lambda_entropy_asym: 0.0   # ditto (network-uncertainty proxy)
   #     lambda_entropy_mass: 0.0   # ditto
-  # (keep lambda_sym so the signal stays a symmetric bump).  beta_bg trades off
-  # the two rejection routes: larger beta_bg => steeper background (toward pure
-  # average-mass minimisation); smaller => toward pure asymmetry maximisation.
+  # (keep lambda_sym so the signal stays a symmetric bump).
+  #
+  # Tuning for "more extreme" QCD:
+  #   beta_bg: relative weight of the low-mass route vs the asymmetry route in the
+  #     OR (1.0 = balanced; >1 favours low mass; <1 favours high asymmetry).
+  #   bg_soft_weight: strength of the distribution-level push (raise toward 2-4 if
+  #     the QCD distribution is not extreme enough; the hard CE alone can saturate).
+  #   bg_asym_cut: if your analysis defines a signal region by a mass-asymmetry cut
+  #     A < A_cut, set this to A_cut (e.g. 0.1) to actively push QCD probability
+  #     above it.  0 disables this explicit term (relative OR push only).
+  #   lambda_bg: overall weight; raise (e.g. 2-5) to push harder still.
   lambda_bg: 0.0
   lambda_bg_rampup: 20
   beta_bg: 1.0
+  bg_soft_weight: 1.0
+  bg_asym_cut: 0.0
   # Distillation from the classical mass-asymmetry solver.
   # At Phase 2 epoch 0 this loss pulls the NN logits toward the assignment with
   # the smallest |m1-m2|/(m1+m2).  It decays linearly to zero over

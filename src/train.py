@@ -450,6 +450,8 @@ def train(config_path: str | None = None, data_path: str | None = None,
     lambda_bg_max = tc.get("lambda_bg", 0.0)
     lambda_bg_rampup = tc.get("lambda_bg_rampup", 0)
     beta_bg = tc.get("beta_bg", 1.0)
+    bg_soft_weight = tc.get("bg_soft_weight", 1.0)
+    bg_asym_cut = tc.get("bg_asym_cut", 0.0)
     # Handing the trainer a QCD sample turns on the background-rejection objective
     # automatically: if lambda_bg was left at its default 0, enable it so the QCD
     # events actually penalise high-average-mass interpretations.  Set
@@ -461,7 +463,8 @@ def train(config_path: str | None = None, data_path: str | None = None,
     if lambda_bg_max > 0:
         print(
             f"Background-rejection loss: lambda_bg={lambda_bg_max} "
-            f"(rampup={lambda_bg_rampup}), beta_bg={beta_bg}"
+            f"(rampup={lambda_bg_rampup}), beta_bg={beta_bg}, "
+            f"bg_soft_weight={bg_soft_weight}, bg_asym_cut={bg_asym_cut}"
         )
         if qcd_present and (
             lambda_qcd_max > 0 or lambda_entropy_asym_max > 0 or lambda_entropy_mass_max > 0
@@ -643,6 +646,7 @@ def train(config_path: str | None = None, data_path: str | None = None,
                 lambda_entropy_asym=lambda_entropy_asym,
                 lambda_entropy_mass=lambda_entropy_mass,
                 lambda_bg=lambda_bg, beta_bg=beta_bg,
+                bg_soft_weight=bg_soft_weight, bg_asym_cut=bg_asym_cut,
                 phase1_only=phase1_only_train,
                 pt_smear_frac=dc.get("pt_smear_frac", 0.0),
             )
@@ -659,6 +663,7 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     lambda_distill=0.0, distill_temperature=distill_temperature,
                     lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
                     lambda_bg=0.0, beta_bg=beta_bg,
+                    bg_soft_weight=bg_soft_weight, bg_asym_cut=bg_asym_cut,
                     pt_smear_frac=dc.get("pt_smear_frac", 0.0),
                 )
 
@@ -2255,7 +2260,7 @@ def _run_epoch(
     tf_ratio=1.0, lambda_sym=0.0, lambda_qcd=0.0, lambda_isr=1.0, lambda_isr_direct=0.0,
     lambda_distill=0.0, distill_temperature=4.0,
     lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
-    lambda_bg=0.0, beta_bg=1.0,
+    lambda_bg=0.0, beta_bg=1.0, bg_soft_weight=1.0, bg_asym_cut=0.0,
     phase1_only=False,
     pt_smear_frac=0.0,
 ):
@@ -2574,11 +2579,21 @@ def _run_epoch(
             # this is identical to the previous batch-mean reductions.
             loss_ce = _masked_mean(loss_ce, sig_mask)
 
-            # Background-rejection loss.  For each QCD/background event, supervise
-            # the assignment toward the most background-like interpretation —
-            # argmax(mass_asym - beta_bg * mass_sum), i.e. low average mass OR high
-            # asymmetry.  This pushes the QCD average-mass distribution to fall at
-            # least as steeply as the classical mass-asymmetry-minimisation solver.
+            # Background-rejection loss.  For each QCD/background event we want the
+            # network to COMMIT to the interpretation that is most obviously not
+            # signal-like and duck out of the signal region, rather than settling
+            # on a mildly-asymmetric / mildly-low-mass compromise.
+            #
+            # Anti-signal score per assignment is an OR of two normalised extremes
+            # (each in [0,1]): high mass asymmetry, or low average mass relative to
+            # what is achievable for that event.  Taking the max (not a sum) means
+            # the target is the single interpretation that is extreme in EITHER
+            # dimension — the blatantly-non-signal choice the event affords.
+            #   (a) hard CE toward argmax(bg_score) commits to that choice;
+            #   (b) a soft term maximises the expected anti-signal score so the
+            #       bulk of the QCD probability (not just the argmax) is pushed out;
+            #   (c) an optional asymmetry cut explicitly evacuates the signal region
+            #       by penalising probability left on low-asymmetry interpretations.
             # Masked to background events, so signal reconstruction is untouched.
             if (
                 lambda_bg > 0
@@ -2586,11 +2601,35 @@ def _run_epoch(
                 and "mass_sum_flat" in output
                 and "mass_asym_flat" in output
             ):
-                asym_bg = output["mass_asym_flat"].detach()    # (batch, N) in [0, 1]
-                msum_bg = output["mass_sum_flat"].detach()     # (batch, N), HT units
-                bg_score = asym_bg - beta_bg * msum_bg         # higher = more bg-like
-                bg_target = bg_score.argmax(dim=-1)            # (batch,)
-                loss_bg = F.cross_entropy(logits, bg_target, reduction="none")  # (batch,)
+                asym = output["mass_asym_flat"].detach()       # (batch, N) in [0, 1]
+                msum = output["mass_sum_flat"].detach()        # (batch, N), HT units
+                probs = logits.softmax(dim=-1)
+
+                # Per-event mass "lowness" in [0,1] (1 = lowest-mass interpretation
+                # available), so the low-mass route is comparable to the asymmetry
+                # route regardless of the event's absolute mass scale.
+                msum_min = msum.min(dim=-1, keepdim=True).values
+                msum_max = msum.max(dim=-1, keepdim=True).values
+                mass_low = (msum_max - msum) / (msum_max - msum_min).clamp(min=1e-6)
+
+                # OR of the two extremes; beta_bg tilts toward the low-mass route.
+                bg_score = torch.maximum(asym, beta_bg * mass_low)          # (batch, N)
+
+                # (a) commit to the single most anti-signal interpretation.
+                bg_target = bg_score.argmax(dim=-1)                          # (batch,)
+                loss_bg = F.cross_entropy(logits, bg_target, reduction="none")   # (batch,)
+
+                # (b) push the whole distribution toward high anti-signal score.
+                if bg_soft_weight > 0:
+                    loss_bg = loss_bg + bg_soft_weight * (1.0 - (probs * bg_score).sum(dim=-1))
+
+                # (c) explicit signal-region exit: penalise probability on
+                #     low-asymmetry (signal-like) interpretations below the cut.
+                if bg_asym_cut > 0:
+                    tau = max(0.25 * bg_asym_cut, 1e-3)
+                    in_sr = torch.sigmoid((bg_asym_cut - asym) / tau)        # ~1 below cut
+                    loss_bg = loss_bg + (probs * in_sr).sum(dim=-1)
+
                 loss_ce = loss_ce + lambda_bg * _masked_mean(loss_bg, is_bkg)
 
             # Adversarial mass loss
