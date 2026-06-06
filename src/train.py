@@ -449,17 +449,17 @@ def train(config_path: str | None = None, data_path: str | None = None,
     # Phase 2 start like lambda_sym/qcd.
     lambda_bg_max = tc.get("lambda_bg", 0.0)
     lambda_bg_rampup = tc.get("lambda_bg_rampup", 0)
-    beta_bg = tc.get("beta_bg", 1.0)
-    bg_soft_weight = tc.get("bg_soft_weight", 1.0)
+    beta_bg = tc.get("beta_bg", 0.5)
+    bg_soft_weight = tc.get("bg_soft_weight", 2.0)
     bg_asym_cut = tc.get("bg_asym_cut", 0.0)
     # Handing the trainer a QCD sample turns on the background-rejection objective
     # automatically: if lambda_bg was left at its default 0, enable it so the QCD
     # events actually penalise high-average-mass interpretations.  Set
     # training.lambda_bg explicitly in the config to override (e.g. back to 0).
     if qcd_present and lambda_bg_max <= 0:
-        lambda_bg_max = 1.0
+        lambda_bg_max = 2.0
         print("QCD sample provided -> auto-enabling background-rejection loss "
-              "(lambda_bg=1.0; set training.lambda_bg to override).")
+              "(lambda_bg=2.0; set training.lambda_bg to override).")
     if lambda_bg_max > 0:
         print(
             f"Background-rejection loss: lambda_bg={lambda_bg_max} "
@@ -672,8 +672,9 @@ def train(config_path: str | None = None, data_path: str | None = None,
                 val_asym_history.append((
                     epoch + 1, training_phase,
                     val_metrics["pred_asym_values"],
-                    val_metrics.get("pred_correct_values"),  # bool array or None
-                    val_metrics.get("pred_is_bkg_values"),   # bool array or None
+                    val_metrics.get("pred_correct_values"),       # bool array or None
+                    val_metrics.get("pred_is_bkg_values"),        # bool array or None
+                    val_metrics.get("pred_asym_achievable_values"),  # best achievable, or None
                 ))
 
             # Accumulate per-event validation mass-sum distribution for GIF
@@ -681,8 +682,9 @@ def train(config_path: str | None = None, data_path: str | None = None,
                 val_mass_sum_history.append((
                     epoch + 1, training_phase,
                     val_metrics["pred_mass_sum_values"],
-                    val_metrics.get("pred_correct_values"),  # bool array or None
-                    val_metrics.get("pred_is_bkg_values"),   # bool array or None
+                    val_metrics.get("pred_correct_values"),           # bool array or None
+                    val_metrics.get("pred_is_bkg_values"),            # bool array or None
+                    val_metrics.get("pred_mass_sum_achievable_values"),  # best achievable, or None
                 ))
 
             # Accumulate per-event validation max-triplet scalar-pT distribution for GIF
@@ -1450,9 +1452,11 @@ def _make_qcd_trend_plot(
 
     Two panels show how the per-epoch mean (±1σ band) of the chosen-assignment
     mass asymmetry and average candidate mass evolve over training for QCD events
-    only.  This is the key diagnostic that the background-rejection loss is
-    working: asymmetry should rise and/or average mass should fall with epoch.
-    Returns ``None`` when no background events are present.
+    only.  A dashed "best achievable" line shows the per-event ceiling/floor (mean
+    of the max available asymmetry / min available average mass), so the gap to it
+    reveals whether there is still headroom for the background-rejection push or
+    whether the data limit has been reached.  Returns ``None`` when no background
+    events are present.
     """
     try:
         import matplotlib
@@ -1464,7 +1468,7 @@ def _make_qcd_trend_plot(
     import numpy as np
 
     def _series(history, transform):
-        xs, means, stds = [], [], []
+        xs, means, stds, ach = [], [], [], []
         for entry in history:
             is_bkg = entry[4] if len(entry) >= 5 else None
             if is_bkg is None:
@@ -1476,10 +1480,15 @@ def _make_qcd_trend_plot(
             xs.append(entry[0])
             means.append(float(v.mean()))
             stds.append(float(v.std()))
-        return np.array(xs), np.array(means), np.array(stds)
+            ach_arr = entry[5] if len(entry) >= 6 else None
+            if ach_arr is not None:
+                ach.append(float(transform(np.asarray(ach_arr)[is_bkg]).mean()))
+            else:
+                ach.append(float("nan"))
+        return np.array(xs), np.array(means), np.array(stds), np.array(ach)
 
-    ax_e, am_m, am_s = _series(val_asym_history, lambda v: v)            # asymmetry in [0,1]
-    mx_e, mm_m, mm_s = _series(val_mass_sum_history, lambda v: v / 2.0)  # average mass
+    ax_e, am_m, am_s, am_a = _series(val_asym_history, lambda v: v)            # asymmetry in [0,1]
+    mx_e, mm_m, mm_s, mm_a = _series(val_mass_sum_history, lambda v: v / 2.0)  # average mass
     if len(ax_e) == 0 and len(mx_e) == 0:
         return None
 
@@ -1493,14 +1502,20 @@ def _make_qcd_trend_plot(
 
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 5))
     if len(ax_e):
-        a1.plot(ax_e, am_m, "-o", color="indianred", label="QCD mean")
+        a1.plot(ax_e, am_m, "-o", color="indianred", label="QCD mean (achieved)")
         a1.fill_between(ax_e, am_m - am_s, am_m + am_s, color="indianred", alpha=0.2, label="±1σ")
+        if np.isfinite(am_a).any():
+            a1.plot(ax_e, am_a, "--", color="firebrick", alpha=0.9,
+                    label="Best achievable (max asym)")
     a1.set_xlabel("Epoch")
     a1.set_ylabel("Mass asymmetry |m₁−m₂|/(m₁+m₂)")
     a1.set_title("QCD background mass asymmetry vs epoch")
     if len(mx_e):
-        a2.plot(mx_e, mm_m, "-o", color="indianred", label="QCD mean")
+        a2.plot(mx_e, mm_m, "-o", color="indianred", label="QCD mean (achieved)")
         a2.fill_between(mx_e, mm_m - mm_s, mm_m + mm_s, color="indianred", alpha=0.2, label="±1σ")
+        if np.isfinite(mm_a).any():
+            a2.plot(mx_e, mm_a, "--", color="firebrick", alpha=0.9,
+                    label="Best achievable (min mass)")
     a2.set_xlabel("Epoch")
     a2.set_ylabel("Average candidate mass (m₁+m₂)/2")
     a2.set_title("QCD background average mass vs epoch")
@@ -2290,6 +2305,8 @@ def _run_epoch(
     all_mass_pred = []
     all_mass_true = []
     all_pred_is_bkg = []
+    all_pred_asym_max = []   # per-event achievable max asymmetry (over assignments)
+    all_pred_mass_min = []   # per-event achievable min mass_sum (over assignments)
     total_sig_samples = 0
     factored = model.has_isr
     # Label smoothing used by ce_loss_fn, replicated here so the per-event
@@ -2672,11 +2689,15 @@ def _run_epoch(
             total_mass_asym_samples += batch_size
             all_pred_asym.append(pred_asym.cpu())
             all_pred_correct.append((preds == labels).cpu())  # aligned with pred_asym
+            # Best achievable asymmetry for this event (ceiling for the bg push).
+            all_pred_asym_max.append(mass_asym_flat.max(dim=-1).values.cpu())
 
         if "mass_sum_flat" in output:
             mass_sum_flat = output["mass_sum_flat"].detach()  # (batch, num_assignments)
             pred_mass_sum = mass_sum_flat.gather(1, preds.unsqueeze(1)).squeeze(1)  # (batch,)
             all_pred_mass_sum.append(pred_mass_sum.cpu())
+            # Lowest achievable mass_sum for this event (floor for the bg push).
+            all_pred_mass_min.append(mass_sum_flat.min(dim=-1).values.cpu())
 
         # Max-triplet scalar-sum pT: look up the two triplets for each event's
         # predicted assignment and take the larger of the two per-triplet pT sums.
@@ -2747,8 +2768,12 @@ def _run_epoch(
         result["std_mass_asym"] = pred_asym_cat.std().item()
         result["pred_asym_values"] = pred_asym_cat.numpy()  # full per-event array
         result["pred_correct_values"] = torch.cat(all_pred_correct).numpy()  # bool per-event
+    if all_pred_asym_max:
+        result["pred_asym_achievable_values"] = torch.cat(all_pred_asym_max).numpy()
     if all_pred_mass_sum:
         result["pred_mass_sum_values"] = torch.cat(all_pred_mass_sum).numpy()  # full per-event array
+    if all_pred_mass_min:
+        result["pred_mass_sum_achievable_values"] = torch.cat(all_pred_mass_min).numpy()
     if all_pred_max_triplet_pt:
         mpt_cat = torch.cat(all_pred_max_triplet_pt)
         result["pred_max_triplet_pt_values"] = mpt_cat.numpy()

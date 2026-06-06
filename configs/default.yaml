@@ -68,28 +68,35 @@ training:
   #       argmax;
   #   (c) an optional asymmetry cut (bg_asym_cut) that explicitly evacuates the
   #       signal region by penalising probability left below the cut.
-  # Disabled by default (lambda_bg: 0); providing a QCD sample auto-enables it.
+  # Active only when a QCD sample is present (no effect on signal-only runs, where
+  # the term is masked out).  Providing a QCD sample with lambda_bg<=0 auto-enables
+  # it at 2.0.
   #
-  # When training WITH a QCD sample, the recommended settings are:
-  #     lambda_bg: 1.0
+  # When training WITH a QCD sample, also set the redundant signal-side proxies to 0:
   #     lambda_qcd: 0.0            # redundant pT-hierarchy proxy; would act on signal
   #     lambda_entropy_asym: 0.0   # ditto (network-uncertainty proxy)
   #     lambda_entropy_mass: 0.0   # ditto
   # (keep lambda_sym so the signal stays a symmetric bump).
   #
-  # Tuning for "more extreme" QCD:
-  #   beta_bg: relative weight of the low-mass route vs the asymmetry route in the
-  #     OR (1.0 = balanced; >1 favours low mass; <1 favours high asymmetry).
-  #   bg_soft_weight: strength of the distribution-level push (raise toward 2-4 if
-  #     the QCD distribution is not extreme enough; the hard CE alone can saturate).
-  #   bg_asym_cut: if your analysis defines a signal region by a mass-asymmetry cut
-  #     A < A_cut, set this to A_cut (e.g. 0.1) to actively push QCD probability
-  #     above it.  0 disables this explicit term (relative OR push only).
-  #   lambda_bg: overall weight; raise (e.g. 2-5) to push harder still.
-  lambda_bg: 0.0
+  # Tuning for "more extreme" QCD (defaults below are already cranked up and biased
+  # toward the asymmetry route):
+  #   beta_bg: weight of the low-mass route vs the asymmetry route in the OR
+  #     max(asym, beta_bg*mass_low).  1.0 = balanced; <1 favours high asymmetry
+  #     (0.5 here); >1 favours low mass.  Lower it further (e.g. 0.3) to lean even
+  #     harder on asymmetry.
+  #   bg_soft_weight: strength of the distribution-level push that drags the bulk
+  #     (not just the argmax) to the extreme.  Raise toward 3-4 to push harder.
+  #   lambda_bg: overall weight; raise (e.g. 3-5) to push harder still (watch the
+  #     signal accuracy — too high starts to cost reconstruction).
+  #   bg_asym_cut: if your signal region is defined by a mass-asymmetry cut
+  #     A < A_cut, set this to A_cut (e.g. 0.1) to explicitly evacuate QCD
+  #     probability from below the cut.  0 = relative OR push only.
+  # The qcd_trends plot draws a dashed "best achievable" line so you can see how
+  # much headroom remains before the per-event data limit.
+  lambda_bg: 2.0
   lambda_bg_rampup: 20
-  beta_bg: 1.0
-  bg_soft_weight: 1.0
+  beta_bg: 0.5
+  bg_soft_weight: 2.0
   bg_asym_cut: 0.0
   # Distillation from the classical mass-asymmetry solver.
   # At Phase 2 epoch 0 this loss pulls the NN logits toward the assignment with
