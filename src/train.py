@@ -72,6 +72,23 @@ def _style_axis(ax, grid_axis: str = "both") -> None:
     ax.set_axisbelow(True)
 
 
+def _init_plot_style(plt) -> None:
+    """Tufte-flavoured global style: a serif font family, larger base/legend text,
+    serif math, and extra title padding so titles sit a little higher.  Idempotent;
+    called at the top of every plotting helper before any text is drawn."""
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.size": 12,
+        "axes.titlesize": 14,
+        "axes.labelsize": 12,
+        "legend.fontsize": 12,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "mathtext.fontset": "dejavuserif",
+        "axes.titlepad": 16,
+    })
+
+
 def _get_git_commit_hash() -> str:
     """Return the short git commit hash of HEAD, or 'unknown' if unavailable."""
     try:
@@ -1153,6 +1170,7 @@ def _make_distribution_gif(
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.animation as animation
+        _init_plot_style(plt)
     except ImportError:
         print(f"  Warning: matplotlib not available; skipping {title_prefix} GIF.")
         return None
@@ -1237,18 +1255,19 @@ def _make_distribution_gif(
         epoch, phase, vals, correct, is_bkg = usable[frame_idx]
         ax.cla()
         sc, sw, qo = _frame_hist(vals, correct, is_bkg)
-        # Filled areas use a translucent face with a crisp thin same-hue outline.
+        # Filled areas have NO per-bar edge; the histogram envelope is drawn once
+        # as an unfilled step outline on top, for a clean ROOT-like look.
         if subset in ("signal", "combined"):
-            ax.bar(centers, sc, width=bar_width, align="center",
-                   facecolor=_rgba(C["signal_correct"], 0.82),
-                   edgecolor=_edge(C["signal_correct"]), linewidth=0.6, label="Signal correct")
-            ax.bar(centers, sw, width=bar_width, align="center", bottom=sc,
-                   facecolor=_rgba(C["signal_wrong"], 0.82),
-                   edgecolor=_edge(C["signal_wrong"]), linewidth=0.6, label="Signal wrong")
+            ax.bar(centers, sc, width=bar_width, align="center", linewidth=0,
+                   facecolor=_rgba(C["signal_correct"], 0.82), label="Signal correct")
+            ax.bar(centers, sw, width=bar_width, align="center", bottom=sc, linewidth=0,
+                   facecolor=_rgba(C["signal_wrong"], 0.82), label="Signal wrong")
+            ax.stairs(sc, bin_edges, color=_edge(C["signal_correct"]), linewidth=1.1)
+            ax.stairs(sc + sw, bin_edges, color=_edge(C["signal_wrong"]), linewidth=1.1)
         if subset == "qcd":
-            ax.bar(centers, qo, width=bar_width, align="center",
-                   facecolor=_rgba(C["qcd"], 0.82),
-                   edgecolor=_edge(C["qcd"]), linewidth=0.6, label="QCD background")
+            ax.bar(centers, qo, width=bar_width, align="center", linewidth=0,
+                   facecolor=_rgba(C["qcd"], 0.82), label="QCD background")
+            ax.stairs(qo, bin_edges, color=_edge(C["qcd"]), linewidth=1.1)
         if subset == "combined" and qo.sum() > 0:
             ax.stairs(qo, bin_edges, color=C["qcd"], linewidth=1.6,
                       label="QCD (area-normalized)")
@@ -1276,7 +1295,7 @@ def _make_distribution_gif(
         elif phase == 2:
             phase_label = " [Phase 2]"
         ax.set_title(f"{title_prefix} — Epoch {epoch}{phase_label}", loc="left", fontsize=11)
-        ax.legend(loc="upper right", fontsize=8, frameon=False)
+        ax.legend(loc="upper right", fontsize=11, frameon=False)
         _style_axis(ax, grid_axis="y")
 
     anim = animation.FuncAnimation(
@@ -1400,6 +1419,7 @@ def _make_trend_plot(
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        _init_plot_style(plt)
     except ImportError:
         return None
 
@@ -1465,7 +1485,7 @@ def _make_trend_plot(
             a.axvline(phase2_start_epoch, color="#777777", linestyle=":", linewidth=1.0,
                       label="Phase 2 start")
         _style_axis(a, grid_axis="both")
-        a.legend(loc="best", frameon=False, fontsize=9)
+        a.legend(loc="best", frameon=False, fontsize=11)
     fig.tight_layout()
     try:
         fig.savefig(str(out_path))
@@ -1545,6 +1565,7 @@ def _make_max_triplet_pt_gif(
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.animation as animation
+        _init_plot_style(plt)
     except ImportError:
         print("  Warning: matplotlib not available; skipping max-triplet-pT GIF.")
         return None
@@ -1603,17 +1624,20 @@ def _make_max_triplet_pt_gif(
             counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
             counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
             ax.bar(centers, counts_correct,   width=bar_width, align="center", label="Correct",
-                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82),
-                   edgecolor=_edge(_HIST_COLORS["signal_correct"]), linewidth=0.6)
+                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82), linewidth=0)
             ax.bar(centers, counts_incorrect, width=bar_width, align="center", label="Incorrect",
                    bottom=counts_correct,
-                   facecolor=_rgba(_HIST_COLORS["signal_wrong"], 0.82),
-                   edgecolor=_edge(_HIST_COLORS["signal_wrong"]), linewidth=0.6)
+                   facecolor=_rgba(_HIST_COLORS["signal_wrong"], 0.82), linewidth=0)
+            ax.stairs(counts_correct, bin_edges,
+                      color=_edge(_HIST_COLORS["signal_correct"]), linewidth=1.1)
+            ax.stairs(counts_correct + counts_incorrect, bin_edges,
+                      color=_edge(_HIST_COLORS["signal_wrong"]), linewidth=1.1)
         else:
             counts, _ = np.histogram(values, bins=bin_edges)
             ax.bar(centers, counts, width=bar_width, align="center",
-                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82),
-                   edgecolor=_edge(_HIST_COLORS["signal_correct"]), linewidth=0.6)
+                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82), linewidth=0)
+            ax.stairs(counts, bin_edges,
+                      color=_edge(_HIST_COLORS["signal_correct"]), linewidth=1.1)
 
         ax.axvline(mean_val, color=_HIST_COLORS["mean"], linewidth=1.3,
                    label=f"Mean = {mean_val:.3f}")
@@ -1683,6 +1707,7 @@ def _make_delta_phi_gif(
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.animation as animation
+        _init_plot_style(plt)
     except ImportError:
         print("  Warning: matplotlib not available; skipping Δφ GIF.")
         return None
@@ -1735,17 +1760,20 @@ def _make_delta_phi_gif(
             counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
             counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
             ax.bar(centers, counts_correct,   width=bar_width, align="center", label="Correct",
-                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82),
-                   edgecolor=_edge(_HIST_COLORS["signal_correct"]), linewidth=0.6)
+                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82), linewidth=0)
             ax.bar(centers, counts_incorrect, width=bar_width, align="center", label="Incorrect",
                    bottom=counts_correct,
-                   facecolor=_rgba(_HIST_COLORS["signal_wrong"], 0.82),
-                   edgecolor=_edge(_HIST_COLORS["signal_wrong"]), linewidth=0.6)
+                   facecolor=_rgba(_HIST_COLORS["signal_wrong"], 0.82), linewidth=0)
+            ax.stairs(counts_correct, bin_edges,
+                      color=_edge(_HIST_COLORS["signal_correct"]), linewidth=1.1)
+            ax.stairs(counts_correct + counts_incorrect, bin_edges,
+                      color=_edge(_HIST_COLORS["signal_wrong"]), linewidth=1.1)
         else:
             counts, _ = np.histogram(values, bins=bin_edges)
             ax.bar(centers, counts, width=bar_width, align="center",
-                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82),
-                   edgecolor=_edge(_HIST_COLORS["signal_correct"]), linewidth=0.6)
+                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82), linewidth=0)
+            ax.stairs(counts, bin_edges,
+                      color=_edge(_HIST_COLORS["signal_correct"]), linewidth=1.1)
 
         ax.axvline(mean_val, color=_HIST_COLORS["mean"], linewidth=1.3,
                    label=f"Mean = {mean_val:.3f}")
@@ -1818,6 +1846,7 @@ def _make_democracy_gif(
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.animation as animation
+        _init_plot_style(plt)
     except ImportError:
         print("  Warning: matplotlib not available; skipping democracy GIF.")
         return None
@@ -1869,17 +1898,20 @@ def _make_democracy_gif(
             counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
             counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
             ax.bar(centers, counts_correct,   width=bar_width, align="center", label="Correct",
-                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82),
-                   edgecolor=_edge(_HIST_COLORS["signal_correct"]), linewidth=0.6)
+                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82), linewidth=0)
             ax.bar(centers, counts_incorrect, width=bar_width, align="center", label="Incorrect",
                    bottom=counts_correct,
-                   facecolor=_rgba(_HIST_COLORS["signal_wrong"], 0.82),
-                   edgecolor=_edge(_HIST_COLORS["signal_wrong"]), linewidth=0.6)
+                   facecolor=_rgba(_HIST_COLORS["signal_wrong"], 0.82), linewidth=0)
+            ax.stairs(counts_correct, bin_edges,
+                      color=_edge(_HIST_COLORS["signal_correct"]), linewidth=1.1)
+            ax.stairs(counts_correct + counts_incorrect, bin_edges,
+                      color=_edge(_HIST_COLORS["signal_wrong"]), linewidth=1.1)
         else:
             counts, _ = np.histogram(values, bins=bin_edges)
             ax.bar(centers, counts, width=bar_width, align="center",
-                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82),
-                   edgecolor=_edge(_HIST_COLORS["signal_correct"]), linewidth=0.6)
+                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82), linewidth=0)
+            ax.stairs(counts, bin_edges,
+                      color=_edge(_HIST_COLORS["signal_correct"]), linewidth=1.1)
 
         ax.axvline(mean_val, color=_HIST_COLORS["mean"], linewidth=1.3,
                    label=f"Mean = {mean_val:.3f}")
@@ -1950,6 +1982,7 @@ def _plot_training_curves(
         import matplotlib
         matplotlib.use("Agg")  # non-interactive backend, safe in all environments
         import matplotlib.pyplot as plt
+        _init_plot_style(plt)
     except ImportError:
         print("  Warning: matplotlib not available; skipping training curve plots.")
         return []
