@@ -30,6 +30,21 @@ from .model import JetAssignmentTransformer
 from .utils import get_config, get_device
 
 
+# Consistent colour palette shared by all training animations and trend plots.
+# Uses the Okabe–Ito palette — a mature, colourblind-safe scheme widely adopted
+# for scientific figures (https://jfly.uni-koeln.de/color/).
+#   signal_correct/signal_wrong : the two parts of the signal stack
+#   qcd                         : QCD background (filled when alone, unfilled
+#                                 outline when overlaid on the signal stack)
+#   mean                        : per-epoch mean reference line
+_HIST_COLORS = {
+    "signal_correct": "#009E73",  # Okabe–Ito bluish green
+    "signal_wrong":   "#E69F00",  # Okabe–Ito orange
+    "qcd":            "#0072B2",  # Okabe–Ito blue
+    "mean":           "#2A2A2A",  # near-black grey
+}
+
+
 def _get_git_commit_hash() -> str:
     """Return the short git commit hash of HEAD, or 'unknown' if unavailable."""
     try:
@@ -785,6 +800,27 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     phase2_start_epoch=phase2_start_epoch,
                     gif_path=Path("plots") / "mass_sum_anim_latest.gif",
                 )
+            # Signal-only diagnostics: mass-asymmetry and average-mass distributions
+            # per epoch (correct vs wrong interpretation stack) + mean-vs-epoch trend.
+            if val_asym_history:
+                _make_signal_mass_asym_gif(
+                    val_asym_history,
+                    phase2_start_epoch=phase2_start_epoch,
+                    gif_path=Path("plots") / "signal_mass_asym_anim_latest.gif",
+                )
+            if val_mass_sum_history:
+                _make_signal_avg_mass_gif(
+                    val_mass_sum_history,
+                    phase2_start_epoch=phase2_start_epoch,
+                    gif_path=Path("plots") / "signal_avg_mass_anim_latest.gif",
+                )
+            if val_asym_history or val_mass_sum_history:
+                _make_signal_trend_plot(
+                    val_asym_history,
+                    val_mass_sum_history,
+                    phase2_start_epoch=phase2_start_epoch,
+                    out_path=Path("plots") / "signal_trends_latest.pdf",
+                )
             # QCD-background-only diagnostics (skipped automatically when there is
             # no QCD sample): mass-asymmetry and average-mass distributions per
             # epoch, plus a mean-vs-epoch trend showing the loss pushing QCD to
@@ -960,6 +996,19 @@ def train(config_path: str | None = None, data_path: str | None = None,
         if mass_sum_gif is not None:
             plot_paths.append(mass_sum_gif)
 
+    # Signal-only diagnostics (correct vs wrong interpretation): distributions + trend.
+    sig_asym_gif = _make_signal_mass_asym_gif(val_asym_history, phase2_start_epoch=phase2_start_epoch)
+    if sig_asym_gif is not None:
+        plot_paths.append(sig_asym_gif)
+    sig_avg_mass_gif = _make_signal_avg_mass_gif(val_mass_sum_history, phase2_start_epoch=phase2_start_epoch)
+    if sig_avg_mass_gif is not None:
+        plot_paths.append(sig_avg_mass_gif)
+    sig_trend = _make_signal_trend_plot(
+        val_asym_history, val_mass_sum_history, phase2_start_epoch=phase2_start_epoch
+    )
+    if sig_trend is not None:
+        plot_paths.append(sig_trend)
+
     # QCD-background-only diagnostics (no-ops when there is no QCD sample):
     # mass-asymmetry and average-mass distributions per epoch + mean-vs-epoch trend.
     qcd_asym_gif = _make_qcd_mass_asym_gif(val_asym_history, phase2_start_epoch=phase2_start_epoch)
@@ -1008,137 +1057,19 @@ def _make_mass_asym_gif(
     phase2_start_epoch: int | None = None,
     gif_path: str | Path | None = None,
 ) -> "Path | None":
-    """Build an animated GIF of the validation mass-asymmetry distribution.
-
-    Each frame shows a histogram of log₁₀(mass asymmetry) for the model's
-    chosen interpretation across all validation events for that epoch.  When a
-    per-event correctness mask is available (4-tuple history entries) the bars
-    are stacked by correct vs incorrect network outputs.  A vertical line marks
-    the per-epoch mean.  When two-phase training was used, frames from Phase 2
-    onward carry a "Phase 2" annotation so the transition is immediately
-    visible.
-
-    When *gif_path* is ``None`` the file is written to
-    ``plots/mass_asym_anim_{timestamp}_{commit}.gif``; pass an explicit path
-    (e.g. ``plots/mass_asym_anim_latest.gif``) to overwrite a fixed file on
-    every call and requires ``pillow`` (pip install pillow).
-
-    Args:
-        val_asym_history: List of ``(epoch, phase, values_array[, correct_mask])``
-            tuples collected during training, one entry per epoch.  The optional
-            fourth element is a boolean NumPy array aligned with *values_array*
-            (True = model chose the correct assignment).
-        phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
-            ``None`` for single-phase runs.
-        gif_path: Destination file path.  When ``None`` a timestamped path
-            inside ``plots/`` is generated automatically.
-    """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import matplotlib.animation as animation
-    except ImportError:
-        print("  Warning: matplotlib not available; skipping mass-asym GIF.")
-        return None
-
-    if not val_asym_history:
-        return None
-
-    plots_dir = Path("plots")
-    plots_dir.mkdir(exist_ok=True)
-
-    if gif_path is None:
-        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        commit = _get_git_commit_hash()
-        gif_path = plots_dir / f"mass_asym_anim_{ts}_{commit}.gif"
-    gif_path = Path(gif_path)
-
+    """Combined mass-asymmetry GIF: signal correct/wrong stack + normalized QCD outline."""
     import numpy as np
-
-    # Unpack history: tolerate 3-tuple (legacy), 4-tuple (with correct mask) and
-    # 5-tuple (with per-event background flag, ignored here).
-    def _unpack(entry):
-        epoch, phase, values = entry[0], entry[1], entry[2]
-        correct_mask = entry[3] if len(entry) >= 4 else None
-        return epoch, phase, values, correct_mask
-
-    # x-axis in log10 space: mass_asym ∈ (0, 1] → log10 ∈ (-∞, 0].
-    # Clip values below 1e-4 to avoid -inf.
-    LOG_CLIP = 1e-4
-    x_min, x_max = -4.0, 0.0
-    n_bins = 50
-    bin_edges = np.linspace(x_min, x_max, n_bins + 1)
-
-    # Pre-compute stacked counts for every frame to fix the y-axis.
-    max_count = 0
-    for entry in val_asym_history:
-        _, _, values, correct_mask = _unpack(entry)
-        log_vals = np.log10(np.clip(values, LOG_CLIP, 1.0))
-        counts_total, _ = np.histogram(log_vals, bins=bin_edges)
-        if counts_total.max() > max_count:
-            max_count = int(counts_total.max())
-    y_max = max_count * 1.1
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bar_width = (x_max - x_min) / n_bins
-    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-    def _draw_frame(frame_idx):
-        _, _, values, correct_mask = _unpack(val_asym_history[frame_idx])
-        epoch, phase = val_asym_history[frame_idx][0], val_asym_history[frame_idx][1]
-        ax.cla()
-        log_vals = np.log10(np.clip(values, LOG_CLIP, 1.0))
-        mean_val = float(log_vals.mean())
-
-        if correct_mask is not None:
-            log_correct   = log_vals[correct_mask]
-            log_incorrect = log_vals[~correct_mask]
-            counts_correct,   _ = np.histogram(log_correct,   bins=bin_edges)
-            counts_incorrect, _ = np.histogram(log_incorrect, bins=bin_edges)
-            ax.bar(centers, counts_correct,   width=bar_width,
-                   color="steelblue", alpha=0.85, align="center", label="Correct")
-            ax.bar(centers, counts_incorrect, width=bar_width,
-                   color="coral",     alpha=0.85, align="center", label="Incorrect",
-                   bottom=counts_correct)
-        else:
-            counts, _ = np.histogram(log_vals, bins=bin_edges)
-            ax.bar(centers, counts, width=bar_width,
-                   color="steelblue", alpha=0.75, align="center")
-
-        ax.axvline(mean_val, color="darkorange", linewidth=2.0,
-                   label=f"Mean = {mean_val:.2f}")
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(0, y_max)
-        ax.set_xlabel("log₁₀(mass asymmetry of chosen interpretation)")
-        ax.set_ylabel("Validation events")
-        phase_label = ""
-        if phase2_start_epoch is not None:
-            phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
-        elif phase == 2:
-            phase_label = " [Phase 2]"
-        ax.set_title(f"Epoch {epoch}{phase_label}")
-        ax.legend(loc="upper left")
-        ax.grid(True, alpha=0.3)
-
-    anim = animation.FuncAnimation(
-        fig,
-        _draw_frame,
-        frames=len(val_asym_history),
-        interval=200,
-        repeat=False,
+    return _make_distribution_gif(
+        val_asym_history,
+        value_fn=lambda v: np.log10(np.clip(v, 1e-4, 1.0)),
+        xlabel="log₁₀(mass asymmetry of chosen interpretation)",
+        title_prefix="Mass asymmetry",
+        short_name="mass_asym_anim",
+        subset="combined",
+        x_range=(-4.0, 0.0),
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
     )
-
-    try:
-        anim.save(str(gif_path), writer="pillow", fps=5)
-        print(f"  -> Saved mass asym GIF : {gif_path}")
-        return gif_path
-    except Exception as exc:
-        print(f"  Warning: could not save mass-asym GIF ({exc}). "
-              "Is pillow installed?  pip install pillow")
-        return None
-    finally:
-        plt.close(fig)
 
 
 def _make_mass_sum_gif(
@@ -1146,174 +1077,49 @@ def _make_mass_sum_gif(
     phase2_start_epoch: int | None = None,
     gif_path: str | Path | None = None,
 ) -> "Path | None":
-    """Build an animated GIF of the validation average-candidate-mass distribution.
-
-    Each frame shows a histogram of ``(m₁ + m₂) / 2`` for the model's chosen
-    interpretation across all validation events for that epoch.  When a
-    per-event correctness mask is available (4-tuple history entries) the bars
-    are stacked by correct vs incorrect network outputs.  A vertical line marks
-    the per-epoch mean.  When two-phase training was used, frames from Phase 2
-    onward carry a "Phase 2" annotation so the transition is immediately
-    visible.
-
-    When *gif_path* is ``None`` the file is written to
-    ``plots/mass_sum_anim_{timestamp}_{commit}.gif``; pass an explicit path
-    (e.g. ``plots/mass_sum_anim_latest.gif``) to overwrite a fixed file on
-    every call.  Requires ``pillow`` (pip install pillow).
-
-    Args:
-        val_mass_sum_history: List of ``(epoch, phase, values_array[, correct_mask])``
-            tuples where *values_array* contains ``mass_sum_flat`` at the
-            predicted assignment for each validation event.  The optional
-            fourth element is a boolean NumPy array aligned with *values_array*
-            (True = model chose the correct assignment).
-        phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
-            ``None`` for single-phase runs.
-        gif_path: Destination file path.  When ``None`` a timestamped path
-            inside ``plots/`` is generated automatically.
-    """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import matplotlib.animation as animation
-    except ImportError:
-        print("  Warning: matplotlib not available; skipping mass-sum GIF.")
-        return None
-
-    if not val_mass_sum_history:
-        return None
-
-    plots_dir = Path("plots")
-    plots_dir.mkdir(exist_ok=True)
-
-    if gif_path is None:
-        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        commit = _get_git_commit_hash()
-        gif_path = plots_dir / f"mass_sum_anim_{ts}_{commit}.gif"
-    gif_path = Path(gif_path)
-
-    import numpy as np
-
-    # Unpack history: tolerate 3-tuple (legacy), 4-tuple (with correct mask) and
-    # 5-tuple (with per-event background flag) entries.
-    def _unpack(entry):
-        epoch, phase, values = entry[0], entry[1], entry[2]
-        correct_mask = entry[3] if len(entry) >= 4 else None
-        is_bkg = entry[4] if len(entry) >= 5 else None
-        return epoch, phase, values, correct_mask, is_bkg
-
-    # The average mass per candidate is mass_sum / 2.
-    all_avg_mass = [u[2] / 2.0 for u in (_unpack(e) for e in val_mass_sum_history)]
-
-    # Fixed x-axis determined from the global data range (1st–99th percentile).
-    all_concat = np.concatenate(all_avg_mass)
-    x_min = float(np.percentile(all_concat, 1))
-    x_max = float(np.percentile(all_concat, 99))
-    if x_min >= x_max:
-        x_min, x_max = float(all_concat.min()), float(all_concat.max())
-    n_bins = 50
-    bin_edges = np.linspace(x_min, x_max, n_bins + 1)
-
-    # Pre-compute total counts for every frame to fix the y-axis.
-    max_count = 0
-    for avg_mass in all_avg_mass:
-        counts, _ = np.histogram(avg_mass, bins=bin_edges)
-        if counts.max() > max_count:
-            max_count = int(counts.max())
-    y_max = max_count * 1.1
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bar_width = (x_max - x_min) / n_bins
-    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-    def _draw_frame(frame_idx):
-        epoch, phase, values, correct_mask, is_bkg = _unpack(val_mass_sum_history[frame_idx])
-        avg_mass = values / 2.0
-        ax.cla()
-        mean_val = float(avg_mass.mean())
-
-        if is_bkg is not None and bool(is_bkg.any()):
-            # Signal vs QCD-background overlay — more informative than
-            # correct/incorrect when a background sample is present.  The QCD
-            # distribution should fall steeply toward low average mass.
-            counts_sig, _ = np.histogram(avg_mass[~is_bkg], bins=bin_edges)
-            counts_bkg, _ = np.histogram(avg_mass[is_bkg],  bins=bin_edges)
-            ax.bar(centers, counts_sig, width=bar_width,
-                   color="steelblue", alpha=0.85, align="center", label="Signal")
-            ax.bar(centers, counts_bkg, width=bar_width,
-                   color="indianred", alpha=0.85, align="center", label="QCD background",
-                   bottom=counts_sig)
-        elif correct_mask is not None:
-            avg_correct   = avg_mass[correct_mask]
-            avg_incorrect = avg_mass[~correct_mask]
-            counts_correct,   _ = np.histogram(avg_correct,   bins=bin_edges)
-            counts_incorrect, _ = np.histogram(avg_incorrect, bins=bin_edges)
-            ax.bar(centers, counts_correct,   width=bar_width,
-                   color="mediumseagreen", alpha=0.85, align="center", label="Correct")
-            ax.bar(centers, counts_incorrect, width=bar_width,
-                   color="coral",           alpha=0.85, align="center", label="Incorrect",
-                   bottom=counts_correct)
-        else:
-            counts, _ = np.histogram(avg_mass, bins=bin_edges)
-            ax.bar(centers, counts, width=bar_width,
-                   color="mediumseagreen", alpha=0.75, align="center")
-
-        ax.axvline(mean_val, color="darkorange", linewidth=2.0,
-                   label=f"Mean = {mean_val:.3f}")
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(0, y_max)
-        ax.set_xlabel("Average candidate mass (m₁+m₂)/2 of chosen interpretation")
-        ax.set_ylabel("Validation events")
-        phase_label = ""
-        if phase2_start_epoch is not None:
-            phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
-        elif phase == 2:
-            phase_label = " [Phase 2]"
-        ax.set_title(f"Epoch {epoch}{phase_label}")
-        ax.legend(loc="upper right")
-        ax.grid(True, alpha=0.3)
-
-    anim = animation.FuncAnimation(
-        fig,
-        _draw_frame,
-        frames=len(val_mass_sum_history),
-        interval=200,
-        repeat=False,
+    """Combined average-mass GIF: signal correct/wrong stack + normalized QCD outline."""
+    return _make_distribution_gif(
+        val_mass_sum_history,
+        value_fn=lambda v: v / 2.0,
+        xlabel="Average candidate mass (m₁+m₂)/2 of chosen interpretation",
+        title_prefix="Average candidate mass",
+        short_name="mass_sum_anim",
+        subset="combined",
+        x_range=None,
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
     )
 
-    try:
-        anim.save(str(gif_path), writer="pillow", fps=5)
-        print(f"  -> Saved mass sum GIF  : {gif_path}")
-        return gif_path
-    except Exception as exc:
-        print(f"  Warning: could not save mass-sum GIF ({exc}). "
-              "Is pillow installed?  pip install pillow")
-        return None
-    finally:
-        plt.close(fig)
 
-
-def _make_qcd_distribution_gif(
+def _make_distribution_gif(
     history: list,
     value_fn,
     xlabel: str,
     title_prefix: str,
     short_name: str,
+    *,
+    subset: str = "combined",
     gif_path: str | Path | None = None,
     phase2_start_epoch: int | None = None,
     x_range: tuple[float, float] | None = None,
     n_bins: int = 50,
-    color: str = "indianred",
+    ylabel: str | None = None,
 ) -> "Path | None":
-    """Animated histogram of a per-event quantity for QCD-background events only.
+    """Animated per-epoch histogram of a per-event quantity, with consistent colours.
 
-    *history* entries are ``(epoch, phase, values, correct_mask, is_bkg)`` tuples
-    (the trailing ``is_bkg`` boolean array selects background events).  Only
-    events with ``is_bkg == True`` are shown.  *value_fn* maps the raw per-event
-    values array to the plotted quantity (e.g. ``v / 2`` for average mass, or a
-    ``log10`` for asymmetry).  Returns ``None`` silently when no background
-    events are present (so signal-only runs produce no QCD plots).
+    History entries are ``(epoch, phase, values, correct_mask, is_bkg[, achievable])``.
+    *subset* selects what each frame shows:
+
+      - ``"signal"``  : signal events only, a filled stack of correct (green) on
+                        the bottom and wrong (orange) on top.
+      - ``"qcd"``     : QCD/background events only, a single filled histogram (red).
+      - ``"combined"``: the signal correct/wrong stack (filled) PLUS the QCD
+                        distribution drawn as a separate **unfilled step outline**,
+                        area-normalised to the signal stack so the shapes compare.
+
+    *value_fn* maps the raw per-event values to the plotted quantity.  Returns
+    ``None`` when the chosen subset has no events in any frame (e.g. "qcd"/"combined"
+    on a signal-only run produce no QCD content; "qcd" returns None entirely).
     """
     try:
         import matplotlib
@@ -1321,25 +1127,34 @@ def _make_qcd_distribution_gif(
         import matplotlib.pyplot as plt
         import matplotlib.animation as animation
     except ImportError:
+        print(f"  Warning: matplotlib not available; skipping {title_prefix} GIF.")
         return None
     if not history:
         return None
 
     import numpy as np
+    C = _HIST_COLORS
 
-    def _bkg_vals(entry):
+    def _parts(entry):
+        vals = value_fn(np.asarray(entry[2]))
+        n = len(vals)
+        correct = entry[3] if len(entry) >= 4 else None
+        correct = np.asarray(correct, dtype=bool) if correct is not None else None
         is_bkg = entry[4] if len(entry) >= 5 else None
-        if is_bkg is None:
-            return None
-        is_bkg = np.asarray(is_bkg, dtype=bool)
-        if not is_bkg.any():
-            return None
-        return value_fn(np.asarray(entry[2])[is_bkg])
+        is_bkg = np.asarray(is_bkg, dtype=bool) if is_bkg is not None else np.zeros(n, dtype=bool)
+        return entry[0], entry[1], vals, correct, is_bkg
 
-    # Keep only frames (epochs) that actually contain background events.
-    frames = [(e[0], e[1], _bkg_vals(e)) for e in history]
-    frames = [f for f in frames if f[2] is not None and len(f[2]) > 0]
-    if not frames:
+    parsed = [_parts(e) for e in history]
+
+    def _sel(vals, is_bkg):
+        if subset == "qcd":
+            return vals[is_bkg]
+        if subset == "signal":
+            return vals[~is_bkg]
+        return vals  # combined
+
+    usable = [p for p in parsed if len(_sel(p[2], p[4])) > 0]
+    if not usable:
         return None
 
     plots_dir = Path("plots")
@@ -1350,7 +1165,7 @@ def _make_qcd_distribution_gif(
         gif_path = plots_dir / f"{short_name}_{ts}_{commit}.gif"
     gif_path = Path(gif_path)
 
-    all_concat = np.concatenate([f[2] for f in frames])
+    all_concat = np.concatenate([_sel(p[2], p[4]) for p in usable])
     if x_range is not None:
         x_min, x_max = x_range
     else:
@@ -1362,37 +1177,79 @@ def _make_qcd_distribution_gif(
     centers = (bin_edges[:-1] + bin_edges[1:]) / 2
     bar_width = (x_max - x_min) / n_bins
 
-    max_count = 0
-    for _, _, v in frames:
-        counts, _ = np.histogram(v, bins=bin_edges)
-        if counts.size and counts.max() > max_count:
-            max_count = int(counts.max())
-    y_max = max(max_count * 1.1, 1)
+    def _frame_hist(vals, correct, is_bkg):
+        sig = ~is_bkg
+        sig_corr = np.zeros(n_bins)
+        sig_wrong = np.zeros(n_bins)
+        qcd_out = np.zeros(n_bins)
+        if subset in ("signal", "combined"):
+            if correct is not None:
+                sig_corr = np.histogram(vals[sig & correct], bins=bin_edges)[0]
+                sig_wrong = np.histogram(vals[sig & ~correct], bins=bin_edges)[0]
+            else:
+                sig_corr = np.histogram(vals[sig], bins=bin_edges)[0]
+        qc_raw = np.histogram(vals[is_bkg], bins=bin_edges)[0]
+        if subset == "qcd":
+            qcd_out = qc_raw.astype(float)
+        elif subset == "combined":
+            sig_total = float(sig_corr.sum() + sig_wrong.sum())
+            qc_total = float(qc_raw.sum())
+            qcd_out = qc_raw * (sig_total / qc_total) if (qc_total > 0 and sig_total > 0) else qc_raw.astype(float)
+        return sig_corr, sig_wrong, qcd_out
+
+    y_max = 1.0
+    for _, _, vals, correct, is_bkg in usable:
+        sc, sw, qo = _frame_hist(vals, correct, is_bkg)
+        top = max(float((sc + sw).max()), float(qo.max()) if qo.size else 0.0)
+        y_max = max(y_max, top)
+    y_max *= 1.15
 
     fig, ax = plt.subplots(figsize=(8, 5))
 
     def _draw_frame(frame_idx):
-        epoch, phase, v = frames[frame_idx]
+        epoch, phase, vals, correct, is_bkg = usable[frame_idx]
         ax.cla()
-        counts, _ = np.histogram(v, bins=bin_edges)
-        ax.bar(centers, counts, width=bar_width, color=color, alpha=0.8, align="center")
-        mean_val = float(v.mean())
-        ax.axvline(mean_val, color="darkorange", linewidth=2.0, label=f"Mean = {mean_val:.3f}")
+        sc, sw, qo = _frame_hist(vals, correct, is_bkg)
+        if subset in ("signal", "combined"):
+            ax.bar(centers, sc, width=bar_width, align="center",
+                   color=C["signal_correct"], alpha=0.9, label="Signal correct")
+            ax.bar(centers, sw, width=bar_width, align="center", bottom=sc,
+                   color=C["signal_wrong"], alpha=0.9, label="Signal wrong")
+        if subset == "qcd":
+            ax.bar(centers, qo, width=bar_width, align="center",
+                   color=C["qcd"], alpha=0.85, label="QCD background")
+        if subset == "combined" and qo.sum() > 0:
+            ax.stairs(qo, bin_edges, color=C["qcd"], linewidth=1.8,
+                      label="QCD (area-normalized)")
+        # Mean reference line(s).
+        sig_vals = vals[~is_bkg]
+        qcd_vals = vals[is_bkg]
+        if subset in ("signal", "combined") and len(sig_vals):
+            m = float(sig_vals.mean())
+            ax.axvline(m, color=C["mean"], linewidth=1.8,
+                       label=f"{'Signal ' if subset == 'combined' else ''}mean = {m:.3f}")
+        if subset == "qcd" and len(qcd_vals):
+            m = float(qcd_vals.mean())
+            ax.axvline(m, color=C["mean"], linewidth=1.8, label=f"Mean = {m:.3f}")
+        if subset == "combined" and len(qcd_vals):
+            m = float(qcd_vals.mean())
+            ax.axvline(m, color=C["qcd"], linewidth=1.6, linestyle="--",
+                       label=f"QCD mean = {m:.3f}")
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(0, y_max)
         ax.set_xlabel(xlabel)
-        ax.set_ylabel("QCD background events")
+        ax.set_ylabel(ylabel or "Validation events")
         phase_label = ""
         if phase2_start_epoch is not None:
             phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
         elif phase == 2:
             phase_label = " [Phase 2]"
         ax.set_title(f"{title_prefix} — Epoch {epoch}{phase_label}")
-        ax.legend(loc="upper right")
+        ax.legend(loc="upper right", fontsize=8)
         ax.grid(True, alpha=0.3)
 
     anim = animation.FuncAnimation(
-        fig, _draw_frame, frames=len(frames), interval=200, repeat=False
+        fig, _draw_frame, frames=len(usable), interval=200, repeat=False
     )
     try:
         anim.save(str(gif_path), writer="pillow", fps=5)
@@ -1412,15 +1269,17 @@ def _make_qcd_mass_asym_gif(
 ) -> "Path | None":
     """Animated histogram of the QCD-background mass asymmetry, one frame/epoch."""
     import numpy as np
-    return _make_qcd_distribution_gif(
+    return _make_distribution_gif(
         val_asym_history,
         value_fn=lambda v: np.log10(np.clip(v, 1e-4, 1.0)),
         xlabel="log₁₀(mass asymmetry) — QCD background",
         title_prefix="QCD mass asymmetry",
         short_name="qcd_mass_asym_anim",
+        subset="qcd",
+        x_range=(-4.0, 0.0),
+        ylabel="QCD background events",
         gif_path=gif_path,
         phase2_start_epoch=phase2_start_epoch,
-        x_range=(-4.0, 0.0),
     )
 
 
@@ -1430,33 +1289,81 @@ def _make_qcd_avg_mass_gif(
     gif_path: str | Path | None = None,
 ) -> "Path | None":
     """Animated histogram of the QCD-background average candidate mass, one frame/epoch."""
-    return _make_qcd_distribution_gif(
+    return _make_distribution_gif(
         val_mass_sum_history,
         value_fn=lambda v: v / 2.0,
         xlabel="Average candidate mass (m₁+m₂)/2 — QCD background",
         title_prefix="QCD average mass",
         short_name="qcd_avg_mass_anim",
+        subset="qcd",
+        x_range=None,
+        ylabel="QCD background events",
         gif_path=gif_path,
         phase2_start_epoch=phase2_start_epoch,
-        x_range=None,
     )
 
 
-def _make_qcd_trend_plot(
+def _make_signal_mass_asym_gif(
     val_asym_history: list,
+    phase2_start_epoch: int | None = None,
+    gif_path: str | Path | None = None,
+) -> "Path | None":
+    """Animated histogram of the SIGNAL mass asymmetry (correct/wrong stack), per epoch."""
+    import numpy as np
+    return _make_distribution_gif(
+        val_asym_history,
+        value_fn=lambda v: np.log10(np.clip(v, 1e-4, 1.0)),
+        xlabel="log₁₀(mass asymmetry) — signal",
+        title_prefix="Signal mass asymmetry",
+        short_name="signal_mass_asym_anim",
+        subset="signal",
+        x_range=(-4.0, 0.0),
+        ylabel="Signal events",
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
+    )
+
+
+def _make_signal_avg_mass_gif(
     val_mass_sum_history: list,
     phase2_start_epoch: int | None = None,
-    out_path: str | Path | None = None,
+    gif_path: str | Path | None = None,
 ) -> "Path | None":
-    """Static plot of QCD-background mean mass asymmetry and mean average mass vs epoch.
+    """Animated histogram of the SIGNAL average candidate mass (correct/wrong stack), per epoch."""
+    return _make_distribution_gif(
+        val_mass_sum_history,
+        value_fn=lambda v: v / 2.0,
+        xlabel="Average candidate mass (m₁+m₂)/2 — signal",
+        title_prefix="Signal average mass",
+        short_name="signal_avg_mass_anim",
+        subset="signal",
+        x_range=None,
+        ylabel="Signal events",
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
+    )
 
-    Two panels show how the per-epoch mean (±1σ band) of the chosen-assignment
-    mass asymmetry and average candidate mass evolve over training for QCD events
-    only.  A dashed "best achievable" line shows the per-event ceiling/floor (mean
-    of the max available asymmetry / min available average mass), so the gap to it
-    reveals whether there is still headroom for the background-rejection push or
-    whether the data limit has been reached.  Returns ``None`` when no background
-    events are present.
+
+def _make_trend_plot(
+    val_asym_history: list,
+    val_mass_sum_history: list,
+    *,
+    subset: str,
+    label: str,
+    color: str,
+    show_achievable: bool = False,
+    phase2_start_epoch: int | None = None,
+    out_path: str | Path | None = None,
+    short_name: str = "trend",
+) -> "Path | None":
+    """Two-panel mean(±1σ)-vs-epoch trend (with markers) for a subset of events.
+
+    *subset* is ``"signal"`` or ``"qcd"``.  Panel 1 is the mass asymmetry, panel 2
+    the average candidate mass (the mass-sum variable, m_sum/2).  When
+    *show_achievable* is set and the per-event achievable extreme is recorded
+    (history 6-tuples), a dashed line shows the mean max-asymmetry / min-mass
+    ceiling so the remaining headroom is visible.  Returns ``None`` when the
+    subset has no events.
     """
     try:
         import matplotlib
@@ -1470,19 +1377,19 @@ def _make_qcd_trend_plot(
     def _series(history, transform):
         xs, means, stds, ach = [], [], [], []
         for entry in history:
+            vals = np.asarray(entry[2])
             is_bkg = entry[4] if len(entry) >= 5 else None
-            if is_bkg is None:
+            is_bkg = np.asarray(is_bkg, dtype=bool) if is_bkg is not None else np.zeros(len(vals), dtype=bool)
+            sel = is_bkg if subset == "qcd" else ~is_bkg
+            if not sel.any():
                 continue
-            is_bkg = np.asarray(is_bkg, dtype=bool)
-            if not is_bkg.any():
-                continue
-            v = transform(np.asarray(entry[2])[is_bkg])
+            v = transform(vals[sel])
             xs.append(entry[0])
             means.append(float(v.mean()))
             stds.append(float(v.std()))
             ach_arr = entry[5] if len(entry) >= 6 else None
             if ach_arr is not None:
-                ach.append(float(transform(np.asarray(ach_arr)[is_bkg]).mean()))
+                ach.append(float(transform(np.asarray(ach_arr)[sel]).mean()))
             else:
                 ach.append(float("nan"))
         return np.array(xs), np.array(means), np.array(stds), np.array(ach)
@@ -1497,28 +1404,28 @@ def _make_qcd_trend_plot(
     if out_path is None:
         ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
         commit = _get_git_commit_hash()
-        out_path = plots_dir / f"qcd_trends_{ts}_{commit}.pdf"
+        out_path = plots_dir / f"{short_name}_{ts}_{commit}.pdf"
     out_path = Path(out_path)
 
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 5))
     if len(ax_e):
-        a1.plot(ax_e, am_m, "-o", color="indianred", label="QCD mean (achieved)")
-        a1.fill_between(ax_e, am_m - am_s, am_m + am_s, color="indianred", alpha=0.2, label="±1σ")
-        if np.isfinite(am_a).any():
-            a1.plot(ax_e, am_a, "--", color="firebrick", alpha=0.9,
+        a1.plot(ax_e, am_m, "-o", color=color, label=f"{label} mean (achieved)")
+        a1.fill_between(ax_e, am_m - am_s, am_m + am_s, color=color, alpha=0.2, label="±1σ")
+        if show_achievable and np.isfinite(am_a).any():
+            a1.plot(ax_e, am_a, "--o", color=color, alpha=0.6, markersize=3,
                     label="Best achievable (max asym)")
     a1.set_xlabel("Epoch")
     a1.set_ylabel("Mass asymmetry |m₁−m₂|/(m₁+m₂)")
-    a1.set_title("QCD background mass asymmetry vs epoch")
+    a1.set_title(f"{label} mass asymmetry vs epoch")
     if len(mx_e):
-        a2.plot(mx_e, mm_m, "-o", color="indianred", label="QCD mean (achieved)")
-        a2.fill_between(mx_e, mm_m - mm_s, mm_m + mm_s, color="indianred", alpha=0.2, label="±1σ")
-        if np.isfinite(mm_a).any():
-            a2.plot(mx_e, mm_a, "--", color="firebrick", alpha=0.9,
+        a2.plot(mx_e, mm_m, "-o", color=color, label=f"{label} mean (achieved)")
+        a2.fill_between(mx_e, mm_m - mm_s, mm_m + mm_s, color=color, alpha=0.2, label="±1σ")
+        if show_achievable and np.isfinite(mm_a).any():
+            a2.plot(mx_e, mm_a, "--o", color=color, alpha=0.6, markersize=3,
                     label="Best achievable (min mass)")
     a2.set_xlabel("Epoch")
     a2.set_ylabel("Average candidate mass (m₁+m₂)/2")
-    a2.set_title("QCD background average mass vs epoch")
+    a2.set_title(f"{label} average mass vs epoch")
     for a in (a1, a2):
         if phase2_start_epoch is not None:
             a.axvline(phase2_start_epoch, color="gray", linestyle="--", alpha=0.7,
@@ -1528,13 +1435,43 @@ def _make_qcd_trend_plot(
     fig.tight_layout()
     try:
         fig.savefig(str(out_path))
-        print(f"  -> Saved QCD trend plot: {out_path}")
+        print(f"  -> Saved {label} trend plot: {out_path}")
         return out_path
     except Exception as exc:
-        print(f"  Warning: could not save QCD trend plot ({exc}).")
+        print(f"  Warning: could not save {label} trend plot ({exc}).")
         return None
     finally:
         plt.close(fig)
+
+
+def _make_qcd_trend_plot(
+    val_asym_history: list,
+    val_mass_sum_history: list,
+    phase2_start_epoch: int | None = None,
+    out_path: str | Path | None = None,
+) -> "Path | None":
+    """QCD-background mass-asymmetry and average-mass trend (with achievable ceiling)."""
+    return _make_trend_plot(
+        val_asym_history, val_mass_sum_history,
+        subset="qcd", label="QCD background", color=_HIST_COLORS["qcd"],
+        show_achievable=True, phase2_start_epoch=phase2_start_epoch,
+        out_path=out_path, short_name="qcd_trends",
+    )
+
+
+def _make_signal_trend_plot(
+    val_asym_history: list,
+    val_mass_sum_history: list,
+    phase2_start_epoch: int | None = None,
+    out_path: str | Path | None = None,
+) -> "Path | None":
+    """Signal mass-asymmetry and average-mass trend vs epoch (with markers)."""
+    return _make_trend_plot(
+        val_asym_history, val_mass_sum_history,
+        subset="signal", label="Signal", color=_HIST_COLORS["signal_correct"],
+        show_achievable=False, phase2_start_epoch=phase2_start_epoch,
+        out_path=out_path, short_name="signal_trends",
+    )
 
 
 def _make_max_triplet_pt_gif(
@@ -1632,16 +1569,16 @@ def _make_max_triplet_pt_gif(
             counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
             counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
             ax.bar(centers, counts_correct,   width=bar_width,
-                   color="mediumorchid", alpha=0.85, align="center", label="Correct")
+                   color=_HIST_COLORS["signal_correct"], alpha=0.9, align="center", label="Correct")
             ax.bar(centers, counts_incorrect, width=bar_width,
-                   color="coral",        alpha=0.85, align="center", label="Incorrect",
+                   color=_HIST_COLORS["signal_wrong"], alpha=0.9, align="center", label="Incorrect",
                    bottom=counts_correct)
         else:
             counts, _ = np.histogram(values, bins=bin_edges)
             ax.bar(centers, counts, width=bar_width,
-                   color="mediumorchid", alpha=0.75, align="center")
+                   color=_HIST_COLORS["signal_correct"], alpha=0.75, align="center")
 
-        ax.axvline(mean_val, color="darkorange", linewidth=2.0,
+        ax.axvline(mean_val, color=_HIST_COLORS["mean"], linewidth=2.0,
                    label=f"Mean = {mean_val:.3f}")
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(0, y_max)
@@ -1761,16 +1698,16 @@ def _make_delta_phi_gif(
             counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
             counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
             ax.bar(centers, counts_correct,   width=bar_width,
-                   color="steelblue", alpha=0.85, align="center", label="Correct")
+                   color=_HIST_COLORS["signal_correct"], alpha=0.9, align="center", label="Correct")
             ax.bar(centers, counts_incorrect, width=bar_width,
-                   color="coral",     alpha=0.85, align="center", label="Incorrect",
+                   color=_HIST_COLORS["signal_wrong"], alpha=0.9, align="center", label="Incorrect",
                    bottom=counts_correct)
         else:
             counts, _ = np.histogram(values, bins=bin_edges)
             ax.bar(centers, counts, width=bar_width,
-                   color="steelblue", alpha=0.75, align="center")
+                   color=_HIST_COLORS["signal_correct"], alpha=0.75, align="center")
 
-        ax.axvline(mean_val, color="darkorange", linewidth=2.0,
+        ax.axvline(mean_val, color=_HIST_COLORS["mean"], linewidth=2.0,
                    label=f"Mean = {mean_val:.3f}")
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(0, y_max)
@@ -1892,16 +1829,16 @@ def _make_democracy_gif(
             counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
             counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
             ax.bar(centers, counts_correct,   width=bar_width,
-                   color="mediumseagreen", alpha=0.85, align="center", label="Correct")
+                   color=_HIST_COLORS["signal_correct"], alpha=0.9, align="center", label="Correct")
             ax.bar(centers, counts_incorrect, width=bar_width,
-                   color="coral",           alpha=0.85, align="center", label="Incorrect",
+                   color=_HIST_COLORS["signal_wrong"], alpha=0.9, align="center", label="Incorrect",
                    bottom=counts_correct)
         else:
             counts, _ = np.histogram(values, bins=bin_edges)
             ax.bar(centers, counts, width=bar_width,
-                   color="mediumseagreen", alpha=0.75, align="center")
+                   color=_HIST_COLORS["signal_correct"], alpha=0.75, align="center")
 
-        ax.axvline(mean_val, color="darkorange", linewidth=2.0,
+        ax.axvline(mean_val, color=_HIST_COLORS["mean"], linewidth=2.0,
                    label=f"Mean = {mean_val:.3f}")
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(0, y_max)
@@ -2021,6 +1958,13 @@ def _plot_training_curves(
     if not epochs:
         print("  Warning: empty training log; skipping plots.")
         return []
+
+    # Draw every trend curve below with point markers, consistent with the
+    # QCD/signal trend plots.  Saved and restored at the end so the marker style
+    # does not leak into the GIF mean lines drawn later in the same epoch.
+    _saved_rc = {k: plt.rcParams[k] for k in ("lines.marker", "lines.markersize")}
+    plt.rcParams["lines.marker"] = "o"
+    plt.rcParams["lines.markersize"] = 3
 
     # --- Output directory and file tag ---
     if tag is None:
@@ -2267,6 +2211,7 @@ def _plot_training_curves(
         print(f"  -> Saved democracy plot: {dem_path}")
         saved_paths.append(dem_path)
 
+    plt.rcParams.update(_saved_rc)
     return saved_paths
 
 
