@@ -72,10 +72,58 @@ def _style_axis(ax, grid_axis: str = "both") -> None:
     ax.set_axisbelow(True)
 
 
+_FONTS_REGISTERED = False
+
+
+def _ensure_serif_fonts() -> None:
+    """Make the EB Garamond serif available without a system install or network.
+
+    If no Garamond is already known to matplotlib, the OFL-licensed copies vendored
+    in ``assets/fonts/`` are registered with the font manager for this process (so
+    plots use Garamond immediately) and also copied into the user font directory so
+    they persist for future runs and other tools.  Best-effort and idempotent;
+    never raises — if anything fails, plotting simply falls back to Times/DejaVu.
+    """
+    global _FONTS_REGISTERED
+    if _FONTS_REGISTERED:
+        return
+    _FONTS_REGISTERED = True
+    try:
+        import matplotlib.font_manager as fm
+        have = {f.name for f in fm.fontManager.ttflist}
+        if {"EB Garamond", "Garamond"} & have:
+            return  # a Garamond is already installed
+        font_dir = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+        bundled = sorted(font_dir.rglob("*.otf")) + sorted(font_dir.rglob("*.ttf"))
+        if not bundled:
+            return
+        for p in bundled:
+            try:
+                fm.fontManager.addfont(str(p))
+            except Exception:
+                pass
+        # Persist to the user font directory so the font "installs" for next time.
+        try:
+            import shutil
+            user_dir = Path.home() / ".local" / "share" / "fonts" / "ebgaramond"
+            user_dir.mkdir(parents=True, exist_ok=True)
+            for p in bundled:
+                dest = user_dir / p.name
+                if not dest.exists():
+                    shutil.copy2(p, dest)
+        except Exception:
+            pass
+        if "EB Garamond" in {f.name for f in fm.fontManager.ttflist}:
+            print("  Registered vendored EB Garamond serif for plots.")
+    except Exception:
+        pass
+
+
 def _init_plot_style(plt) -> None:
     """Tufte-flavoured global style: a serif font family, larger base/legend text,
     serif math, and extra title padding so titles sit a little higher.  Idempotent;
     called at the top of every plotting helper before any text is drawn."""
+    _ensure_serif_fonts()
     plt.rcParams.update({
         "font.family": "serif",
         # Prefer a refined serif; fall back gracefully to whatever is installed.
