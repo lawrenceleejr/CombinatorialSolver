@@ -39,10 +39,37 @@ from .utils import get_config, get_device
 #   mean                        : per-epoch mean reference line
 _HIST_COLORS = {
     "signal_correct": "#009E73",  # Okabe–Ito bluish green — correct interpretation
-    "signal_wrong":   "#999999",  # neutral grey — combinatorial bkg (wrong interpretation)
-    "qcd":            "#CC79A7",  # Okabe–Ito reddish purple — QCD background
+    "signal_wrong":   "#CFCFCF",  # light grey — combinatorial bkg (wrong interpretation)
+    "qcd":            "#D55E00",  # Okabe–Ito vermillion — QCD background
     "mean":           "#2A2A2A",  # near-black grey — mean reference line
 }
+
+
+def _rgba(color, alpha: float):
+    """Translucent face colour for filled areas."""
+    from matplotlib.colors import to_rgba
+    return to_rgba(color, alpha)
+
+
+def _edge(color, factor: float = 0.55):
+    """A darker shade of *color* for a crisp thin outline around a filled area."""
+    from matplotlib.colors import to_rgba
+    r, g, b = to_rgba(color)[:3]
+    return (r * factor, g * factor, b * factor)
+
+
+def _style_axis(ax, grid_axis: str = "both") -> None:
+    """Apply a clean, Tufte-inspired style: drop the top/right spines, lighten the
+    remaining spines and ticks, and lay faint gridlines behind the data so the ink
+    serves the data, not the frame.  Legends are drawn frameless by the callers."""
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color("#777777")
+        ax.spines[side].set_linewidth(0.8)
+    ax.tick_params(colors="#555555", length=3, width=0.8)
+    ax.grid(True, axis=grid_axis, color="#E9E9E9", linewidth=0.6)
+    ax.set_axisbelow(True)
 
 
 def _get_git_commit_hash() -> str:
@@ -1210,30 +1237,34 @@ def _make_distribution_gif(
         epoch, phase, vals, correct, is_bkg = usable[frame_idx]
         ax.cla()
         sc, sw, qo = _frame_hist(vals, correct, is_bkg)
+        # Filled areas use a translucent face with a crisp thin same-hue outline.
         if subset in ("signal", "combined"):
             ax.bar(centers, sc, width=bar_width, align="center",
-                   color=C["signal_correct"], alpha=0.9, label="Signal correct")
+                   facecolor=_rgba(C["signal_correct"], 0.82),
+                   edgecolor=_edge(C["signal_correct"]), linewidth=0.6, label="Signal correct")
             ax.bar(centers, sw, width=bar_width, align="center", bottom=sc,
-                   color=C["signal_wrong"], alpha=0.9, label="Signal wrong")
+                   facecolor=_rgba(C["signal_wrong"], 0.82),
+                   edgecolor=_edge(C["signal_wrong"]), linewidth=0.6, label="Signal wrong")
         if subset == "qcd":
             ax.bar(centers, qo, width=bar_width, align="center",
-                   color=C["qcd"], alpha=0.85, label="QCD background")
+                   facecolor=_rgba(C["qcd"], 0.82),
+                   edgecolor=_edge(C["qcd"]), linewidth=0.6, label="QCD background")
         if subset == "combined" and qo.sum() > 0:
-            ax.stairs(qo, bin_edges, color=C["qcd"], linewidth=1.8,
+            ax.stairs(qo, bin_edges, color=C["qcd"], linewidth=1.6,
                       label="QCD (area-normalized)")
-        # Mean reference line(s).
+        # Mean reference line(s) — thin, understated.
         sig_vals = vals[~is_bkg]
         qcd_vals = vals[is_bkg]
         if subset in ("signal", "combined") and len(sig_vals):
             m = float(sig_vals.mean())
-            ax.axvline(m, color=C["mean"], linewidth=1.8,
+            ax.axvline(m, color=C["mean"], linewidth=1.3,
                        label=f"{'Signal ' if subset == 'combined' else ''}mean = {m:.3f}")
         if subset == "qcd" and len(qcd_vals):
             m = float(qcd_vals.mean())
-            ax.axvline(m, color=C["mean"], linewidth=1.8, label=f"Mean = {m:.3f}")
+            ax.axvline(m, color=C["mean"], linewidth=1.3, label=f"Mean = {m:.3f}")
         if subset == "combined" and len(qcd_vals):
             m = float(qcd_vals.mean())
-            ax.axvline(m, color=C["qcd"], linewidth=1.6, linestyle="--",
+            ax.axvline(m, color=C["qcd"], linewidth=1.3, linestyle="--",
                        label=f"QCD mean = {m:.3f}")
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(0, y_max)
@@ -1244,9 +1275,9 @@ def _make_distribution_gif(
             phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
         elif phase == 2:
             phase_label = " [Phase 2]"
-        ax.set_title(f"{title_prefix} — Epoch {epoch}{phase_label}")
-        ax.legend(loc="upper right", fontsize=8)
-        ax.grid(True, alpha=0.3)
+        ax.set_title(f"{title_prefix} — Epoch {epoch}{phase_label}", loc="left", fontsize=11)
+        ax.legend(loc="upper right", fontsize=8, frameon=False)
+        _style_axis(ax, grid_axis="y")
 
     anim = animation.FuncAnimation(
         fig, _draw_frame, frames=len(usable), interval=200, repeat=False
@@ -1408,30 +1439,33 @@ def _make_trend_plot(
     out_path = Path(out_path)
 
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 5))
+    line_kw = dict(marker="o", markersize=4, markeredgecolor="white", markeredgewidth=0.6,
+                   linewidth=1.6, color=color)
+    band_kw = dict(facecolor=_rgba(color, 0.15), edgecolor=_rgba(color, 0.45), linewidth=0.6)
     if len(ax_e):
-        a1.plot(ax_e, am_m, "-o", color=color, label=f"{label} mean (achieved)")
-        a1.fill_between(ax_e, am_m - am_s, am_m + am_s, color=color, alpha=0.2, label="±1σ")
+        a1.plot(ax_e, am_m, label=f"{label} mean (achieved)", **line_kw)
+        a1.fill_between(ax_e, am_m - am_s, am_m + am_s, label="±1σ", **band_kw)
         if show_achievable and np.isfinite(am_a).any():
-            a1.plot(ax_e, am_a, "--o", color=color, alpha=0.6, markersize=3,
+            a1.plot(ax_e, am_a, "--", marker="o", markersize=3, color=color, alpha=0.55,
                     label="Best achievable (max asym)")
     a1.set_xlabel("Epoch")
     a1.set_ylabel("Mass asymmetry |m₁−m₂|/(m₁+m₂)")
-    a1.set_title(f"{label} mass asymmetry vs epoch")
+    a1.set_title(f"{label} mass asymmetry vs epoch", loc="left", fontsize=11)
     if len(mx_e):
-        a2.plot(mx_e, mm_m, "-o", color=color, label=f"{label} mean (achieved)")
-        a2.fill_between(mx_e, mm_m - mm_s, mm_m + mm_s, color=color, alpha=0.2, label="±1σ")
+        a2.plot(mx_e, mm_m, label=f"{label} mean (achieved)", **line_kw)
+        a2.fill_between(mx_e, mm_m - mm_s, mm_m + mm_s, label="±1σ", **band_kw)
         if show_achievable and np.isfinite(mm_a).any():
-            a2.plot(mx_e, mm_a, "--o", color=color, alpha=0.6, markersize=3,
+            a2.plot(mx_e, mm_a, "--", marker="o", markersize=3, color=color, alpha=0.55,
                     label="Best achievable (min mass)")
     a2.set_xlabel("Epoch")
     a2.set_ylabel("Average candidate mass (m₁+m₂)/2")
-    a2.set_title(f"{label} average mass vs epoch")
+    a2.set_title(f"{label} average mass vs epoch", loc="left", fontsize=11)
     for a in (a1, a2):
         if phase2_start_epoch is not None:
-            a.axvline(phase2_start_epoch, color="gray", linestyle="--", alpha=0.7,
+            a.axvline(phase2_start_epoch, color="#777777", linestyle=":", linewidth=1.0,
                       label="Phase 2 start")
-        a.grid(True, alpha=0.3)
-        a.legend(loc="best")
+        _style_axis(a, grid_axis="both")
+        a.legend(loc="best", frameon=False, fontsize=9)
     fig.tight_layout()
     try:
         fig.savefig(str(out_path))
@@ -1568,17 +1602,20 @@ def _make_max_triplet_pt_gif(
             vals_incorrect = values[~correct_mask]
             counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
             counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
-            ax.bar(centers, counts_correct,   width=bar_width,
-                   color=_HIST_COLORS["signal_correct"], alpha=0.9, align="center", label="Correct")
-            ax.bar(centers, counts_incorrect, width=bar_width,
-                   color=_HIST_COLORS["signal_wrong"], alpha=0.9, align="center", label="Incorrect",
-                   bottom=counts_correct)
+            ax.bar(centers, counts_correct,   width=bar_width, align="center", label="Correct",
+                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82),
+                   edgecolor=_edge(_HIST_COLORS["signal_correct"]), linewidth=0.6)
+            ax.bar(centers, counts_incorrect, width=bar_width, align="center", label="Incorrect",
+                   bottom=counts_correct,
+                   facecolor=_rgba(_HIST_COLORS["signal_wrong"], 0.82),
+                   edgecolor=_edge(_HIST_COLORS["signal_wrong"]), linewidth=0.6)
         else:
             counts, _ = np.histogram(values, bins=bin_edges)
-            ax.bar(centers, counts, width=bar_width,
-                   color=_HIST_COLORS["signal_correct"], alpha=0.75, align="center")
+            ax.bar(centers, counts, width=bar_width, align="center",
+                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82),
+                   edgecolor=_edge(_HIST_COLORS["signal_correct"]), linewidth=0.6)
 
-        ax.axvline(mean_val, color=_HIST_COLORS["mean"], linewidth=2.0,
+        ax.axvline(mean_val, color=_HIST_COLORS["mean"], linewidth=1.3,
                    label=f"Mean = {mean_val:.3f}")
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(0, y_max)
@@ -1590,8 +1627,8 @@ def _make_max_triplet_pt_gif(
         elif phase == 2:
             phase_label = " [Phase 2]"
         ax.set_title(f"Epoch {epoch}{phase_label}")
-        ax.legend(loc="upper right")
-        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", frameon=False)
+        _style_axis(ax)
 
     anim = animation.FuncAnimation(
         fig,
@@ -1697,17 +1734,20 @@ def _make_delta_phi_gif(
             vals_incorrect = values[~correct_mask]
             counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
             counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
-            ax.bar(centers, counts_correct,   width=bar_width,
-                   color=_HIST_COLORS["signal_correct"], alpha=0.9, align="center", label="Correct")
-            ax.bar(centers, counts_incorrect, width=bar_width,
-                   color=_HIST_COLORS["signal_wrong"], alpha=0.9, align="center", label="Incorrect",
-                   bottom=counts_correct)
+            ax.bar(centers, counts_correct,   width=bar_width, align="center", label="Correct",
+                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82),
+                   edgecolor=_edge(_HIST_COLORS["signal_correct"]), linewidth=0.6)
+            ax.bar(centers, counts_incorrect, width=bar_width, align="center", label="Incorrect",
+                   bottom=counts_correct,
+                   facecolor=_rgba(_HIST_COLORS["signal_wrong"], 0.82),
+                   edgecolor=_edge(_HIST_COLORS["signal_wrong"]), linewidth=0.6)
         else:
             counts, _ = np.histogram(values, bins=bin_edges)
-            ax.bar(centers, counts, width=bar_width,
-                   color=_HIST_COLORS["signal_correct"], alpha=0.75, align="center")
+            ax.bar(centers, counts, width=bar_width, align="center",
+                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82),
+                   edgecolor=_edge(_HIST_COLORS["signal_correct"]), linewidth=0.6)
 
-        ax.axvline(mean_val, color=_HIST_COLORS["mean"], linewidth=2.0,
+        ax.axvline(mean_val, color=_HIST_COLORS["mean"], linewidth=1.3,
                    label=f"Mean = {mean_val:.3f}")
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(0, y_max)
@@ -1719,8 +1759,8 @@ def _make_delta_phi_gif(
         elif phase == 2:
             phase_label = " [Phase 2]"
         ax.set_title(f"Epoch {epoch}{phase_label}")
-        ax.legend(loc="upper left")
-        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper left", frameon=False)
+        _style_axis(ax)
 
     anim = animation.FuncAnimation(
         fig,
@@ -1828,17 +1868,20 @@ def _make_democracy_gif(
             vals_incorrect = values[~correct_mask]
             counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
             counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
-            ax.bar(centers, counts_correct,   width=bar_width,
-                   color=_HIST_COLORS["signal_correct"], alpha=0.9, align="center", label="Correct")
-            ax.bar(centers, counts_incorrect, width=bar_width,
-                   color=_HIST_COLORS["signal_wrong"], alpha=0.9, align="center", label="Incorrect",
-                   bottom=counts_correct)
+            ax.bar(centers, counts_correct,   width=bar_width, align="center", label="Correct",
+                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82),
+                   edgecolor=_edge(_HIST_COLORS["signal_correct"]), linewidth=0.6)
+            ax.bar(centers, counts_incorrect, width=bar_width, align="center", label="Incorrect",
+                   bottom=counts_correct,
+                   facecolor=_rgba(_HIST_COLORS["signal_wrong"], 0.82),
+                   edgecolor=_edge(_HIST_COLORS["signal_wrong"]), linewidth=0.6)
         else:
             counts, _ = np.histogram(values, bins=bin_edges)
-            ax.bar(centers, counts, width=bar_width,
-                   color=_HIST_COLORS["signal_correct"], alpha=0.75, align="center")
+            ax.bar(centers, counts, width=bar_width, align="center",
+                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82),
+                   edgecolor=_edge(_HIST_COLORS["signal_correct"]), linewidth=0.6)
 
-        ax.axvline(mean_val, color=_HIST_COLORS["mean"], linewidth=2.0,
+        ax.axvline(mean_val, color=_HIST_COLORS["mean"], linewidth=1.3,
                    label=f"Mean = {mean_val:.3f}")
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(0, y_max)
@@ -1850,8 +1893,8 @@ def _make_democracy_gif(
         elif phase == 2:
             phase_label = " [Phase 2]"
         ax.set_title(f"Epoch {epoch}{phase_label}")
-        ax.legend(loc="upper left")
-        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper left", frameon=False)
+        _style_axis(ax)
 
     anim = animation.FuncAnimation(
         fig,
@@ -1962,9 +2005,15 @@ def _plot_training_curves(
     # Draw every trend curve below with point markers, consistent with the
     # QCD/signal trend plots.  Saved and restored at the end so the marker style
     # does not leak into the GIF mean lines drawn later in the same epoch.
-    _saved_rc = {k: plt.rcParams[k] for k in ("lines.marker", "lines.markersize")}
-    plt.rcParams["lines.marker"] = "o"
-    plt.rcParams["lines.markersize"] = 3
+    _marker_keys = ("lines.marker", "lines.markersize", "lines.markeredgecolor",
+                    "lines.markeredgewidth")
+    _saved_rc = {k: plt.rcParams[k] for k in _marker_keys}
+    plt.rcParams.update({
+        "lines.marker": "o",
+        "lines.markersize": 3.5,
+        "lines.markeredgecolor": "white",
+        "lines.markeredgewidth": 0.5,
+    })
 
     # --- Output directory and file tag ---
     if tag is None:
@@ -2006,7 +2055,7 @@ def _plot_training_curves(
     ax.set_ylabel("Loss")
     ax.set_yscale("log")
     ax.set_title("Loss vs Epoch")
-    ax.legend()
+    ax.legend(frameon=False)
     ax.grid(True, alpha=0.3, which="both")
     fig.tight_layout()
     loss_path = plots_dir / f"loss_{tag}.pdf"
@@ -2023,8 +2072,8 @@ def _plot_training_curves(
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Accuracy")
     ax.set_title("Accuracy vs Epoch")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.legend(frameon=False)
+    _style_axis(ax)
     fig.tight_layout()
     acc_path = plots_dir / f"accuracy_{tag}.pdf"
     fig.savefig(acc_path)
@@ -2067,7 +2116,7 @@ def _plot_training_curves(
         ax.set_ylabel("Mass asymmetry of chosen interpretation")
         ax.set_title("Mass Asymmetry of Chosen Interpretation vs Epoch")
         ax.set_yscale("log")
-        ax.legend()
+        ax.legend(frameon=False)
         ax.grid(True, alpha=0.3, which="both")
         fig.tight_layout()
         asym_path = plots_dir / f"mass_asym_{tag}.pdf"
@@ -2091,8 +2140,8 @@ def _plot_training_curves(
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Grouping accuracy")
         ax.set_title("GRP Score (Grouping Accuracy) vs Epoch")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.legend(frameon=False)
+        _style_axis(ax)
         fig.tight_layout()
         grp_path = plots_dir / f"grp_acc_{tag}.pdf"
         fig.savefig(grp_path)
@@ -2130,8 +2179,8 @@ def _plot_training_curves(
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Max-triplet scalar sum pT of chosen interpretation")
         ax.set_title("Max-Triplet Scalar Sum pT of Chosen Interpretation vs Epoch")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.legend(frameon=False)
+        _style_axis(ax)
         fig.tight_layout()
         mpt_path = plots_dir / f"max_triplet_pt_{tag}.pdf"
         fig.savefig(mpt_path)
@@ -2166,8 +2215,8 @@ def _plot_training_curves(
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Δφ between parent candidates (rad)")
         ax.set_title("Δφ Between Parent Candidates of Chosen Interpretation vs Epoch")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.legend(frameon=False)
+        _style_axis(ax)
         fig.tight_layout()
         dphi_path = plots_dir / f"delta_phi_{tag}.pdf"
         fig.savefig(dphi_path)
@@ -2202,8 +2251,8 @@ def _plot_training_curves(
         ax.set_xlabel("Epoch")
         ax.set_ylabel("pT democracy = avg(min pT / max pT) per triplet")
         ax.set_title("pT Democracy of Chosen Interpretation vs Epoch")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.legend(frameon=False)
+        _style_axis(ax)
         fig.tight_layout()
         dem_path = plots_dir / f"democracy_{tag}.pdf"
         fig.savefig(dem_path)
