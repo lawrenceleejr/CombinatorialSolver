@@ -78,14 +78,20 @@ def _init_plot_style(plt) -> None:
     called at the top of every plotting helper before any text is drawn."""
     plt.rcParams.update({
         "font.family": "serif",
+        # Prefer a refined serif; fall back gracefully to whatever is installed.
+        "font.serif": ["EB Garamond", "Garamond", "Adobe Garamond Pro",
+                       "Times New Roman", "Times", "Nimbus Roman No9 L",
+                       "Liberation Serif", "DejaVu Serif"],
         "font.size": 12,
         "axes.titlesize": 14,
         "axes.labelsize": 12,
         "legend.fontsize": 12,
         "xtick.labelsize": 10,
         "ytick.labelsize": 10,
-        "mathtext.fontset": "dejavuserif",
+        "mathtext.fontset": "cm",
         "axes.titlepad": 16,
+        # Garamond/Times lack the Unicode minus (U+2212); use ASCII hyphen on ticks.
+        "axes.unicode_minus": False,
     })
 
 
@@ -832,6 +838,7 @@ def train(config_path: str | None = None, data_path: str | None = None,
             # Per-epoch live-monitoring plots (overwrite fixed "latest" files so a
             # viewer that auto-refreshes (e.g. an open PDF) always shows current progress).
             _plot_training_curves(log_path, phase2_start_epoch=phase2_start_epoch, tag="latest")
+            # Distribution animations always show signal AND QCD together.
             if val_asym_history:
                 _make_mass_asym_gif(
                     val_asym_history,
@@ -844,51 +851,14 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     phase2_start_epoch=phase2_start_epoch,
                     gif_path=Path("plots") / "mass_sum_anim_latest.gif",
                 )
-            # Signal-only diagnostics: mass-asymmetry and average-mass distributions
-            # per epoch (correct vs wrong interpretation stack) + mean-vs-epoch trend.
-            if val_asym_history:
-                _make_signal_mass_asym_gif(
-                    val_asym_history,
-                    phase2_start_epoch=phase2_start_epoch,
-                    gif_path=Path("plots") / "signal_mass_asym_anim_latest.gif",
-                )
-            if val_mass_sum_history:
-                _make_signal_avg_mass_gif(
-                    val_mass_sum_history,
-                    phase2_start_epoch=phase2_start_epoch,
-                    gif_path=Path("plots") / "signal_avg_mass_anim_latest.gif",
-                )
+            # One combined trend overlaying signal and QCD means vs epoch.
             if val_asym_history or val_mass_sum_history:
-                _make_signal_trend_plot(
+                _make_trend_plot(
                     val_asym_history,
                     val_mass_sum_history,
                     phase2_start_epoch=phase2_start_epoch,
-                    out_path=Path("plots") / "signal_trends_latest.pdf",
+                    out_path=Path("plots") / "trends_latest.pdf",
                 )
-            # QCD-background-only diagnostics (skipped automatically when there is
-            # no QCD sample): mass-asymmetry and average-mass distributions per
-            # epoch, plus a mean-vs-epoch trend showing the loss pushing QCD to
-            # high asymmetry / low average mass.
-            if qcd_present:
-                if val_asym_history:
-                    _make_qcd_mass_asym_gif(
-                        val_asym_history,
-                        phase2_start_epoch=phase2_start_epoch,
-                        gif_path=Path("plots") / "qcd_mass_asym_anim_latest.gif",
-                    )
-                if val_mass_sum_history:
-                    _make_qcd_avg_mass_gif(
-                        val_mass_sum_history,
-                        phase2_start_epoch=phase2_start_epoch,
-                        gif_path=Path("plots") / "qcd_avg_mass_anim_latest.gif",
-                    )
-                if val_asym_history or val_mass_sum_history:
-                    _make_qcd_trend_plot(
-                        val_asym_history,
-                        val_mass_sum_history,
-                        phase2_start_epoch=phase2_start_epoch,
-                        out_path=Path("plots") / "qcd_trends_latest.pdf",
-                    )
             if val_max_triplet_pt_history:
                 _make_max_triplet_pt_gif(
                     val_max_triplet_pt_history,
@@ -1040,32 +1010,13 @@ def train(config_path: str | None = None, data_path: str | None = None,
         if mass_sum_gif is not None:
             plot_paths.append(mass_sum_gif)
 
-    # Signal-only diagnostics (correct vs wrong interpretation): distributions + trend.
-    sig_asym_gif = _make_signal_mass_asym_gif(val_asym_history, phase2_start_epoch=phase2_start_epoch)
-    if sig_asym_gif is not None:
-        plot_paths.append(sig_asym_gif)
-    sig_avg_mass_gif = _make_signal_avg_mass_gif(val_mass_sum_history, phase2_start_epoch=phase2_start_epoch)
-    if sig_avg_mass_gif is not None:
-        plot_paths.append(sig_avg_mass_gif)
-    sig_trend = _make_signal_trend_plot(
+    # One combined trend overlaying signal and QCD means (asymmetry + average mass)
+    # vs epoch, with the QCD "best achievable" ceiling.
+    trend = _make_trend_plot(
         val_asym_history, val_mass_sum_history, phase2_start_epoch=phase2_start_epoch
     )
-    if sig_trend is not None:
-        plot_paths.append(sig_trend)
-
-    # QCD-background-only diagnostics (no-ops when there is no QCD sample):
-    # mass-asymmetry and average-mass distributions per epoch + mean-vs-epoch trend.
-    qcd_asym_gif = _make_qcd_mass_asym_gif(val_asym_history, phase2_start_epoch=phase2_start_epoch)
-    if qcd_asym_gif is not None:
-        plot_paths.append(qcd_asym_gif)
-    qcd_avg_mass_gif = _make_qcd_avg_mass_gif(val_mass_sum_history, phase2_start_epoch=phase2_start_epoch)
-    if qcd_avg_mass_gif is not None:
-        plot_paths.append(qcd_avg_mass_gif)
-    qcd_trend = _make_qcd_trend_plot(
-        val_asym_history, val_mass_sum_history, phase2_start_epoch=phase2_start_epoch
-    )
-    if qcd_trend is not None:
-        plot_paths.append(qcd_trend)
+    if trend is not None:
+        plot_paths.append(trend)
 
     # Animated GIF of the validation max-triplet scalar-sum pT distribution.
     if val_max_triplet_pt_history:
@@ -1106,7 +1057,7 @@ def _make_mass_asym_gif(
     return _make_distribution_gif(
         val_asym_history,
         value_fn=lambda v: np.log10(np.clip(v, 1e-4, 1.0)),
-        xlabel="log₁₀(mass asymmetry of chosen interpretation)",
+        xlabel=r"$\log_{10}$(mass asymmetry of chosen interpretation)",
         title_prefix="Mass asymmetry",
         short_name="mass_asym_anim",
         subset="combined",
@@ -1125,7 +1076,7 @@ def _make_mass_sum_gif(
     return _make_distribution_gif(
         val_mass_sum_history,
         value_fn=lambda v: v / 2.0,
-        xlabel="Average candidate mass (m₁+m₂)/2 of chosen interpretation",
+        xlabel=r"Average candidate mass $(m_1{+}m_2)/2$ of chosen interpretation",
         title_prefix="Average candidate mass",
         short_name="mass_sum_anim",
         subset="combined",
@@ -1312,108 +1263,17 @@ def _make_distribution_gif(
         plt.close(fig)
 
 
-def _make_qcd_mass_asym_gif(
-    val_asym_history: list,
-    phase2_start_epoch: int | None = None,
-    gif_path: str | Path | None = None,
-) -> "Path | None":
-    """Animated histogram of the QCD-background mass asymmetry, one frame/epoch."""
-    import numpy as np
-    return _make_distribution_gif(
-        val_asym_history,
-        value_fn=lambda v: np.log10(np.clip(v, 1e-4, 1.0)),
-        xlabel="log₁₀(mass asymmetry) — QCD background",
-        title_prefix="QCD mass asymmetry",
-        short_name="qcd_mass_asym_anim",
-        subset="qcd",
-        x_range=(-4.0, 0.0),
-        ylabel="QCD background events",
-        gif_path=gif_path,
-        phase2_start_epoch=phase2_start_epoch,
-    )
-
-
-def _make_qcd_avg_mass_gif(
-    val_mass_sum_history: list,
-    phase2_start_epoch: int | None = None,
-    gif_path: str | Path | None = None,
-) -> "Path | None":
-    """Animated histogram of the QCD-background average candidate mass, one frame/epoch."""
-    return _make_distribution_gif(
-        val_mass_sum_history,
-        value_fn=lambda v: v / 2.0,
-        xlabel="Average candidate mass (m₁+m₂)/2 — QCD background",
-        title_prefix="QCD average mass",
-        short_name="qcd_avg_mass_anim",
-        subset="qcd",
-        x_range=None,
-        ylabel="QCD background events",
-        gif_path=gif_path,
-        phase2_start_epoch=phase2_start_epoch,
-    )
-
-
-def _make_signal_mass_asym_gif(
-    val_asym_history: list,
-    phase2_start_epoch: int | None = None,
-    gif_path: str | Path | None = None,
-) -> "Path | None":
-    """Animated histogram of the SIGNAL mass asymmetry (correct/wrong stack), per epoch."""
-    import numpy as np
-    return _make_distribution_gif(
-        val_asym_history,
-        value_fn=lambda v: np.log10(np.clip(v, 1e-4, 1.0)),
-        xlabel="log₁₀(mass asymmetry) — signal",
-        title_prefix="Signal mass asymmetry",
-        short_name="signal_mass_asym_anim",
-        subset="signal",
-        x_range=(-4.0, 0.0),
-        ylabel="Signal events",
-        gif_path=gif_path,
-        phase2_start_epoch=phase2_start_epoch,
-    )
-
-
-def _make_signal_avg_mass_gif(
-    val_mass_sum_history: list,
-    phase2_start_epoch: int | None = None,
-    gif_path: str | Path | None = None,
-) -> "Path | None":
-    """Animated histogram of the SIGNAL average candidate mass (correct/wrong stack), per epoch."""
-    return _make_distribution_gif(
-        val_mass_sum_history,
-        value_fn=lambda v: v / 2.0,
-        xlabel="Average candidate mass (m₁+m₂)/2 — signal",
-        title_prefix="Signal average mass",
-        short_name="signal_avg_mass_anim",
-        subset="signal",
-        x_range=None,
-        ylabel="Signal events",
-        gif_path=gif_path,
-        phase2_start_epoch=phase2_start_epoch,
-    )
-
-
 def _make_trend_plot(
     val_asym_history: list,
     val_mass_sum_history: list,
-    *,
-    subset: str,
-    label: str,
-    color: str,
-    show_achievable: bool = False,
     phase2_start_epoch: int | None = None,
     out_path: str | Path | None = None,
-    short_name: str = "trend",
 ) -> "Path | None":
-    """Two-panel mean(±1σ)-vs-epoch trend (with markers) for a subset of events.
-
-    *subset* is ``"signal"`` or ``"qcd"``.  Panel 1 is the mass asymmetry, panel 2
-    the average candidate mass (the mass-sum variable, m_sum/2).  When
-    *show_achievable* is set and the per-event achievable extreme is recorded
-    (history 6-tuples), a dashed line shows the mean max-asymmetry / min-mass
-    ceiling so the remaining headroom is visible.  Returns ``None`` when the
-    subset has no events.
+    """Two-panel trend (mass asymmetry, average candidate mass) vs epoch that
+    overlays BOTH the signal and QCD-background means (±1σ band) on the same axes,
+    with markers.  The QCD curves also carry a dashed "best achievable" ceiling
+    (mean max-asymmetry / min-mass) so the remaining headroom is visible.  Returns
+    ``None`` when there are no validation events.
     """
     try:
         import matplotlib
@@ -1425,7 +1285,7 @@ def _make_trend_plot(
 
     import numpy as np
 
-    def _series(history, transform):
+    def _series(history, transform, subset):
         xs, means, stds, ach = [], [], [], []
         for entry in history:
             vals = np.asarray(entry[2])
@@ -1439,47 +1299,47 @@ def _make_trend_plot(
             means.append(float(v.mean()))
             stds.append(float(v.std()))
             ach_arr = entry[5] if len(entry) >= 6 else None
-            if ach_arr is not None:
-                ach.append(float(transform(np.asarray(ach_arr)[sel]).mean()))
-            else:
-                ach.append(float("nan"))
+            ach.append(float(transform(np.asarray(ach_arr)[sel]).mean())
+                       if ach_arr is not None else float("nan"))
         return np.array(xs), np.array(means), np.array(stds), np.array(ach)
 
-    ax_e, am_m, am_s, am_a = _series(val_asym_history, lambda v: v)            # asymmetry in [0,1]
-    mx_e, mm_m, mm_s, mm_a = _series(val_mass_sum_history, lambda v: v / 2.0)  # average mass
-    if len(ax_e) == 0 and len(mx_e) == 0:
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 5))
+    any_data = False
+    # (subset, label, colour, draw the achievable ceiling)
+    specs = [
+        ("signal", "Signal", _HIST_COLORS["signal_correct"], False),
+        ("qcd", "QCD background", _HIST_COLORS["qcd"], True),
+    ]
+    for subset, label, color, show_ach in specs:
+        ae, am, asd, aa = _series(val_asym_history, lambda v: v, subset)
+        me, mm, msd, ma = _series(val_mass_sum_history, lambda v: v / 2.0, subset)
+        line_kw = dict(marker="o", markersize=4, markeredgecolor="white",
+                       markeredgewidth=0.6, linewidth=1.6, color=color)
+        band_kw = dict(facecolor=_rgba(color, 0.15), edgecolor=_rgba(color, 0.45), linewidth=0.6)
+        if len(ae):
+            any_data = True
+            a1.plot(ae, am, label=f"{label} mean", **line_kw)
+            a1.fill_between(ae, am - asd, am + asd, **band_kw)
+            if show_ach and np.isfinite(aa).any():
+                a1.plot(ae, aa, "--", marker="o", markersize=3, color=color, alpha=0.55,
+                        label=f"{label} best achievable")
+        if len(me):
+            any_data = True
+            a2.plot(me, mm, label=f"{label} mean", **line_kw)
+            a2.fill_between(me, mm - msd, mm + msd, **band_kw)
+            if show_ach and np.isfinite(ma).any():
+                a2.plot(me, ma, "--", marker="o", markersize=3, color=color, alpha=0.55,
+                        label=f"{label} best achievable")
+    if not any_data:
+        plt.close(fig)
         return None
 
-    plots_dir = Path("plots")
-    plots_dir.mkdir(exist_ok=True)
-    if out_path is None:
-        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        commit = _get_git_commit_hash()
-        out_path = plots_dir / f"{short_name}_{ts}_{commit}.pdf"
-    out_path = Path(out_path)
-
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 5))
-    line_kw = dict(marker="o", markersize=4, markeredgecolor="white", markeredgewidth=0.6,
-                   linewidth=1.6, color=color)
-    band_kw = dict(facecolor=_rgba(color, 0.15), edgecolor=_rgba(color, 0.45), linewidth=0.6)
-    if len(ax_e):
-        a1.plot(ax_e, am_m, label=f"{label} mean (achieved)", **line_kw)
-        a1.fill_between(ax_e, am_m - am_s, am_m + am_s, label="±1σ", **band_kw)
-        if show_achievable and np.isfinite(am_a).any():
-            a1.plot(ax_e, am_a, "--", marker="o", markersize=3, color=color, alpha=0.55,
-                    label="Best achievable (max asym)")
     a1.set_xlabel("Epoch")
-    a1.set_ylabel("Mass asymmetry |m₁−m₂|/(m₁+m₂)")
-    a1.set_title(f"{label} mass asymmetry vs epoch", loc="left", fontsize=11)
-    if len(mx_e):
-        a2.plot(mx_e, mm_m, label=f"{label} mean (achieved)", **line_kw)
-        a2.fill_between(mx_e, mm_m - mm_s, mm_m + mm_s, label="±1σ", **band_kw)
-        if show_achievable and np.isfinite(mm_a).any():
-            a2.plot(mx_e, mm_a, "--", marker="o", markersize=3, color=color, alpha=0.55,
-                    label="Best achievable (min mass)")
+    a1.set_ylabel(r"Mass asymmetry $|m_1{-}m_2|/(m_1{+}m_2)$")
+    a1.set_title("Mass asymmetry vs epoch", loc="left")
     a2.set_xlabel("Epoch")
-    a2.set_ylabel("Average candidate mass (m₁+m₂)/2")
-    a2.set_title(f"{label} average mass vs epoch", loc="left", fontsize=11)
+    a2.set_ylabel(r"Average candidate mass $(m_1{+}m_2)/2$")
+    a2.set_title("Average candidate mass vs epoch", loc="left")
     for a in (a1, a2):
         if phase2_start_epoch is not None:
             a.axvline(phase2_start_epoch, color="#777777", linestyle=":", linewidth=1.0,
@@ -1487,45 +1347,23 @@ def _make_trend_plot(
         _style_axis(a, grid_axis="both")
         a.legend(loc="best", frameon=False, fontsize=11)
     fig.tight_layout()
+
+    plots_dir = Path("plots")
+    plots_dir.mkdir(exist_ok=True)
+    if out_path is None:
+        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        commit = _get_git_commit_hash()
+        out_path = plots_dir / f"trends_{ts}_{commit}.pdf"
+    out_path = Path(out_path)
     try:
         fig.savefig(str(out_path))
-        print(f"  -> Saved {label} trend plot: {out_path}")
+        print(f"  -> Saved trend plot: {out_path}")
         return out_path
     except Exception as exc:
-        print(f"  Warning: could not save {label} trend plot ({exc}).")
+        print(f"  Warning: could not save trend plot ({exc}).")
         return None
     finally:
         plt.close(fig)
-
-
-def _make_qcd_trend_plot(
-    val_asym_history: list,
-    val_mass_sum_history: list,
-    phase2_start_epoch: int | None = None,
-    out_path: str | Path | None = None,
-) -> "Path | None":
-    """QCD-background mass-asymmetry and average-mass trend (with achievable ceiling)."""
-    return _make_trend_plot(
-        val_asym_history, val_mass_sum_history,
-        subset="qcd", label="QCD background", color=_HIST_COLORS["qcd"],
-        show_achievable=True, phase2_start_epoch=phase2_start_epoch,
-        out_path=out_path, short_name="qcd_trends",
-    )
-
-
-def _make_signal_trend_plot(
-    val_asym_history: list,
-    val_mass_sum_history: list,
-    phase2_start_epoch: int | None = None,
-    out_path: str | Path | None = None,
-) -> "Path | None":
-    """Signal mass-asymmetry and average-mass trend vs epoch (with markers)."""
-    return _make_trend_plot(
-        val_asym_history, val_mass_sum_history,
-        subset="signal", label="Signal", color=_HIST_COLORS["signal_correct"],
-        show_achievable=False, phase2_start_epoch=phase2_start_epoch,
-        out_path=out_path, short_name="signal_trends",
-    )
 
 
 def _make_max_triplet_pt_gif(
@@ -1779,7 +1617,7 @@ def _make_delta_phi_gif(
                    label=f"Mean = {mean_val:.3f}")
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(0, y_max)
-        ax.set_xlabel("Δφ between parent candidates (rad)")
+        ax.set_xlabel(r"$\Delta\phi$ between parent candidates (rad)")
         ax.set_ylabel("Validation events")
         phase_label = ""
         if phase2_start_epoch is not None:
@@ -2074,7 +1912,7 @@ def _plot_training_curves(
                 color="gray",
                 linestyle="--",
                 linewidth=1.2,
-                label="Phase 1 → 2" if idx == 0 else None,
+                label=r"Phase 1 $\rightarrow$ 2" if idx == 0 else None,
             )
 
     saved_paths: list[Path] = []
@@ -2088,8 +1926,12 @@ def _plot_training_curves(
     ax.set_ylabel("Loss")
     ax.set_yscale("log")
     ax.set_title("Loss vs Epoch")
+    # Plain-decimal log ticks (avoid mathtext 10^{-n} minus missing from serif fonts).
+    from matplotlib import ticker as _mticker
+    ax.yaxis.set_major_formatter(_mticker.FuncFormatter(lambda y, _pos: f"{y:g}"))
+    ax.yaxis.set_minor_formatter(_mticker.NullFormatter())
     ax.legend(frameon=False)
-    ax.grid(True, alpha=0.3, which="both")
+    _style_axis(ax)
     fig.tight_layout()
     loss_path = plots_dir / f"loss_{tag}.pdf"
     fig.savefig(loss_path)
@@ -2132,7 +1974,7 @@ def _plot_training_curves(
             asym_epochs,
             [m - s for m, s in zip(asym_train_avg, asym_train_std)],
             [m + s for m, s in zip(asym_train_avg, asym_train_std)],
-            color="steelblue", alpha=0.2, label="Train ±1σ",
+            color="steelblue", alpha=0.2, label=r"Train $\pm1\sigma$",
         )
 
         # Val: line + ±1σ shaded band
@@ -2141,7 +1983,7 @@ def _plot_training_curves(
             asym_epochs,
             [m - s for m, s in zip(asym_val_avg, asym_val_std)],
             [m + s for m, s in zip(asym_val_avg, asym_val_std)],
-            color="darkorange", alpha=0.2, label="Val ±1σ",
+            color="darkorange", alpha=0.2, label=r"Val $\pm1\sigma$",
         )
 
         _add_phase_lines(ax)
@@ -2149,8 +1991,13 @@ def _plot_training_curves(
         ax.set_ylabel("Mass asymmetry of chosen interpretation")
         ax.set_title("Mass Asymmetry of Chosen Interpretation vs Epoch")
         ax.set_yscale("log")
+        # Render log-axis ticks as plain decimals (avoids mathtext 10^{-n} whose
+        # minus sign is missing from refined serif fonts like Garamond).
+        from matplotlib import ticker as _mticker
+        ax.yaxis.set_major_formatter(_mticker.FuncFormatter(lambda y, _pos: f"{y:g}"))
+        ax.yaxis.set_minor_formatter(_mticker.NullFormatter())
         ax.legend(frameon=False)
-        ax.grid(True, alpha=0.3, which="both")
+        _style_axis(ax)
         fig.tight_layout()
         asym_path = plots_dir / f"mass_asym_{tag}.pdf"
         fig.savefig(asym_path)
@@ -2197,7 +2044,7 @@ def _plot_training_curves(
             mpt_epochs,
             [m - s for m, s in zip(mpt_train_avg, mpt_train_std)],
             [m + s for m, s in zip(mpt_train_avg, mpt_train_std)],
-            color="steelblue", alpha=0.2, label="Train ±1σ",
+            color="steelblue", alpha=0.2, label=r"Train $\pm1\sigma$",
         )
 
         ax.plot(mpt_epochs, mpt_val_avg, label="Val mean max-triplet pT", color="darkorange")
@@ -2205,7 +2052,7 @@ def _plot_training_curves(
             mpt_epochs,
             [m - s for m, s in zip(mpt_val_avg, mpt_val_std)],
             [m + s for m, s in zip(mpt_val_avg, mpt_val_std)],
-            color="darkorange", alpha=0.2, label="Val ±1σ",
+            color="darkorange", alpha=0.2, label=r"Val $\pm1\sigma$",
         )
 
         _add_phase_lines(ax)
@@ -2230,24 +2077,24 @@ def _plot_training_curves(
         dphi_val_std   = [v for e, v in zip(epochs, val_std_dphi)   if e in set(dphi_epochs) and not _math2.isnan(v)]
 
         fig, ax = plt.subplots(figsize=(9, 5))
-        ax.plot(dphi_epochs, dphi_train_avg, label="Train mean Δφ", color="steelblue")
+        ax.plot(dphi_epochs, dphi_train_avg, label=r"Train mean $\Delta\phi$", color="steelblue")
         ax.fill_between(
             dphi_epochs,
             [m - s for m, s in zip(dphi_train_avg, dphi_train_std)],
             [m + s for m, s in zip(dphi_train_avg, dphi_train_std)],
-            color="steelblue", alpha=0.2, label="Train ±1σ",
+            color="steelblue", alpha=0.2, label=r"Train $\pm1\sigma$",
         )
-        ax.plot(dphi_epochs, dphi_val_avg, label="Val mean Δφ", color="darkorange")
+        ax.plot(dphi_epochs, dphi_val_avg, label=r"Val mean $\Delta\phi$", color="darkorange")
         ax.fill_between(
             dphi_epochs,
             [m - s for m, s in zip(dphi_val_avg, dphi_val_std)],
             [m + s for m, s in zip(dphi_val_avg, dphi_val_std)],
-            color="darkorange", alpha=0.2, label="Val ±1σ",
+            color="darkorange", alpha=0.2, label=r"Val $\pm1\sigma$",
         )
         _add_phase_lines(ax)
         ax.set_xlabel("Epoch")
-        ax.set_ylabel("Δφ between parent candidates (rad)")
-        ax.set_title("Δφ Between Parent Candidates of Chosen Interpretation vs Epoch")
+        ax.set_ylabel(r"$\Delta\phi$ between parent candidates (rad)")
+        ax.set_title(r"$\Delta\phi$ Between Parent Candidates of Chosen Interpretation vs Epoch")
         ax.legend(frameon=False)
         _style_axis(ax)
         fig.tight_layout()
@@ -2271,14 +2118,14 @@ def _plot_training_curves(
             dem_epochs,
             [m - s for m, s in zip(dem_train_avg, dem_train_std)],
             [m + s for m, s in zip(dem_train_avg, dem_train_std)],
-            color="mediumseagreen", alpha=0.2, label="Train ±1σ",
+            color="mediumseagreen", alpha=0.2, label=r"Train $\pm1\sigma$",
         )
         ax.plot(dem_epochs, dem_val_avg, label="Val mean democracy", color="darkorange")
         ax.fill_between(
             dem_epochs,
             [m - s for m, s in zip(dem_val_avg, dem_val_std)],
             [m + s for m, s in zip(dem_val_avg, dem_val_std)],
-            color="darkorange", alpha=0.2, label="Val ±1σ",
+            color="darkorange", alpha=0.2, label=r"Val $\pm1\sigma$",
         )
         _add_phase_lines(ax)
         ax.set_xlabel("Epoch")
