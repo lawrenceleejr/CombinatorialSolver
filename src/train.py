@@ -528,6 +528,9 @@ def train(config_path: str | None = None, data_path: str | None = None,
     val_max_triplet_pt_history: list = []  # per-epoch list of numpy arrays (val max-triplet scalar pT)
     val_delta_phi_history: list = []  # per-epoch list of numpy arrays (val Δφ between parent candidates)
     val_democracy_history: list = []  # per-epoch list of numpy arrays (val avg pT democracy of triplets)
+    val_max_boost_history: list = []  # per-epoch list (val larger triplet Lorentz boost γ=E/m)
+    val_avg_boost_history: list = []  # per-epoch list (val average triplet Lorentz boost γ=E/m)
+    latest_dalitz = None              # (x, y, is_bkg) from the most recent validation epoch
 
     tf_start = tc.get("tf_start", 1.0)
     tf_end = tc.get("tf_end", 0.3)
@@ -806,6 +809,7 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     epoch + 1, training_phase,
                     val_metrics["pred_max_triplet_pt_values"],
                     val_metrics.get("pred_correct_values"),  # bool array or None
+                    val_metrics.get("pred_is_bkg_values"),   # bool array or None
                 ))
 
             # Accumulate per-event validation ΔΦ distribution for GIF
@@ -814,6 +818,7 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     epoch + 1, training_phase,
                     val_metrics["pred_delta_phi_values"],
                     val_metrics.get("pred_correct_values"),  # bool array or None
+                    val_metrics.get("pred_is_bkg_values"),   # bool array or None
                 ))
 
             # Accumulate per-event validation pT-democracy distribution for GIF
@@ -822,7 +827,31 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     epoch + 1, training_phase,
                     val_metrics["pred_democracy_values"],
                     val_metrics.get("pred_correct_values"),  # bool array or None
+                    val_metrics.get("pred_is_bkg_values"),   # bool array or None
                 ))
+
+            # Accumulate per-event validation triplet Lorentz-boost distributions for GIF
+            if "pred_max_boost_values" in val_metrics:
+                val_max_boost_history.append((
+                    epoch + 1, training_phase,
+                    val_metrics["pred_max_boost_values"],
+                    val_metrics.get("pred_correct_values"),
+                    val_metrics.get("pred_is_bkg_values"),
+                ))
+            if "pred_avg_boost_values" in val_metrics:
+                val_avg_boost_history.append((
+                    epoch + 1, training_phase,
+                    val_metrics["pred_avg_boost_values"],
+                    val_metrics.get("pred_correct_values"),
+                    val_metrics.get("pred_is_bkg_values"),
+                ))
+            # Most recent validation Dalitz coordinates (for the 2-D Dalitz plot).
+            if "pred_dalitz_x_values" in val_metrics:
+                latest_dalitz = (
+                    val_metrics["pred_dalitz_x_values"],
+                    val_metrics["pred_dalitz_y_values"],
+                    val_metrics.get("pred_is_bkg_values"),
+                )
 
             # Log
             phase_tag = f"[P{training_phase}]" if phase1_active else ""
@@ -924,6 +953,24 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     val_democracy_history,
                     phase2_start_epoch=phase2_start_epoch,
                     gif_path=Path("plots") / "democracy_anim_latest.gif",
+                )
+            if val_max_boost_history:
+                _make_max_boost_gif(
+                    val_max_boost_history,
+                    phase2_start_epoch=phase2_start_epoch,
+                    gif_path=Path("plots") / "max_boost_anim_latest.gif",
+                )
+            if val_avg_boost_history:
+                _make_avg_boost_gif(
+                    val_avg_boost_history,
+                    phase2_start_epoch=phase2_start_epoch,
+                    gif_path=Path("plots") / "avg_boost_anim_latest.gif",
+                )
+            if latest_dalitz is not None:
+                _make_dalitz_plot(
+                    *latest_dalitz, epoch=epoch + 1,
+                    phase2_start_epoch=phase2_start_epoch,
+                    out_path=Path("plots") / "dalitz_latest.pdf",
                 )
 
             # ---------------------------------------------------------------
@@ -1083,6 +1130,20 @@ def train(config_path: str | None = None, data_path: str | None = None,
         dem_gif = _make_democracy_gif(val_democracy_history, phase2_start_epoch=phase2_start_epoch)
         if dem_gif is not None:
             plot_paths.append(dem_gif)
+
+    # Triplet Lorentz-boost animations and the 2-D Dalitz plot.
+    if val_max_boost_history:
+        mb_gif = _make_max_boost_gif(val_max_boost_history, phase2_start_epoch=phase2_start_epoch)
+        if mb_gif is not None:
+            plot_paths.append(mb_gif)
+    if val_avg_boost_history:
+        ab_gif = _make_avg_boost_gif(val_avg_boost_history, phase2_start_epoch=phase2_start_epoch)
+        if ab_gif is not None:
+            plot_paths.append(ab_gif)
+    if latest_dalitz is not None:
+        dalitz = _make_dalitz_plot(*latest_dalitz, phase2_start_epoch=phase2_start_epoch)
+        if dalitz is not None:
+            plot_paths.append(dalitz)
 
     # Full timestamped snapshot bundle (ML model + classical solver + plots),
     # mirroring the Phase 1 snapshot produced by _export_phase1_snapshot.
@@ -1419,145 +1480,19 @@ def _make_max_triplet_pt_gif(
     phase2_start_epoch: int | None = None,
     gif_path: str | Path | None = None,
 ) -> "Path | None":
-    """Build an animated GIF of the max-triplet scalar-sum-pT distribution.
-
-    For each event the scalar sum pT of each of the two triplets in the
-    predicted interpretation is computed and the larger of the two is
-    recorded.  Each frame shows the histogram of this quantity over all
-    validation events for that epoch.  When a per-event correctness mask is
-    available (4-tuple history entries) the bars are stacked by correct vs
-    incorrect network outputs.  A vertical line marks the per-epoch mean.
-    When two-phase training was used, frames from Phase 2 onward carry a
-    "Phase 2" annotation so the transition is immediately visible.
-
-    When *gif_path* is ``None`` the file is written to
-    ``plots/max_triplet_pt_anim_{timestamp}_{commit}.gif``; pass an explicit
-    path (e.g. ``plots/max_triplet_pt_anim_latest.gif``) to overwrite a fixed
-    file on every call.  Requires ``pillow`` (pip install pillow).
-
-    Args:
-        val_max_triplet_pt_history: List of ``(epoch, phase, values_array[, correct_mask])``
-            tuples where *values_array* contains the max-triplet scalar-sum pT at the
-            predicted assignment for each validation event.  The optional
-            fourth element is a boolean NumPy array aligned with *values_array*
-            (True = model chose the correct assignment).
-        phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
-            ``None`` for single-phase runs.
-        gif_path: Destination file path.  When ``None`` a timestamped path
-            inside ``plots/`` is generated automatically.
-    """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import matplotlib.animation as animation
-        _init_plot_style(plt)
-    except ImportError:
-        print("  Warning: matplotlib not available; skipping max-triplet-pT GIF.")
-        return None
-
-    if not val_max_triplet_pt_history:
-        return None
-
-    plots_dir = Path("plots")
-    plots_dir.mkdir(exist_ok=True)
-
-    if gif_path is None:
-        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        commit = _get_git_commit_hash()
-        gif_path = plots_dir / f"max_triplet_pt_anim_{ts}_{commit}.gif"
-    gif_path = Path(gif_path)
-
-    import numpy as np
-
-    # Unpack history: support both 3-tuple (legacy) and 4-tuple (with correct mask).
-    def _unpack(entry):
-        if len(entry) == 4:
-            return entry
-        return entry[0], entry[1], entry[2], None
-
-    all_values = [_unpack(e)[2] for e in val_max_triplet_pt_history]
-
-    # Fixed x-axis determined from the global data range (1st–99th percentile).
-    all_concat = np.concatenate(all_values)
-    x_min = float(np.percentile(all_concat, 1))
-    x_max = float(np.percentile(all_concat, 99))
-    if x_min >= x_max:
-        x_min, x_max = float(all_concat.min()), float(all_concat.max())
-    n_bins = 50
-    bin_edges = np.linspace(x_min, x_max, n_bins + 1)
-
-    # Pre-compute total counts for every frame to fix the y-axis.
-    max_count = 0
-    for vals in all_values:
-        counts, _ = np.histogram(vals, bins=bin_edges)
-        if counts.max() > max_count:
-            max_count = int(counts.max())
-    y_max = max_count * 1.1
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bar_width = (x_max - x_min) / n_bins
-    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-    def _draw_frame(frame_idx):
-        epoch, phase, values, correct_mask = _unpack(val_max_triplet_pt_history[frame_idx])
-        ax.cla()
-        mean_val = float(values.mean())
-
-        if correct_mask is not None:
-            vals_correct   = values[correct_mask]
-            vals_incorrect = values[~correct_mask]
-            counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
-            counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
-            ax.bar(centers, counts_correct,   width=bar_width, align="center", label="Correct",
-                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82), linewidth=0)
-            ax.bar(centers, counts_incorrect, width=bar_width, align="center", label="Incorrect",
-                   bottom=counts_correct,
-                   facecolor=_rgba(_HIST_COLORS["signal_wrong"], 0.82), linewidth=0)
-            ax.stairs(counts_correct, bin_edges,
-                      color=_edge(_HIST_COLORS["signal_correct"]), linewidth=1.1)
-            ax.stairs(counts_correct + counts_incorrect, bin_edges,
-                      color=_edge(_HIST_COLORS["signal_wrong"]), linewidth=1.1)
-        else:
-            counts, _ = np.histogram(values, bins=bin_edges)
-            ax.bar(centers, counts, width=bar_width, align="center",
-                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82), linewidth=0)
-            ax.stairs(counts, bin_edges,
-                      color=_edge(_HIST_COLORS["signal_correct"]), linewidth=1.1)
-
-        ax.axvline(mean_val, color=_HIST_COLORS["mean"], linewidth=1.3,
-                   label=f"Mean = {mean_val:.3f}")
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(0, y_max)
-        ax.set_xlabel("Max-triplet scalar sum pT of chosen interpretation")
-        ax.set_ylabel("Validation events")
-        phase_label = ""
-        if phase2_start_epoch is not None:
-            phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
-        elif phase == 2:
-            phase_label = " [Phase 2]"
-        ax.set_title(f"Epoch {epoch}{phase_label}")
-        ax.legend(loc="upper right", frameon=False)
-        _style_axis(ax)
-
-    anim = animation.FuncAnimation(
-        fig,
-        _draw_frame,
-        frames=len(val_max_triplet_pt_history),
-        interval=200,
-        repeat=False,
+    """Combined max-triplet scalar-sum-pT animation: signal correct/wrong stack
+    plus the area-normalised QCD outline (signal AND QCD shown together)."""
+    return _make_distribution_gif(
+        val_max_triplet_pt_history,
+        value_fn=lambda v: v,
+        xlabel="Max-triplet scalar sum pT of chosen interpretation",
+        title_prefix="Max-triplet scalar-sum pT",
+        short_name="max_triplet_pt_anim",
+        subset="combined",
+        x_range=None,
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
     )
-
-    try:
-        anim.save(str(gif_path), writer="pillow", fps=5)
-        print(f"  -> Saved max-triplet-pT GIF: {gif_path}")
-        return gif_path
-    except Exception as exc:
-        print(f"  Warning: could not save max-triplet-pT GIF ({exc}). "
-              "Is pillow installed?  pip install pillow")
-        return None
-    finally:
-        plt.close(fig)
 
 
 def _make_delta_phi_gif(
@@ -1565,135 +1500,18 @@ def _make_delta_phi_gif(
     phase2_start_epoch: int | None = None,
     gif_path: str | Path | None = None,
 ) -> "Path | None":
-    """Build an animated GIF of the Δφ distribution between the two parent candidates.
-
-    For each event Δφ = |φ(triplet1) − φ(triplet2)| is folded into [0, π],
-    where φᵢ = atan2(ΣPy, ΣPx) over the jets assigned to candidate i.  Each
-    frame shows a histogram over all validation events for that epoch.  When a
-    per-event correctness mask is available (4-tuple history entries) the bars
-    are stacked by correct vs incorrect network outputs.  A vertical line marks
-    the per-epoch mean.  When two-phase training was used, frames from Phase 2
-    onward carry a "Phase 2" annotation.
-
-    When *gif_path* is ``None`` the file is written to
-    ``plots/delta_phi_anim_{timestamp}_{commit}.gif``.  Requires ``pillow``
-    (pip install pillow).
-
-    Args:
-        val_delta_phi_history: List of ``(epoch, phase, values_array[, correct_mask])``
-            tuples where *values_array* contains the per-event Δφ in [0, π].
-            The optional fourth element is a boolean NumPy array (True = correct).
-        phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
-            ``None`` for single-phase runs.
-        gif_path: Destination file path.  When ``None`` a timestamped path
-            inside ``plots/`` is generated automatically.
-    """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import matplotlib.animation as animation
-        _init_plot_style(plt)
-    except ImportError:
-        print("  Warning: matplotlib not available; skipping Δφ GIF.")
-        return None
-
-    if not val_delta_phi_history:
-        return None
-
-    plots_dir = Path("plots")
-    plots_dir.mkdir(exist_ok=True)
-
-    if gif_path is None:
-        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        commit = _get_git_commit_hash()
-        gif_path = plots_dir / f"delta_phi_anim_{ts}_{commit}.gif"
-    gif_path = Path(gif_path)
-
-    import numpy as np
-    import math as _math_gif
-
-    def _unpack(entry):
-        if len(entry) == 4:
-            return entry
-        return entry[0], entry[1], entry[2], None
-
-    x_min, x_max = 0.0, _math_gif.pi
-    n_bins = 50
-    bin_edges = np.linspace(x_min, x_max, n_bins + 1)
-
-    # Pre-compute total counts to fix the y-axis.
-    max_count = 0
-    for entry in val_delta_phi_history:
-        _, _, values, _ = _unpack(entry)
-        counts, _ = np.histogram(values, bins=bin_edges)
-        if counts.max() > max_count:
-            max_count = int(counts.max())
-    y_max = max_count * 1.1
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bar_width = (x_max - x_min) / n_bins
-    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-    def _draw_frame(frame_idx):
-        epoch, phase, values, correct_mask = _unpack(val_delta_phi_history[frame_idx])
-        ax.cla()
-        mean_val = float(values.mean())
-
-        if correct_mask is not None:
-            vals_correct   = values[correct_mask]
-            vals_incorrect = values[~correct_mask]
-            counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
-            counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
-            ax.bar(centers, counts_correct,   width=bar_width, align="center", label="Correct",
-                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82), linewidth=0)
-            ax.bar(centers, counts_incorrect, width=bar_width, align="center", label="Incorrect",
-                   bottom=counts_correct,
-                   facecolor=_rgba(_HIST_COLORS["signal_wrong"], 0.82), linewidth=0)
-            ax.stairs(counts_correct, bin_edges,
-                      color=_edge(_HIST_COLORS["signal_correct"]), linewidth=1.1)
-            ax.stairs(counts_correct + counts_incorrect, bin_edges,
-                      color=_edge(_HIST_COLORS["signal_wrong"]), linewidth=1.1)
-        else:
-            counts, _ = np.histogram(values, bins=bin_edges)
-            ax.bar(centers, counts, width=bar_width, align="center",
-                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82), linewidth=0)
-            ax.stairs(counts, bin_edges,
-                      color=_edge(_HIST_COLORS["signal_correct"]), linewidth=1.1)
-
-        ax.axvline(mean_val, color=_HIST_COLORS["mean"], linewidth=1.3,
-                   label=f"Mean = {mean_val:.3f}")
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(0, y_max)
-        ax.set_xlabel(r"$\Delta\phi$ between parent candidates (rad)")
-        ax.set_ylabel("Validation events")
-        phase_label = ""
-        if phase2_start_epoch is not None:
-            phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
-        elif phase == 2:
-            phase_label = " [Phase 2]"
-        ax.set_title(f"Epoch {epoch}{phase_label}")
-        ax.legend(loc="upper left", frameon=False)
-        _style_axis(ax)
-
-    anim = animation.FuncAnimation(
-        fig,
-        _draw_frame,
-        frames=len(val_delta_phi_history),
-        interval=200,
-        repeat=False,
+    """Combined Δφ animation: signal correct/wrong stack + area-normalised QCD outline."""
+    return _make_distribution_gif(
+        val_delta_phi_history,
+        value_fn=lambda v: v,
+        xlabel=r"$\Delta\phi$ between parent candidates (rad)",
+        title_prefix=r"$\Delta\phi$ between parent candidates",
+        short_name="delta_phi_anim",
+        subset="combined",
+        x_range=(0.0, math.pi),
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
     )
-
-    try:
-        anim.save(str(gif_path), writer="pillow", fps=5)
-        print(f"  -> Saved Δφ GIF        : {gif_path}")
-        return gif_path
-    except Exception as exc:
-        print(f"  Warning: could not save Δφ GIF ({exc}). "
-              "Is pillow installed?  pip install pillow")
-        return None
-    finally:
-        plt.close(fig)
 
 
 def _make_democracy_gif(
@@ -1701,134 +1519,127 @@ def _make_democracy_gif(
     phase2_start_epoch: int | None = None,
     gif_path: str | Path | None = None,
 ) -> "Path | None":
-    """Build an animated GIF of the pT-democracy distribution.
+    """Combined pT-democracy animation: signal correct/wrong stack + area-normalised QCD outline."""
+    return _make_distribution_gif(
+        val_democracy_history,
+        value_fn=lambda v: v,
+        xlabel="pT democracy = avg(min pT / max pT) per triplet",
+        title_prefix="pT democracy",
+        short_name="democracy_anim",
+        subset="combined",
+        x_range=(0.0, 1.0),
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
+    )
 
-    For each event the pT-democracy of a triplet is defined as
-    ``min(pT) / max(pT)`` over its three jets, which equals 1 when all jets
-    carry equal pT and approaches 0 when one jet dominates.  The per-event
-    score is the average democracy across the two triplets in the predicted
-    assignment.  Each frame shows a histogram over all validation events for
-    that epoch.  When a per-event correctness mask is available (4-tuple
-    history entries) the bars are stacked by correct vs incorrect outputs.
-    A vertical line marks the per-epoch mean.  When two-phase training was
-    used, frames from Phase 2 onward carry a "Phase 2" annotation.
 
-    When *gif_path* is ``None`` the file is written to
-    ``plots/democracy_anim_{timestamp}_{commit}.gif``.  Requires ``pillow``
-    (pip install pillow).
+def _make_max_boost_gif(
+    val_max_boost_history: list,
+    phase2_start_epoch: int | None = None,
+    gif_path: str | Path | None = None,
+) -> "Path | None":
+    """Combined animation of the larger triplet Lorentz boost γ=E/m (signal + QCD)."""
+    return _make_distribution_gif(
+        val_max_boost_history,
+        value_fn=lambda v: v,
+        xlabel="Max triplet Lorentz boost  γ = E/m",
+        title_prefix="Max triplet boost",
+        short_name="max_boost_anim",
+        subset="combined",
+        x_range=None,
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
+    )
 
-    Args:
-        val_democracy_history: List of ``(epoch, phase, values_array[, correct_mask])``
-            tuples where *values_array* contains the per-event average pT
-            democracy in (0, 1].  The optional fourth element is a boolean
-            NumPy array (True = correct).
-        phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
-            ``None`` for single-phase runs.
-        gif_path: Destination file path.  When ``None`` a timestamped path
-            inside ``plots/`` is generated automatically.
+
+def _make_avg_boost_gif(
+    val_avg_boost_history: list,
+    phase2_start_epoch: int | None = None,
+    gif_path: str | Path | None = None,
+) -> "Path | None":
+    """Combined animation of the average triplet Lorentz boost γ=E/m (signal + QCD)."""
+    return _make_distribution_gif(
+        val_avg_boost_history,
+        value_fn=lambda v: v,
+        xlabel="Average triplet Lorentz boost  γ = E/m",
+        title_prefix="Average triplet boost",
+        short_name="avg_boost_anim",
+        subset="combined",
+        x_range=None,
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
+    )
+
+
+def _make_dalitz_plot(
+    dalitz_x,
+    dalitz_y,
+    is_bkg=None,
+    epoch: int | None = None,
+    phase2_start_epoch: int | None = None,
+    out_path: str | Path | None = None,
+) -> "Path | None":
+    """Two-panel Dalitz plot (Signal | QCD) of the chosen triplets.
+
+    For each parent-candidate triplet the jets are pT-ordered and the normalised
+    pairwise invariant-mass-squared are plotted: x = m²(lead,sub)/M²,
+    y = m²(lead,third)/M².  Each event contributes its two triplets.  A uniform
+    population fills the kinematically-allowed (Dalitz) region for true 3-body
+    decays, while combinatorial/QCD triplets cluster near the edges — so the two
+    panels reveal whether the chosen groupings have genuine 3-body structure.
     """
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        import matplotlib.animation as animation
         _init_plot_style(plt)
     except ImportError:
-        print("  Warning: matplotlib not available; skipping democracy GIF.")
         return None
+    import numpy as np
 
-    if not val_democracy_history:
+    x = np.asarray(dalitz_x, dtype=float).reshape(-1)
+    y = np.asarray(dalitz_y, dtype=float).reshape(-1)
+    if x.size == 0:
         return None
+    if is_bkg is not None:
+        b = np.asarray(is_bkg, dtype=bool).reshape(-1)
+        # x,y carry two triplets per event; expand the per-event flag to match.
+        bkg = np.repeat(b, 2) if b.size * 2 == x.size else np.zeros(x.size, dtype=bool)
+    else:
+        bkg = np.zeros(x.size, dtype=bool)
 
     plots_dir = Path("plots")
     plots_dir.mkdir(exist_ok=True)
-
-    if gif_path is None:
+    if out_path is None:
         ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
         commit = _get_git_commit_hash()
-        gif_path = plots_dir / f"democracy_anim_{ts}_{commit}.gif"
-    gif_path = Path(gif_path)
+        out_path = plots_dir / f"dalitz_{ts}_{commit}.pdf"
+    out_path = Path(out_path)
 
-    import numpy as np
-
-    def _unpack(entry):
-        if len(entry) == 4:
-            return entry
-        return entry[0], entry[1], entry[2], None
-
-    x_min, x_max = 0.0, 1.0
-    n_bins = 50
-    bin_edges = np.linspace(x_min, x_max, n_bins + 1)
-
-    # Pre-compute total counts to fix the y-axis.
-    max_count = 0
-    for entry in val_democracy_history:
-        _, _, values, _ = _unpack(entry)
-        counts, _ = np.histogram(values, bins=bin_edges)
-        if counts.max() > max_count:
-            max_count = int(counts.max())
-    y_max = max_count * 1.1
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bar_width = (x_max - x_min) / n_bins
-    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-    def _draw_frame(frame_idx):
-        epoch, phase, values, correct_mask = _unpack(val_democracy_history[frame_idx])
-        ax.cla()
-        mean_val = float(values.mean())
-
-        if correct_mask is not None:
-            vals_correct   = values[correct_mask]
-            vals_incorrect = values[~correct_mask]
-            counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
-            counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
-            ax.bar(centers, counts_correct,   width=bar_width, align="center", label="Correct",
-                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82), linewidth=0)
-            ax.bar(centers, counts_incorrect, width=bar_width, align="center", label="Incorrect",
-                   bottom=counts_correct,
-                   facecolor=_rgba(_HIST_COLORS["signal_wrong"], 0.82), linewidth=0)
-            ax.stairs(counts_correct, bin_edges,
-                      color=_edge(_HIST_COLORS["signal_correct"]), linewidth=1.1)
-            ax.stairs(counts_correct + counts_incorrect, bin_edges,
-                      color=_edge(_HIST_COLORS["signal_wrong"]), linewidth=1.1)
-        else:
-            counts, _ = np.histogram(values, bins=bin_edges)
-            ax.bar(centers, counts, width=bar_width, align="center",
-                   facecolor=_rgba(_HIST_COLORS["signal_correct"], 0.82), linewidth=0)
-            ax.stairs(counts, bin_edges,
-                      color=_edge(_HIST_COLORS["signal_correct"]), linewidth=1.1)
-
-        ax.axvline(mean_val, color=_HIST_COLORS["mean"], linewidth=1.3,
-                   label=f"Mean = {mean_val:.3f}")
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(0, y_max)
-        ax.set_xlabel("pT democracy = avg(min pT / max pT) per triplet")
-        ax.set_ylabel("Validation events")
-        phase_label = ""
-        if phase2_start_epoch is not None:
-            phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
-        elif phase == 2:
-            phase_label = " [Phase 2]"
-        ax.set_title(f"Epoch {epoch}{phase_label}")
-        ax.legend(loc="upper left", frameon=False)
-        _style_axis(ax)
-
-    anim = animation.FuncAnimation(
-        fig,
-        _draw_frame,
-        frames=len(val_democracy_history),
-        interval=200,
-        repeat=False,
-    )
-
+    lim = 1.05
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.4), sharex=True, sharey=True)
+    panels = [(axes[0], ~bkg, "Signal", "Greens"),
+              (axes[1], bkg, "QCD background", "OrRd")]
+    for ax, sel, label, cmap in panels:
+        xs, ys = x[sel], y[sel]
+        if xs.size:
+            hb = ax.hexbin(xs, ys, gridsize=45, extent=(0, lim, 0, lim),
+                           cmap=cmap, mincnt=1, linewidths=0.0)
+            fig.colorbar(hb, ax=ax, shrink=0.85, label="triplets")
+        ax.set_xlabel(r"$m^2(\mathrm{lead,sub})\,/\,M^2$")
+        ax.set_ylabel(r"$m^2(\mathrm{lead,third})\,/\,M^2$")
+        suffix = f" — Epoch {epoch}" if epoch is not None else ""
+        ax.set_title(f"{label} Dalitz{suffix}", loc="left")
+        _style_axis(ax, grid_axis="both")
+        ax.set_xlim(0, lim)
+        ax.set_ylim(0, lim)
+    fig.tight_layout()
     try:
-        anim.save(str(gif_path), writer="pillow", fps=5)
-        print(f"  -> Saved democracy GIF : {gif_path}")
-        return gif_path
+        fig.savefig(str(out_path))
+        print(f"  -> Saved Dalitz plot: {out_path}")
+        return out_path
     except Exception as exc:
-        print(f"  Warning: could not save democracy GIF ({exc}). "
-              "Is pillow installed?  pip install pillow")
+        print(f"  Warning: could not save Dalitz plot ({exc}).")
         return None
     finally:
         plt.close(fig)
@@ -2224,6 +2035,10 @@ def _run_epoch(
     all_pred_max_triplet_pt = []
     all_pred_delta_phi = []
     all_pred_democracy = []
+    all_pred_max_boost = []
+    all_pred_avg_boost = []
+    all_pred_dalitz_x = []   # validation only; per-event (B, 2) for the two triplets
+    all_pred_dalitz_y = []
     all_mass_pred = []
     all_mass_true = []
     all_pred_is_bkg = []
@@ -2664,6 +2479,44 @@ def _run_epoch(
             democracy = (dem_g1 + dem_g2) / 2.0        # (batch,)
             all_pred_democracy.append(democracy.detach().cpu())
 
+            # Lorentz boost γ = E/m of each parent candidate (E/m is a ratio, so it
+            # is invariant under the HT normalisation of the inputs).  Track the
+            # larger of the two and the average across the two triplets.
+            E_b = four_mom[:, :, 0]
+            pz_b = four_mom[:, :, 3]
+            E_g1 = E_b.gather(1, g1_jets).sum(dim=1)
+            E_g2 = E_b.gather(1, g2_jets).sum(dim=1)
+            pz_g1 = pz_b.gather(1, g1_jets).sum(dim=1)
+            pz_g2 = pz_b.gather(1, g2_jets).sum(dim=1)
+            m2_g1 = (E_g1**2 - sum_px_g1**2 - sum_py_g1**2 - pz_g1**2).clamp(min=1e-8)
+            m2_g2 = (E_g2**2 - sum_px_g2**2 - sum_py_g2**2 - pz_g2**2).clamp(min=1e-8)
+            gamma1 = (E_g1 / m2_g1.sqrt()).clamp(max=200.0)
+            gamma2 = (E_g2 / m2_g2.sqrt()).clamp(max=200.0)
+            all_pred_max_boost.append(torch.maximum(gamma1, gamma2).detach().cpu())
+            all_pred_avg_boost.append(((gamma1 + gamma2) / 2.0).detach().cpu())
+
+            # Dalitz coordinates (validation only, used for the 2-D Dalitz plot):
+            # for each triplet, the pairwise invariant-mass-squared of its pT-ordered
+            # jets normalised by the triplet m²:  x = m²(lead,sub)/M², y = m²(lead,third)/M².
+            if optimizer is None:
+                def _dalitz_xy(idx, m2_parent):
+                    tri = torch.gather(four_mom, 1, idx.unsqueeze(-1).expand(-1, -1, 4))  # (B,3,4)
+                    ptt = torch.sqrt(tri[..., 1] ** 2 + tri[..., 2] ** 2)
+                    order = torch.argsort(ptt, dim=1, descending=True)
+                    tri = torch.gather(tri, 1, order.unsqueeze(-1).expand(-1, -1, 4))
+                    a, b, c = tri[:, 0], tri[:, 1], tri[:, 2]
+
+                    def _m2(p, q):
+                        s = p + q
+                        return s[:, 0] ** 2 - s[:, 1] ** 2 - s[:, 2] ** 2 - s[:, 3] ** 2
+                    denom = m2_parent.clamp(min=1e-8)
+                    return _m2(a, b) / denom, _m2(a, c) / denom
+
+                x1, y1 = _dalitz_xy(g1_jets, m2_g1)
+                x2, y2 = _dalitz_xy(g2_jets, m2_g2)
+                all_pred_dalitz_x.append(torch.stack([x1, x2], dim=1).detach().cpu())  # (B, 2)
+                all_pred_dalitz_y.append(torch.stack([y1, y2], dim=1).detach().cpu())
+
         mass_mask = parent_mass > 0
         if mass_mask.any():
             all_mass_pred.append(mass_pred[mass_mask].detach().cpu())
@@ -2711,6 +2564,13 @@ def _run_epoch(
         result["pred_democracy_values"] = dem_cat.numpy()
         result["avg_democracy"] = dem_cat.mean().item()
         result["std_democracy"] = dem_cat.std().item()
+    if all_pred_max_boost:
+        result["pred_max_boost_values"] = torch.cat(all_pred_max_boost).numpy()
+    if all_pred_avg_boost:
+        result["pred_avg_boost_values"] = torch.cat(all_pred_avg_boost).numpy()
+    if all_pred_dalitz_x:
+        result["pred_dalitz_x_values"] = torch.cat(all_pred_dalitz_x).numpy()  # (N, 2)
+        result["pred_dalitz_y_values"] = torch.cat(all_pred_dalitz_y).numpy()  # (N, 2)
     if all_pred_is_bkg:
         result["pred_is_bkg_values"] = torch.cat(all_pred_is_bkg).numpy()
     if factored:

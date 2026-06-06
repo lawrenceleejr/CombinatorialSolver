@@ -131,7 +131,7 @@ training:
   #             lambda_distill_max over lambda_distill_epochs measured from the
   #             Phase 2 start epoch.
   #   Set phase1_patience: 0 to disable two-phase training (legacy behaviour).
-  phase1_patience: 15
+  phase1_patience: 10
   # LR cap for Phase 1.  Phase 1 uses a pure 10-class grouping-CE loss (no
   # auxiliary sym/qcd/adversary terms); this simple objective is stable at the
   # full cosine-schedule LR.  Setting phase1_max_lr_fraction: 1.0 lets Phase 1
