@@ -38,10 +38,10 @@ from .utils import get_config, get_device
 #                                 outline when overlaid on the signal stack)
 #   mean                        : per-epoch mean reference line
 _HIST_COLORS = {
-    "signal_correct": "#009E73",  # Okabe–Ito bluish green
-    "signal_wrong":   "#E69F00",  # Okabe–Ito orange
-    "qcd":            "#0072B2",  # Okabe–Ito blue
-    "mean":           "#2A2A2A",  # near-black grey
+    "signal_correct": "#009E73",  # Okabe–Ito bluish green — correct interpretation
+    "signal_wrong":   "#999999",  # neutral grey — combinatorial bkg (wrong interpretation)
+    "qcd":            "#CC79A7",  # Okabe–Ito reddish purple — QCD background
+    "mean":           "#2A2A2A",  # near-black grey — mean reference line
 }
 
 
