@@ -530,7 +530,7 @@ def train(config_path: str | None = None, data_path: str | None = None,
     val_democracy_history: list = []  # per-epoch list of numpy arrays (val avg pT democracy of triplets)
     val_max_boost_history: list = []  # per-epoch list (val larger triplet Lorentz boost γ=E/m)
     val_avg_boost_history: list = []  # per-epoch list (val average triplet Lorentz boost γ=E/m)
-    latest_dalitz = None              # (x, y, is_bkg) from the most recent validation epoch
+    val_dalitz_history: list = []     # per-epoch list of (epoch, phase, x, y, is_bkg) for Dalitz
 
     tf_start = tc.get("tf_start", 1.0)
     tf_end = tc.get("tf_end", 0.3)
@@ -845,13 +845,17 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     val_metrics.get("pred_correct_values"),
                     val_metrics.get("pred_is_bkg_values"),
                 ))
-            # Most recent validation Dalitz coordinates (for the 2-D Dalitz plot).
+            # Per-epoch validation Dalitz coordinates (for the animated 2-D Dalitz
+            # plot).  Cap the stored points per epoch so the GIF stays light.
             if "pred_dalitz_x_values" in val_metrics:
-                latest_dalitz = (
-                    val_metrics["pred_dalitz_x_values"],
-                    val_metrics["pred_dalitz_y_values"],
-                    val_metrics.get("pred_is_bkg_values"),
-                )
+                _dx = val_metrics["pred_dalitz_x_values"]
+                _dy = val_metrics["pred_dalitz_y_values"]
+                _db = val_metrics.get("pred_is_bkg_values")
+                _cap = 4000
+                if _dx.shape[0] > _cap:
+                    _dx, _dy = _dx[:_cap], _dy[:_cap]
+                    _db = _db[:_cap] if _db is not None else None
+                val_dalitz_history.append((epoch + 1, training_phase, _dx, _dy, _db))
 
             # Log
             phase_tag = f"[P{training_phase}]" if phase1_active else ""
@@ -928,11 +932,12 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     phase2_start_epoch=phase2_start_epoch,
                     gif_path=Path("plots") / "mass_sum_anim_latest.gif",
                 )
-            # One combined trend overlaying signal and QCD means vs epoch.
+            # One combined trend overlaying signal and QCD means vs epoch
+            # (asymmetry, average mass, and the max / average triplet boosts).
             if val_asym_history or val_mass_sum_history:
                 _make_trend_plot(
-                    val_asym_history,
-                    val_mass_sum_history,
+                    _trend_panels(val_asym_history, val_mass_sum_history,
+                                  val_max_boost_history, val_avg_boost_history),
                     phase2_start_epoch=phase2_start_epoch,
                     out_path=Path("plots") / "trends_latest.pdf",
                 )
@@ -966,11 +971,11 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     phase2_start_epoch=phase2_start_epoch,
                     gif_path=Path("plots") / "avg_boost_anim_latest.gif",
                 )
-            if latest_dalitz is not None:
-                _make_dalitz_plot(
-                    *latest_dalitz, epoch=epoch + 1,
+            if val_dalitz_history:
+                _make_dalitz_gif(
+                    val_dalitz_history,
                     phase2_start_epoch=phase2_start_epoch,
-                    out_path=Path("plots") / "dalitz_latest.pdf",
+                    gif_path=Path("plots") / "dalitz_anim_latest.gif",
                 )
 
             # ---------------------------------------------------------------
@@ -1105,10 +1110,12 @@ def train(config_path: str | None = None, data_path: str | None = None,
         if mass_sum_gif is not None:
             plot_paths.append(mass_sum_gif)
 
-    # One combined trend overlaying signal and QCD means (asymmetry + average mass)
-    # vs epoch, with the QCD "best achievable" ceiling.
+    # One combined trend overlaying signal and QCD means vs epoch (asymmetry,
+    # average mass, max & average triplet boost), with the QCD achievable ceiling.
     trend = _make_trend_plot(
-        val_asym_history, val_mass_sum_history, phase2_start_epoch=phase2_start_epoch
+        _trend_panels(val_asym_history, val_mass_sum_history,
+                      val_max_boost_history, val_avg_boost_history),
+        phase2_start_epoch=phase2_start_epoch,
     )
     if trend is not None:
         plot_paths.append(trend)
@@ -1140,8 +1147,8 @@ def train(config_path: str | None = None, data_path: str | None = None,
         ab_gif = _make_avg_boost_gif(val_avg_boost_history, phase2_start_epoch=phase2_start_epoch)
         if ab_gif is not None:
             plot_paths.append(ab_gif)
-    if latest_dalitz is not None:
-        dalitz = _make_dalitz_plot(*latest_dalitz, phase2_start_epoch=phase2_start_epoch)
+    if val_dalitz_history:
+        dalitz = _make_dalitz_gif(val_dalitz_history, phase2_start_epoch=phase2_start_epoch)
         if dalitz is not None:
             plot_paths.append(dalitz)
 
@@ -1372,17 +1379,34 @@ def _make_distribution_gif(
         plt.close(fig)
 
 
+def _trend_panels(asym_hist, mass_hist, max_boost_hist, avg_boost_hist):
+    """Build the (history, transform, ylabel, title, show_achievable) panel list
+    for the combined trend plot: mass asymmetry, average candidate mass, and the
+    max / average triplet Lorentz boosts."""
+    return [
+        (asym_hist, lambda v: v,
+         r"Mass asymmetry $|m_1{-}m_2|/(m_1{+}m_2)$", "Mass asymmetry vs epoch", True),
+        (mass_hist, lambda v: v / 2.0,
+         r"Average candidate mass $(m_1{+}m_2)/2$", "Average candidate mass vs epoch", True),
+        (max_boost_hist, lambda v: v,
+         r"Max triplet boost $\gamma=E/m$", "Max triplet boost vs epoch", False),
+        (avg_boost_hist, lambda v: v,
+         r"Average triplet boost $\gamma=E/m$", "Average triplet boost vs epoch", False),
+    ]
+
+
 def _make_trend_plot(
-    val_asym_history: list,
-    val_mass_sum_history: list,
+    panels: list,
     phase2_start_epoch: int | None = None,
     out_path: str | Path | None = None,
 ) -> "Path | None":
-    """Two-panel trend (mass asymmetry, average candidate mass) vs epoch that
-    overlays BOTH the signal and QCD-background means (±1σ band) on the same axes,
-    with markers.  The QCD curves also carry a dashed "best achievable" ceiling
-    (mean max-asymmetry / min-mass) so the remaining headroom is visible.  Returns
-    ``None`` when there are no validation events.
+    """Grid of mean(±1σ)-vs-epoch trends, each panel overlaying the signal and
+    QCD-background means (with markers), laid out two per row.
+
+    *panels* is a list of ``(history, transform, ylabel, title, show_achievable)``
+    tuples.  ``show_achievable`` adds the dashed QCD "best achievable" ceiling
+    (for the asymmetry / average-mass panels).  Returns ``None`` when there are
+    no validation events.
     """
     try:
         import matplotlib
@@ -1412,49 +1436,41 @@ def _make_trend_plot(
                        if ach_arr is not None else float("nan"))
         return np.array(xs), np.array(means), np.array(stds), np.array(ach)
 
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 5))
+    subsets = [("signal", "Signal", _HIST_COLORS["signal_correct"]),
+               ("qcd", "QCD background", _HIST_COLORS["qcd"])]
+
+    n = len(panels)
+    ncols = 2 if n > 1 else 1
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6.2 * ncols, 4.6 * nrows), squeeze=False)
+    axes_flat = list(axes.ravel())
     any_data = False
-    # (subset, label, colour, draw the achievable ceiling)
-    specs = [
-        ("signal", "Signal", _HIST_COLORS["signal_correct"], False),
-        ("qcd", "QCD background", _HIST_COLORS["qcd"], True),
-    ]
-    for subset, label, color, show_ach in specs:
-        ae, am, asd, aa = _series(val_asym_history, lambda v: v, subset)
-        me, mm, msd, ma = _series(val_mass_sum_history, lambda v: v / 2.0, subset)
-        line_kw = dict(marker="o", markersize=4, markeredgecolor="white",
-                       markeredgewidth=0.6, linewidth=1.6, color=color)
-        band_kw = dict(facecolor=_rgba(color, 0.15), edgecolor=_rgba(color, 0.45), linewidth=0.6)
-        if len(ae):
+    for ax, (history, transform, ylabel, title, show_ach) in zip(axes_flat, panels):
+        for subset, label, color in subsets:
+            e, m, s, a = _series(history, transform, subset)
+            if not len(e):
+                continue
             any_data = True
-            a1.plot(ae, am, label=f"{label} mean", **line_kw)
-            a1.fill_between(ae, am - asd, am + asd, **band_kw)
-            if show_ach and np.isfinite(aa).any():
-                a1.plot(ae, aa, "--", marker="o", markersize=3, color=color, alpha=0.55,
+            ax.plot(e, m, label=f"{label} mean", marker="o", markersize=4,
+                    markeredgecolor="white", markeredgewidth=0.6, linewidth=1.6, color=color)
+            ax.fill_between(e, m - s, m + s, facecolor=_rgba(color, 0.15),
+                            edgecolor=_rgba(color, 0.45), linewidth=0.6)
+            if show_ach and np.isfinite(a).any():
+                ax.plot(e, a, "--", marker="o", markersize=3, color=color, alpha=0.55,
                         label=f"{label} best achievable")
-        if len(me):
-            any_data = True
-            a2.plot(me, mm, label=f"{label} mean", **line_kw)
-            a2.fill_between(me, mm - msd, mm + msd, **band_kw)
-            if show_ach and np.isfinite(ma).any():
-                a2.plot(me, ma, "--", marker="o", markersize=3, color=color, alpha=0.55,
-                        label=f"{label} best achievable")
+        if phase2_start_epoch is not None:
+            ax.axvline(phase2_start_epoch, color="#777777", linestyle=":", linewidth=1.0,
+                       label="Phase 2 start")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, loc="left")
+        _style_axis(ax, grid_axis="both")
+        ax.legend(loc="best", frameon=False, fontsize=10)
+    for ax in axes_flat[n:]:
+        ax.set_visible(False)
     if not any_data:
         plt.close(fig)
         return None
-
-    a1.set_xlabel("Epoch")
-    a1.set_ylabel(r"Mass asymmetry $|m_1{-}m_2|/(m_1{+}m_2)$")
-    a1.set_title("Mass asymmetry vs epoch", loc="left")
-    a2.set_xlabel("Epoch")
-    a2.set_ylabel(r"Average candidate mass $(m_1{+}m_2)/2$")
-    a2.set_title("Average candidate mass vs epoch", loc="left")
-    for a in (a1, a2):
-        if phase2_start_epoch is not None:
-            a.axvline(phase2_start_epoch, color="#777777", linestyle=":", linewidth=1.0,
-                      label="Phase 2 start")
-        _style_axis(a, grid_axis="both")
-        a.legend(loc="best", frameon=False, fontsize=11)
     fig.tight_layout()
 
     plots_dir = Path("plots")
@@ -1571,75 +1587,96 @@ def _make_avg_boost_gif(
     )
 
 
-def _make_dalitz_plot(
-    dalitz_x,
-    dalitz_y,
-    is_bkg=None,
-    epoch: int | None = None,
+def _make_dalitz_gif(
+    val_dalitz_history: list,
     phase2_start_epoch: int | None = None,
-    out_path: str | Path | None = None,
+    gif_path: str | Path | None = None,
 ) -> "Path | None":
-    """Two-panel Dalitz plot (Signal | QCD) of the chosen triplets.
+    """Animated two-panel Dalitz plot (Signal | QCD) over epochs.
 
     For each parent-candidate triplet the jets are pT-ordered and the normalised
     pairwise invariant-mass-squared are plotted: x = m²(lead,sub)/M²,
-    y = m²(lead,third)/M².  Each event contributes its two triplets.  A uniform
-    population fills the kinematically-allowed (Dalitz) region for true 3-body
-    decays, while combinatorial/QCD triplets cluster near the edges — so the two
-    panels reveal whether the chosen groupings have genuine 3-body structure.
+    y = m²(lead,third)/M².  Each event contributes its two triplets.  A genuine
+    3-body decay fills the Dalitz interior, while combinatorial/QCD triplets
+    cluster near the low-mass edges — so the two panels (and their evolution over
+    epochs) reveal whether the network's chosen groupings have real 3-body
+    structure.  Each panel's colour scale is fixed across frames for comparability.
+
+    *val_dalitz_history* entries are ``(epoch, phase, x, y, is_bkg)`` with x, y of
+    shape (N, 2) (the two triplets per event) and is_bkg of shape (N,).
     """
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        import matplotlib.animation as animation
         _init_plot_style(plt)
     except ImportError:
         return None
+    if not val_dalitz_history:
+        return None
+
     import numpy as np
 
-    x = np.asarray(dalitz_x, dtype=float).reshape(-1)
-    y = np.asarray(dalitz_y, dtype=float).reshape(-1)
-    if x.size == 0:
-        return None
-    if is_bkg is not None:
-        b = np.asarray(is_bkg, dtype=bool).reshape(-1)
-        # x,y carry two triplets per event; expand the per-event flag to match.
-        bkg = np.repeat(b, 2) if b.size * 2 == x.size else np.zeros(x.size, dtype=bool)
-    else:
-        bkg = np.zeros(x.size, dtype=bool)
+    lim = 1.05
+    nb = 44
+    edges = np.linspace(0.0, lim, nb + 1)
+
+    def _counts(entry):
+        epoch, phase, x, y, bk = entry
+        x = np.asarray(x, dtype=float).reshape(-1)
+        y = np.asarray(y, dtype=float).reshape(-1)
+        if bk is not None:
+            b = np.asarray(bk, dtype=bool).reshape(-1)
+            bkg = np.repeat(b, 2) if b.size * 2 == x.size else np.zeros(x.size, dtype=bool)
+        else:
+            bkg = np.zeros(x.size, dtype=bool)
+        hs, _, _ = np.histogram2d(x[~bkg], y[~bkg], bins=[edges, edges])
+        hq, _, _ = np.histogram2d(x[bkg], y[bkg], bins=[edges, edges])
+        return epoch, phase, hs.T, hq.T  # transpose -> rows = y for imshow
+
+    frames = [_counts(e) for e in val_dalitz_history]
+    vmax_s = max((float(f[2].max()) for f in frames if f[2].size), default=1.0) or 1.0
+    vmax_q = max((float(f[3].max()) for f in frames if f[3].size), default=1.0) or 1.0
 
     plots_dir = Path("plots")
     plots_dir.mkdir(exist_ok=True)
-    if out_path is None:
+    if gif_path is None:
         ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
         commit = _get_git_commit_hash()
-        out_path = plots_dir / f"dalitz_{ts}_{commit}.pdf"
-    out_path = Path(out_path)
+        gif_path = plots_dir / f"dalitz_anim_{ts}_{commit}.gif"
+    gif_path = Path(gif_path)
 
-    lim = 1.05
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5.4), sharex=True, sharey=True)
-    panels = [(axes[0], ~bkg, "Signal", "Greens"),
-              (axes[1], bkg, "QCD background", "OrRd")]
-    for ax, sel, label, cmap in panels:
-        xs, ys = x[sel], y[sel]
-        if xs.size:
-            hb = ax.hexbin(xs, ys, gridsize=45, extent=(0, lim, 0, lim),
-                           cmap=cmap, mincnt=1, linewidths=0.0)
-            fig.colorbar(hb, ax=ax, shrink=0.85, label="triplets")
-        ax.set_xlabel(r"$m^2(\mathrm{lead,sub})\,/\,M^2$")
-        ax.set_ylabel(r"$m^2(\mathrm{lead,third})\,/\,M^2$")
-        suffix = f" — Epoch {epoch}" if epoch is not None else ""
-        ax.set_title(f"{label} Dalitz{suffix}", loc="left")
-        _style_axis(ax, grid_axis="both")
-        ax.set_xlim(0, lim)
-        ax.set_ylim(0, lim)
-    fig.tight_layout()
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 5.4))
+
+    def _draw_frame(i):
+        epoch, phase, hs, hq = frames[i]
+        for ax, h, cmap, label, vmax in (
+            (a1, hs, "Greens", "Signal", vmax_s),
+            (a2, hq, "OrRd", "QCD background", vmax_q),
+        ):
+            ax.cla()
+            ax.imshow(h, origin="lower", extent=(0, lim, 0, lim), cmap=cmap,
+                      vmin=0.0, vmax=vmax, aspect="auto", interpolation="nearest")
+            phase_label = ""
+            if phase2_start_epoch is not None:
+                phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
+            elif phase == 2:
+                phase_label = " [Phase 2]"
+            ax.set_xlabel(r"$m^2(\mathrm{lead,sub})\,/\,M^2$")
+            ax.set_ylabel(r"$m^2(\mathrm{lead,third})\,/\,M^2$")
+            ax.set_title(f"{label} Dalitz — Epoch {epoch}{phase_label}", loc="left")
+            _style_axis(ax, grid_axis="both")
+            ax.set_xlim(0, lim)
+            ax.set_ylim(0, lim)
+
+    anim = animation.FuncAnimation(fig, _draw_frame, frames=len(frames), interval=250, repeat=False)
     try:
-        fig.savefig(str(out_path))
-        print(f"  -> Saved Dalitz plot: {out_path}")
-        return out_path
+        anim.save(str(gif_path), writer="pillow", fps=4)
+        print(f"  -> Saved Dalitz GIF: {gif_path}")
+        return gif_path
     except Exception as exc:
-        print(f"  Warning: could not save Dalitz plot ({exc}).")
+        print(f"  Warning: could not save Dalitz GIF ({exc}).")
         return None
     finally:
         plt.close(fig)
