@@ -1455,7 +1455,9 @@ def _make_trend_plot(
                     markeredgecolor="white", markeredgewidth=0.6, linewidth=1.6, color=color)
             ax.fill_between(e, m - s, m + s, facecolor=_rgba(color, 0.15),
                             edgecolor=_rgba(color, 0.45), linewidth=0.6)
-            if show_ach and np.isfinite(a).any():
+            # The "best achievable" ceiling is only meaningful for QCD (how far it
+            # could be pushed out); the signal max-asymmetry ceiling is not useful.
+            if show_ach and subset == "qcd" and np.isfinite(a).any():
                 ax.plot(e, a, "--", marker="o", markersize=3, color=color, alpha=0.55,
                         label=f"{label} best achievable")
         if phase2_start_epoch is not None:
