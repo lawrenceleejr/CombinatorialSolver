@@ -163,8 +163,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        required=True,
-        help="Path to trained model checkpoint (best_model.pt)",
+        default=None,
+        help="Path to trained model checkpoint (best_model.pt). "
+             "Required unless --classical-only is given.",
     )
     parser.add_argument(
         "--output-dir",
@@ -197,6 +198,8 @@ if __name__ == "__main__":
             num_jets=args.num_jets,
         )
     else:
+        if args.checkpoint is None:
+            parser.error("--checkpoint is required unless --classical-only is given.")
         export_all(
             checkpoint_path=args.checkpoint,
             output_dir=args.output_dir,

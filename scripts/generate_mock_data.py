@@ -105,6 +105,142 @@ def generate_event(parent_mass: float, include_isr: bool = False) -> dict:
     }
 
 
+def _lorentz_boost_to_lab(q_rest: np.ndarray, parent_lab: np.ndarray) -> np.ndarray:
+    """Boost a rest-frame four-vector ``q_rest`` (E, px, py, pz) into the lab
+    frame, where ``parent_lab`` is the parent's lab four-vector (its mass defines
+    the rest frame).  Standard active Lorentz boost along the parent velocity."""
+    E_p, px, py, pz = parent_lab
+    M = np.sqrt(max(E_p**2 - px**2 - py**2 - pz**2, 1e-12))
+    beta = np.array([px, py, pz]) / E_p
+    b2 = float(beta @ beta)
+    gamma = E_p / M
+    E_q = q_rest[0]
+    p_q = q_rest[1:]
+    bp = float(beta @ p_q)
+    if b2 < 1e-12:
+        return q_rest.copy()
+    E_lab = gamma * (E_q + bp)
+    p_lab = p_q + ((gamma - 1.0) * bp / b2 + gamma * E_q) * beta
+    return np.array([E_lab, p_lab[0], p_lab[1], p_lab[2]])
+
+
+def _two_body_decay(parent_lab: np.ndarray, m1: float, m2: float) -> tuple[np.ndarray, np.ndarray]:
+    """Isotropic relativistic 2-body decay of ``parent_lab`` → (m1, m2).
+
+    Returns the two daughter four-vectors in the lab frame.
+    """
+    E_p, px, py, pz = parent_lab
+    M = np.sqrt(max(E_p**2 - px**2 - py**2 - pz**2, 1e-12))
+    # Daughter momentum magnitude in the parent rest frame (Källén function).
+    p_star = np.sqrt(max((M**2 - (m1 + m2) ** 2) * (M**2 - (m1 - m2) ** 2), 0.0)) / (2 * M)
+    # Isotropic direction in the rest frame.
+    cos_t = np.random.uniform(-1, 1)
+    sin_t = np.sqrt(max(1 - cos_t**2, 0.0))
+    phi = np.random.uniform(0, 2 * np.pi)
+    n = np.array([sin_t * np.cos(phi), sin_t * np.sin(phi), cos_t])
+    d1_rest = np.array([np.sqrt(p_star**2 + m1**2), *(p_star * n)])
+    d2_rest = np.array([np.sqrt(p_star**2 + m2**2), *(-p_star * n)])
+    return _lorentz_boost_to_lab(d1_rest, parent_lab), _lorentz_boost_to_lab(d2_rest, parent_lab)
+
+
+def _fourvec_to_ptetaphim(p: np.ndarray) -> dict:
+    """Convert (E, px, py, pz) → {pt, eta, phi, mass} jet dict."""
+    E, px, py, pz = p
+    pt = np.sqrt(px**2 + py**2)
+    eta = np.arcsinh(pz / pt) if pt > 1e-9 else 0.0
+    phi = np.arctan2(py, px)
+    mass = np.sqrt(max(E**2 - px**2 - py**2 - pz**2, 0.0))
+    return {"pt": float(pt), "eta": float(eta), "phi": float(phi), "mass": float(mass)}
+
+
+def generate_cascade_event(
+    gluino_mass: float, squark_mass: float, include_isr: bool = False
+) -> dict:
+    """Generate a resonant-triplet signal event: g~ → q + sq~(→ q q).
+
+    Each of the two (equal-mass) gluinos decays to a quark plus an on-shell
+    squark, and the squark decays to two quarks via an RPV vertex.  Every gluino
+    therefore yields a 3-jet triplet whose total invariant mass is the gluino
+    mass, but with a *resonant* pairwise mass at the squark mass — a populated
+    band/line inside the Dalitz triangle.  This is the topology the network must
+    still recognise as signal (the two triplets are equal-mass, so the
+    argmin|m1-m2| truth labelling groups them correctly), even though its
+    internal substructure differs from a flat 3-body RPV decay.
+
+    Jets are stored in truth-group order (g1=[0,1,2], g2=[3,4,5], optional ISR
+    last); the resonant quark pair from each squark is placed at indices (1,2)
+    and (4,5).
+    """
+    if squark_mass >= gluino_mass:
+        raise ValueError("squark_mass must be < gluino_mass for an on-shell cascade")
+
+    jets = []
+    # Two gluinos, roughly back-to-back in the transverse plane.
+    parent_pt = np.random.exponential(gluino_mass * 0.3)
+    phi1 = np.random.uniform(-np.pi, np.pi)
+    for sign, p_eta in [(0.0, np.random.normal(0, 1.5)), (np.pi, np.random.normal(0, 1.5))]:
+        p_phi = phi1 + sign
+        # Gluino lab four-vector.
+        glu_pt = parent_pt
+        glu_px = glu_pt * np.cos(p_phi)
+        glu_py = glu_pt * np.sin(p_phi)
+        glu_pz = np.sqrt(glu_pt**2 + gluino_mass**2) * np.sinh(p_eta)
+        glu_E = np.sqrt(glu_px**2 + glu_py**2 + glu_pz**2 + gluino_mass**2)
+        glu = np.array([glu_E, glu_px, glu_py, glu_pz])
+
+        # g~ → q (massless) + sq~ (on-shell).
+        q1, squark = _two_body_decay(glu, 0.0, squark_mass)
+        # sq~ → q + q (massless RPV decay).
+        q2, q3 = _two_body_decay(squark, 0.0, 0.0)
+        for p in (q1, q2, q3):
+            jets.append(_fourvec_to_ptetaphim(p))
+
+    if include_isr:
+        isr_pt = max(np.random.exponential(40.0), 25.0)
+        jets.append({
+            "pt": isr_pt,
+            "eta": float(np.random.uniform(-2.5, 2.5)),
+            "phi": float(np.random.uniform(-np.pi, np.pi)),
+            "mass": float(np.random.exponential(0.003)),
+        })
+
+    return _assemble_event(jets, include_isr)
+
+
+def _assemble_event(jets: list[dict], include_isr: bool) -> dict:
+    """Pack a list of jet dicts (truth-group order) into the HDF5 event layout."""
+    n_jets = len(jets)
+    max_jets = 20
+
+    pt = np.zeros(max_jets, dtype=np.float32)
+    eta = np.zeros(max_jets, dtype=np.float32)
+    phi = np.zeros(max_jets, dtype=np.float32)
+    mass = np.zeros(max_jets, dtype=np.float32)
+    mask = np.zeros(max_jets, dtype=bool)
+    for i, j in enumerate(jets):
+        pt[i], eta[i], phi[i], mass[i], mask[i] = j["pt"], j["eta"], j["phi"], j["mass"], True
+
+    px = pt * np.cos(phi)
+    py = pt * np.sin(phi)
+    pz = pt * np.sinh(eta)
+    energy = np.sqrt(px**2 + py**2 + pz**2 + mass**2)
+    ht = pt[mask].sum()
+
+    jet_features = np.zeros((max_jets, 6), dtype=np.float32)
+    for i in range(n_jets):
+        jet_features[i, 0:4] = pt[i], eta[i], phi[i], mass[i]
+        jet_features[i, 4] = 1.0 if i < 3 else (2.0 if i < 6 else 0.0)
+        jet_features[i, 5] = 0.0  # is_signal (matches real data convention)
+
+    event_features = np.array([n_jets, 0.0, 0.0, 0.0, ht, 6, 1.0], dtype=np.float32)
+    return {
+        "jet_features": jet_features, "jet_mask": mask,
+        "event_features": event_features,
+        "pt": pt, "eta": eta, "phi": phi, "mass": mass,
+        "energy": energy, "mask": mask,
+    }
+
+
 def generate_background_event(include_isr: bool = False) -> dict:
     """Generate one QCD-like multijet background event (no resonance).
 
@@ -169,12 +305,19 @@ def generate_dataset(
     parent_masses: list[float] | None = None,
     include_isr: bool = False,
     background: bool = False,
+    cascade: bool = False,
+    squark_mass: float | None = None,
 ):
     """Generate a full HDF5 dataset matching the real data layout.
 
     When ``background`` is True, QCD-like multijet events (no resonance,
     ``is_signal=0``) are produced instead of signal events — a synthetic stand-in
     for a MadGraph QCD sample to test the background-rejection training path.
+
+    When ``cascade`` is True, resonant-triplet signal events are produced
+    (g~ → q + sq~(→ q q)): each gluino's triplet carries the gluino mass with an
+    on-shell squark resonance inside it.  ``squark_mass`` sets the resonance
+    (default: 0.4 × gluino mass per event).
     """
     if parent_masses is None:
         parent_masses = [300.0, 500.0, 700.0, 1000.0, 1500.0]
@@ -215,6 +358,12 @@ def generate_dataset(
     for i in range(n_events):
         if background:
             event = generate_background_event(include_isr=include_isr)
+        elif cascade:
+            mass = float(np.random.choice(parent_masses))
+            sq = squark_mass if squark_mass is not None else 0.4 * mass
+            event = generate_cascade_event(
+                gluino_mass=mass, squark_mass=min(sq, 0.9 * mass), include_isr=include_isr
+            )
         else:
             mass = np.random.choice(parent_masses)
             event = generate_event(parent_mass=mass, include_isr=include_isr)
@@ -279,6 +428,10 @@ def generate_dataset(
     print(f"Generated {n_events} events -> {output_path}")
     if background:
         print("  Sample type: QCD-like background (is_signal=0, no resonance)")
+    elif cascade:
+        sq_desc = f"{squark_mass:.0f} GeV" if squark_mass is not None else "0.4 x gluino mass"
+        print(f"  Sample type: resonant-triplet signal g~->q+sq~(->qq), squark mass = {sq_desc}")
+        print(f"  Gluino masses sampled from: {parent_masses} GeV")
     else:
         print(f"  Parent masses sampled from: {parent_masses} GeV")
     print(f"  Jets per event: {n_jets_per_event} ({'with' if include_isr else 'without'} ISR)")
@@ -296,7 +449,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Generate QCD-like multijet background events (is_signal=0, no resonance)",
     )
+    parser.add_argument(
+        "--cascade",
+        action="store_true",
+        help="Generate resonant-triplet signal: g~ -> q + sq~(-> q q) (on-shell squark inside each triplet)",
+    )
+    parser.add_argument(
+        "--squark-mass",
+        type=float,
+        default=None,
+        help="Squark resonance mass in GeV for --cascade (default: 0.4 x gluino mass per event)",
+    )
     args = parser.parse_args()
     generate_dataset(
-        args.output, args.n_events, args.masses, args.include_isr, background=args.background
+        args.output, args.n_events, args.masses, args.include_isr,
+        background=args.background, cascade=args.cascade, squark_mass=args.squark_mass,
     )

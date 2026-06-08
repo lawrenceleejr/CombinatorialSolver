@@ -70,6 +70,42 @@ docker compose run evaluate
 
 Outputs `results/mass_reconstruction.csv` (per-event) and `results/mass_arrays.npz` (numpy arrays for plotting the m_avg distribution).
 
+### 4. Bump-hunt cut analysis (cutflow, ROC, m_avg bump)
+
+Run the analysis-level selection (Δφ > 2.5, mass asymmetry < 0.4, average boost
+< 2, plus optional Dalitz edge/corner cuts) on a **final** trained network and
+see what each cut buys you:
+
+```bash
+# On an exported ONNX model (ML or classical):
+python -m src.analysis --onnx onnx_snapshots/final_.../ml_model_final_....onnx \
+    --signal "data/sig*.h5" --background "data/qcd*.h5" --output results/bump_hunt
+# Or directly from a checkpoint (no ONNX needed):
+python -m src.analysis --checkpoint checkpoints/best_model.pt \
+    --signal "data/sig*.h5" --background "data/qcd*.h5" --output results/bump_hunt
+```
+
+Outputs a **cutflow** (fraction of signal/background remaining + running S/√B),
+`observables.npz`, and a four-panel `bump_hunt_summary.pdf`: single-cut **ROC
+scans**, a **combined working-point cloud** (many cut combinations + Pareto front
++ nominal point), the cutflow bars, and the **average-mass bump-hunt histogram**
+before/after cuts. The same plots are **animated per epoch** during training
+(`plots/bump_hunt_roc_anim_latest.gif`) whenever a `--qcd-data` background sample
+is supplied.
+
+See [`docs/bump_hunt.md`](docs/bump_hunt.md) for the full search roadmap
+(background estimation, decorrelation/no-sculpting checks, limits/significance,
+look-elsewhere, systematics) and for how the setup stays robust to signals with
+**resonant structure inside the triplet** (`g̃ → q + q̃(→qq)` cascades).
+
+### Resonant-triplet (cascade) signal generation
+
+```bash
+# Gluino -> q + on-shell squark(-> q q): a resonant band inside each 3-jet triplet
+python scripts/generate_mock_data.py --output data/cascade.h5 --n-events 10000 \
+    --include-isr --cascade --masses 1000 --squark-mass 400
+```
+
 ## Data Format
 
 Expects HDF5 files in the [MadGraphMLProducer](https://github.com/lawrenceleejr/MadGraphMLProducer) format:

@@ -24,6 +24,8 @@ import torch.nn.functional as F
 import torch.onnx
 from torch.utils.data import ConcatDataset, DataLoader, random_split
 
+from .cut_analysis import DEFAULT_CUTS, observables_from_arrays
+from .cut_plots import draw_roc_curves, draw_working_point_cloud
 from .dataset import JetAssignmentDataset
 from .export_onnx import export_classical_solver, export_ml_model
 from .model import JetAssignmentTransformer
@@ -531,6 +533,7 @@ def train(config_path: str | None = None, data_path: str | None = None,
     val_max_boost_history: list = []  # per-epoch list (val larger triplet Lorentz boost γ=E/m)
     val_avg_boost_history: list = []  # per-epoch list (val average triplet Lorentz boost γ=E/m)
     val_dalitz_history: list = []     # per-epoch list of (epoch, phase, x, y, is_bkg) for Dalitz
+    val_roc_history: list = []        # per-epoch bundle of all observables for the bump-hunt ROC animation
 
     tf_start = tc.get("tf_start", 1.0)
     tf_end = tc.get("tf_end", 0.3)
@@ -857,6 +860,27 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     _db = _db[:_cap] if _db is not None else None
                 val_dalitz_history.append((epoch + 1, training_phase, _dx, _dy, _db))
 
+            # Bundle every per-event observable needed for the bump-hunt ROC
+            # animation (all index-aligned, from the same validation pass).  Only
+            # populated when the full set is present (factored model with a QCD
+            # sample, so signal AND background both appear).
+            if all(
+                k in val_metrics for k in (
+                    "pred_mass_sum_values", "pred_asym_values", "pred_delta_phi_values",
+                    "pred_avg_boost_values", "pred_dalitz_x_values", "pred_dalitz_y_values",
+                )
+            ):
+                val_roc_history.append((
+                    epoch + 1, training_phase,
+                    val_metrics["pred_mass_sum_values"],
+                    val_metrics["pred_asym_values"],
+                    val_metrics["pred_delta_phi_values"],
+                    val_metrics["pred_avg_boost_values"],
+                    val_metrics["pred_dalitz_x_values"],
+                    val_metrics["pred_dalitz_y_values"],
+                    val_metrics.get("pred_is_bkg_values"),
+                ))
+
             # Log
             phase_tag = f"[P{training_phase}]" if phase1_active else ""
             adv_str = f" | Adv R²={val_metrics['adv_r2']:.3f}" if use_adversary else ""
@@ -975,6 +999,12 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     val_dalitz_history,
                     phase2_start_epoch=phase2_start_epoch,
                     gif_path=Path("plots") / "dalitz_anim_latest.gif",
+                )
+            if val_roc_history:
+                _make_roc_gif(
+                    val_roc_history,
+                    phase2_start_epoch=phase2_start_epoch,
+                    gif_path=Path("plots") / "bump_hunt_roc_anim_latest.gif",
                 )
 
             # ---------------------------------------------------------------
@@ -1149,6 +1179,12 @@ def train(config_path: str | None = None, data_path: str | None = None,
         dalitz = _make_dalitz_gif(val_dalitz_history, phase2_start_epoch=phase2_start_epoch)
         if dalitz is not None:
             plot_paths.append(dalitz)
+
+    # Animated bump-hunt ROC (single-cut scans + combined working-point cloud).
+    if val_roc_history:
+        roc_gif = _make_roc_gif(val_roc_history, phase2_start_epoch=phase2_start_epoch)
+        if roc_gif is not None:
+            plot_paths.append(roc_gif)
 
     # Full timestamped snapshot bundle (ML model + classical solver + plots),
     # mirroring the Phase 1 snapshot produced by _export_phase1_snapshot.
@@ -1672,6 +1708,98 @@ def _make_dalitz_gif(
         return gif_path
     except Exception as exc:
         print(f"  Warning: could not save Dalitz GIF ({exc}).")
+        return None
+    finally:
+        plt.close(fig)
+
+
+def _make_roc_gif(
+    val_roc_history: list,
+    phase2_start_epoch: int | None = None,
+    gif_path: str | Path | None = None,
+    cuts: dict | None = None,
+) -> "Path | None":
+    """Animated bump-hunt ROC over epochs (two panels per frame).
+
+    Left panel: single-cut ROC scans (signal efficiency vs background rejection)
+    for each analysis variable (Δφ, mass asymmetry, average boost, Dalitz
+    edge/corner).  Right panel: a cloud of MANY combined cut working points with
+    the Pareto front and the nominal working point (Δφ>2.5, asym<0.4, boost<2)
+    marked, showing how the achievable signal/background trade-off — and the
+    fraction of signal and background kept at the nominal cuts — evolves as the
+    network learns.
+
+    Requires a QCD/background sample (so both signal and background appear in the
+    validation set).  Returns ``None`` for signal-only runs or if matplotlib is
+    unavailable.  Uses the same cut/observable/plotting logic as the standalone
+    ``src.analysis`` tool, so the training animation and the final-network plots
+    are guaranteed to agree.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.animation as animation
+        _init_plot_style(plt)
+    except ImportError:
+        return None
+    if not val_roc_history:
+        return None
+
+    import numpy as np
+
+    cuts = cuts or DEFAULT_CUTS
+
+    frames = []
+    for entry in val_roc_history:
+        epoch, phase, msum, asym, dphi, boost, dx, dy, is_bkg = entry
+        if is_bkg is None:
+            continue
+        is_bkg = np.asarray(is_bkg, dtype=bool)
+        if not is_bkg.any() or not (~is_bkg).any():
+            continue  # need both classes for a ROC
+
+        def _sub(sel):
+            return observables_from_arrays(
+                np.asarray(msum)[sel], np.asarray(asym)[sel], np.asarray(dphi)[sel],
+                np.asarray(boost)[sel], np.asarray(dx)[sel], np.asarray(dy)[sel],
+            )
+
+        frames.append((epoch, phase, _sub(~is_bkg), _sub(is_bkg)))
+
+    if not frames:
+        return None
+
+    plots_dir = Path("plots")
+    plots_dir.mkdir(exist_ok=True)
+    if gif_path is None:
+        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        commit = _get_git_commit_hash()
+        gif_path = plots_dir / f"bump_hunt_roc_anim_{ts}_{commit}.gif"
+    gif_path = Path(gif_path)
+
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 5.6))
+
+    def _draw(i):
+        epoch, phase, sig, bkg = frames[i]
+        a1.cla()
+        a2.cla()
+        draw_roc_curves(a1, sig, bkg, cuts, n=60)
+        draw_working_point_cloud(a2, sig, bkg, cuts, n_per_axis=4)
+        phase_label = ""
+        if phase2_start_epoch is not None:
+            phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
+        elif phase == 2:
+            phase_label = " [Phase 2]"
+        fig.suptitle(f"Bump-hunt ROC — Epoch {epoch}{phase_label}", fontsize=14, y=1.0)
+
+    anim = animation.FuncAnimation(fig, _draw, frames=len(frames), interval=250, repeat=False)
+    try:
+        anim.save(str(gif_path), writer="pillow", fps=4)
+        print(f"  -> Saved bump-hunt ROC GIF: {gif_path}")
+        return gif_path
+    except Exception as exc:
+        print(f"  Warning: could not save bump-hunt ROC GIF ({exc}).")
         return None
     finally:
         plt.close(fig)
