@@ -309,6 +309,33 @@ def evaluate(
     print(f"Mass avg (truth):         mean={np.nanmean(mass_avg_truth):.1f} GeV, "
           f"std={np.nanstd(mass_avg_truth):.1f} GeV")
 
+    # Background-steepness comparison.  On a QCD sample, a steeper (lower
+    # background) method has a SMALLER fraction of events above each average-mass
+    # threshold.  The goal of the background-rejection training is for the ML
+    # tail fraction to be <= classical at every threshold (at least as steep).
+    if has_classical:
+        ml = np.asarray(mass_avg_pred, dtype=float)
+        cl = np.asarray(mass_avg_classical, dtype=float)
+        ml = ml[np.isfinite(ml)]
+        cl = cl[np.isfinite(cl)]
+        if len(ml) and len(cl):
+            thresholds = np.percentile(cl, [50, 75, 90, 95, 99])
+            print("\nAverage-mass tail fraction (smaller = steeper = lower background):")
+            print(f"  {'threshold [GeV]':>16} {'ML':>10} {'classical':>10} {'ML<=cls':>9}")
+            all_steeper = True
+            for thr in thresholds:
+                f_ml = float((ml > thr).mean())
+                f_cl = float((cl > thr).mean())
+                ok = f_ml <= f_cl + 1e-9
+                all_steeper = all_steeper and ok
+                print(f"  {thr:16.1f} {f_ml:10.4f} {f_cl:10.4f} {('yes' if ok else 'NO'):>9}")
+            if all_steeper:
+                print("  => ML average-mass background is at least as steep as classical "
+                      "at all thresholds.")
+            else:
+                print("  => ML is shallower than classical at some thresholds "
+                      "(increase beta_bg / lambda_bg).")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate jet assignment model")

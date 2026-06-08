@@ -22,12 +22,125 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.onnx
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import ConcatDataset, DataLoader, random_split
 
 from .dataset import JetAssignmentDataset
 from .export_onnx import export_classical_solver, export_ml_model
 from .model import JetAssignmentTransformer
 from .utils import get_config, get_device
+
+
+# Consistent colour palette shared by all training animations and trend plots.
+# Uses the Okabe–Ito palette — a mature, colourblind-safe scheme widely adopted
+# for scientific figures (https://jfly.uni-koeln.de/color/).
+#   signal_correct/signal_wrong : the two parts of the signal stack
+#   qcd                         : QCD background (filled when alone, unfilled
+#                                 outline when overlaid on the signal stack)
+#   mean                        : per-epoch mean reference line
+_HIST_COLORS = {
+    "signal_correct": "#009E73",  # Okabe–Ito bluish green — correct interpretation
+    "signal_wrong":   "#CFCFCF",  # light grey — combinatorial bkg (wrong interpretation)
+    "qcd":            "#D55E00",  # Okabe–Ito vermillion — QCD background
+    "mean":           "#2A2A2A",  # near-black grey — mean reference line
+}
+
+
+def _rgba(color, alpha: float):
+    """Translucent face colour for filled areas."""
+    from matplotlib.colors import to_rgba
+    return to_rgba(color, alpha)
+
+
+def _edge(color, factor: float = 0.55):
+    """A darker shade of *color* for a crisp thin outline around a filled area."""
+    from matplotlib.colors import to_rgba
+    r, g, b = to_rgba(color)[:3]
+    return (r * factor, g * factor, b * factor)
+
+
+def _style_axis(ax, grid_axis: str = "both") -> None:
+    """Apply a clean, Tufte-inspired style: drop the top/right spines, lighten the
+    remaining spines and ticks, and lay faint gridlines behind the data so the ink
+    serves the data, not the frame.  Legends are drawn frameless by the callers."""
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color("#777777")
+        ax.spines[side].set_linewidth(0.8)
+    ax.tick_params(colors="#555555", length=3, width=0.8)
+    ax.grid(True, axis=grid_axis, color="#E9E9E9", linewidth=0.6)
+    ax.set_axisbelow(True)
+
+
+_FONTS_REGISTERED = False
+
+
+def _ensure_serif_fonts() -> None:
+    """Make the EB Garamond serif available without a system install or network.
+
+    If no Garamond is already known to matplotlib, the OFL-licensed copies vendored
+    in ``assets/fonts/`` are registered with the font manager for this process (so
+    plots use Garamond immediately) and also copied into the user font directory so
+    they persist for future runs and other tools.  Best-effort and idempotent;
+    never raises — if anything fails, plotting simply falls back to Times/DejaVu.
+    """
+    global _FONTS_REGISTERED
+    if _FONTS_REGISTERED:
+        return
+    _FONTS_REGISTERED = True
+    try:
+        import matplotlib.font_manager as fm
+        have = {f.name for f in fm.fontManager.ttflist}
+        if {"EB Garamond", "Garamond"} & have:
+            return  # a Garamond is already installed
+        font_dir = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+        bundled = sorted(font_dir.rglob("*.otf")) + sorted(font_dir.rglob("*.ttf"))
+        if not bundled:
+            return
+        for p in bundled:
+            try:
+                fm.fontManager.addfont(str(p))
+            except Exception:
+                pass
+        # Persist to the user font directory so the font "installs" for next time.
+        try:
+            import shutil
+            user_dir = Path.home() / ".local" / "share" / "fonts" / "ebgaramond"
+            user_dir.mkdir(parents=True, exist_ok=True)
+            for p in bundled:
+                dest = user_dir / p.name
+                if not dest.exists():
+                    shutil.copy2(p, dest)
+        except Exception:
+            pass
+        if "EB Garamond" in {f.name for f in fm.fontManager.ttflist}:
+            print("  Registered vendored EB Garamond serif for plots.")
+    except Exception:
+        pass
+
+
+def _init_plot_style(plt) -> None:
+    """Tufte-flavoured global style: a serif font family, larger base/legend text,
+    serif math, and extra title padding so titles sit a little higher.  Idempotent;
+    called at the top of every plotting helper before any text is drawn."""
+    _ensure_serif_fonts()
+    plt.rcParams.update({
+        "font.family": "serif",
+        # Prefer a refined serif; fall back gracefully to whatever is installed.
+        "font.serif": ["EB Garamond", "Garamond", "Adobe Garamond Pro",
+                       "Times New Roman", "Times", "Nimbus Roman No9 L",
+                       "Liberation Serif", "DejaVu Serif"],
+        "font.size": 12,
+        "axes.titlesize": 14,
+        "axes.labelsize": 12,
+        "legend.fontsize": 12,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "mathtext.fontset": "cm",
+        "axes.titlepad": 16,
+        # Garamond/Times lack the Unicode minus (U+2212); use ASCII hyphen on ticks.
+        "axes.unicode_minus": False,
+    })
 
 
 def _get_git_commit_hash() -> str:
@@ -233,7 +346,8 @@ def _check_optional_deps() -> None:
         )
 
 
-def train(config_path: str | None = None, data_path: str | None = None):
+def train(config_path: str | None = None, data_path: str | None = None,
+          qcd_data_path: str | None = None):
     """Main training function."""
     _check_optional_deps()
 
@@ -247,16 +361,52 @@ def train(config_path: str | None = None, data_path: str | None = None):
 
     # Data
     if data_path is None:
-        data_path = "data/*.h5"
+        data_path = dc.get("data_path", "data/*.h5")
 
-    dataset = JetAssignmentDataset(
+    sig_dataset = JetAssignmentDataset(
         data_paths=data_path,
         num_jets=dc["num_jets"],
         normalize_by_ht=dc["normalize_by_ht"],
         pt_smear_frac=dc.get("pt_smear_frac", 0.0),
         use_mass_asymmetry_labels=dc.get("use_mass_asymmetry_labels", True),
+        is_background=False,
     )
-    print(f"Dataset size: {len(dataset)} events")
+    print(f"Signal dataset size: {len(sig_dataset)} events")
+
+    # Optional QCD/background sample.  Tagged is_background=True so its events
+    # drive the background-rejection loss (push to low average mass OR high
+    # asymmetry) instead of the supervised assignment loss.  The glob comes from
+    # the --qcd-data CLI flag (preferred) or data.qcd_data_path; if unset or no
+    # files match, training is signal-only and behaves exactly as before.
+    qcd_path = qcd_data_path if qcd_data_path is not None else dc.get("qcd_data_path")
+    qcd_dataset = None
+    if qcd_path:
+        try:
+            qcd_dataset = JetAssignmentDataset(
+                data_paths=qcd_path,
+                num_jets=dc["num_jets"],
+                normalize_by_ht=dc["normalize_by_ht"],
+                pt_smear_frac=dc.get("pt_smear_frac", 0.0),
+                use_mass_asymmetry_labels=dc.get("use_mass_asymmetry_labels", True),
+                is_background=True,
+            )
+            print(f"QCD background dataset size: {len(qcd_dataset)} events")
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            print(f"QCD background sample not loaded ({qcd_path}): {exc}")
+            qcd_dataset = None
+
+    qcd_present = qcd_dataset is not None and len(qcd_dataset) > 0
+    if qcd_present:
+        dataset = ConcatDataset([sig_dataset, qcd_dataset])
+        n_bkg = len(qcd_dataset)
+        print(
+            f"Combined dataset size: {len(dataset)} events "
+            f"({len(sig_dataset)} signal + {n_bkg} background, "
+            f"{100.0 * n_bkg / max(len(dataset), 1):.1f}% background)"
+        )
+    else:
+        dataset = sig_dataset
+        print(f"Dataset size: {len(dataset)} events (signal only)")
 
     # Train/val split (90/10)
     n_val = max(1, int(0.1 * len(dataset)))
@@ -336,8 +486,9 @@ def train(config_path: str | None = None, data_path: str | None = None):
         print(f"Label smoothing: {label_smoothing}")
     mse_loss_fn = nn.MSELoss()
 
-    # Check if adversarial training is useful
-    mass_std = dataset.parent_masses.std().item()
+    # Check if adversarial training is useful (signal mass spread only;
+    # background events carry zeroed parent_mass and are excluded).
+    mass_std = sig_dataset.parent_masses.std().item()
     use_adversary = tc["lambda_adv"] > 0 and mass_std > 0.01
     if tc["lambda_adv"] == 0:
         print("Adversary disabled: lambda_adv=0")
@@ -377,6 +528,9 @@ def train(config_path: str | None = None, data_path: str | None = None):
     val_max_triplet_pt_history: list = []  # per-epoch list of numpy arrays (val max-triplet scalar pT)
     val_delta_phi_history: list = []  # per-epoch list of numpy arrays (val Δφ between parent candidates)
     val_democracy_history: list = []  # per-epoch list of numpy arrays (val avg pT democracy of triplets)
+    val_max_boost_history: list = []  # per-epoch list (val larger triplet Lorentz boost γ=E/m)
+    val_avg_boost_history: list = []  # per-epoch list (val average triplet Lorentz boost γ=E/m)
+    val_dalitz_history: list = []     # per-epoch list of (epoch, phase, x, y, is_bkg) for Dalitz
 
     tf_start = tc.get("tf_start", 1.0)
     tf_end = tc.get("tf_end", 0.3)
@@ -400,6 +554,39 @@ def train(config_path: str | None = None, data_path: str | None = None):
     lambda_entropy_mass_max = tc.get("lambda_entropy_mass", 0.0)
     lambda_entropy_asym_rampup = tc.get("lambda_entropy_asym_rampup", 0)
     lambda_entropy_mass_rampup = tc.get("lambda_entropy_mass_rampup", 0)
+    # Background-rejection loss (requires a QCD sample loaded with is_background=True).
+    # For each background event, supervise the assignment toward the one that
+    # maximises bg = mass_asym - beta_bg * mass_sum — the most QCD-like (low average
+    # mass OR high asymmetry) interpretation.  This drives the QCD average-mass
+    # distribution to fall at least as steeply as the classical mass-asymmetry
+    # solver, while leaving signal untouched (the term is masked to background
+    # events only).  beta_bg -> inf is pure average-mass minimisation (steepest
+    # background); beta_bg -> 0 is pure asymmetry maximisation.  Ramps up from
+    # Phase 2 start like lambda_sym/qcd.
+    lambda_bg_max = tc.get("lambda_bg", 0.0)
+    lambda_bg_rampup = tc.get("lambda_bg_rampup", 0)
+    beta_bg = tc.get("beta_bg", 0.5)
+    bg_soft_weight = tc.get("bg_soft_weight", 2.0)
+    bg_asym_cut = tc.get("bg_asym_cut", 0.0)
+    # Handing the trainer a QCD sample turns on the background-rejection objective
+    # automatically: if lambda_bg was left at its default 0, enable it so the QCD
+    # events actually penalise high-average-mass interpretations.  Set
+    # training.lambda_bg explicitly in the config to override (e.g. back to 0).
+    if qcd_present and lambda_bg_max <= 0:
+        lambda_bg_max = 2.0
+        print("QCD sample provided -> auto-enabling background-rejection loss "
+              "(lambda_bg=2.0; set training.lambda_bg to override).")
+    if lambda_bg_max > 0:
+        print(
+            f"Background-rejection loss: lambda_bg={lambda_bg_max} "
+            f"(rampup={lambda_bg_rampup}), beta_bg={beta_bg}, "
+            f"bg_soft_weight={bg_soft_weight}, bg_asym_cut={bg_asym_cut}"
+        )
+        if qcd_present and (
+            lambda_qcd_max > 0 or lambda_entropy_asym_max > 0 or lambda_entropy_mass_max > 0
+        ):
+            print("  Note: lambda_qcd / lambda_entropy_* are signal-side QCD proxies; "
+                  "with a real QCD sample they are redundant — consider setting them to 0.")
     if lambda_entropy_asym_max > 0 or lambda_entropy_mass_max > 0:
         print(
             f"Entropy-weighted physics prior: "
@@ -505,6 +692,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 lambda_isr_direct = 0.0
                 lambda_entropy_asym = 0.0
                 lambda_entropy_mass = 0.0
+                lambda_bg = 0.0
                 phase1_only_train = True
             else:
                 # Phase 2: teacher forcing, auxiliary losses, decaying distillation
@@ -548,6 +736,11 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 else:
                     lambda_entropy_mass = lambda_entropy_mass_max
 
+                if lambda_bg_rampup > 0:
+                    lambda_bg = lambda_bg_max * min(1.0, phase2_epoch / lambda_bg_rampup)
+                else:
+                    lambda_bg = lambda_bg_max
+
                 # Distillation decays from max to zero over lambda_distill_epochs
                 if lambda_distill_epochs > 0:
                     lambda_distill = lambda_distill_max * max(
@@ -568,6 +761,8 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 lambda_distill=lambda_distill, distill_temperature=distill_temperature,
                 lambda_entropy_asym=lambda_entropy_asym,
                 lambda_entropy_mass=lambda_entropy_mass,
+                lambda_bg=lambda_bg, beta_bg=beta_bg,
+                bg_soft_weight=bg_soft_weight, bg_asym_cut=bg_asym_cut,
                 phase1_only=phase1_only_train,
                 pt_smear_frac=dc.get("pt_smear_frac", 0.0),
             )
@@ -583,6 +778,8 @@ def train(config_path: str | None = None, data_path: str | None = None):
                     lambda_isr=lambda_isr, lambda_isr_direct=0.0,
                     lambda_distill=0.0, distill_temperature=distill_temperature,
                     lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
+                    lambda_bg=0.0, beta_bg=beta_bg,
+                    bg_soft_weight=bg_soft_weight, bg_asym_cut=bg_asym_cut,
                     pt_smear_frac=dc.get("pt_smear_frac", 0.0),
                 )
 
@@ -591,7 +788,9 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 val_asym_history.append((
                     epoch + 1, training_phase,
                     val_metrics["pred_asym_values"],
-                    val_metrics.get("pred_correct_values"),  # bool array or None
+                    val_metrics.get("pred_correct_values"),       # bool array or None
+                    val_metrics.get("pred_is_bkg_values"),        # bool array or None
+                    val_metrics.get("pred_asym_achievable_values"),  # best achievable, or None
                 ))
 
             # Accumulate per-event validation mass-sum distribution for GIF
@@ -599,7 +798,9 @@ def train(config_path: str | None = None, data_path: str | None = None):
                 val_mass_sum_history.append((
                     epoch + 1, training_phase,
                     val_metrics["pred_mass_sum_values"],
-                    val_metrics.get("pred_correct_values"),  # bool array or None
+                    val_metrics.get("pred_correct_values"),           # bool array or None
+                    val_metrics.get("pred_is_bkg_values"),            # bool array or None
+                    val_metrics.get("pred_mass_sum_achievable_values"),  # best achievable, or None
                 ))
 
             # Accumulate per-event validation max-triplet scalar-pT distribution for GIF
@@ -608,6 +809,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                     epoch + 1, training_phase,
                     val_metrics["pred_max_triplet_pt_values"],
                     val_metrics.get("pred_correct_values"),  # bool array or None
+                    val_metrics.get("pred_is_bkg_values"),   # bool array or None
                 ))
 
             # Accumulate per-event validation ΔΦ distribution for GIF
@@ -616,6 +818,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
                     epoch + 1, training_phase,
                     val_metrics["pred_delta_phi_values"],
                     val_metrics.get("pred_correct_values"),  # bool array or None
+                    val_metrics.get("pred_is_bkg_values"),   # bool array or None
                 ))
 
             # Accumulate per-event validation pT-democracy distribution for GIF
@@ -624,7 +827,35 @@ def train(config_path: str | None = None, data_path: str | None = None):
                     epoch + 1, training_phase,
                     val_metrics["pred_democracy_values"],
                     val_metrics.get("pred_correct_values"),  # bool array or None
+                    val_metrics.get("pred_is_bkg_values"),   # bool array or None
                 ))
+
+            # Accumulate per-event validation triplet Lorentz-boost distributions for GIF
+            if "pred_max_boost_values" in val_metrics:
+                val_max_boost_history.append((
+                    epoch + 1, training_phase,
+                    val_metrics["pred_max_boost_values"],
+                    val_metrics.get("pred_correct_values"),
+                    val_metrics.get("pred_is_bkg_values"),
+                ))
+            if "pred_avg_boost_values" in val_metrics:
+                val_avg_boost_history.append((
+                    epoch + 1, training_phase,
+                    val_metrics["pred_avg_boost_values"],
+                    val_metrics.get("pred_correct_values"),
+                    val_metrics.get("pred_is_bkg_values"),
+                ))
+            # Per-epoch validation Dalitz coordinates (for the animated 2-D Dalitz
+            # plot).  Cap the stored points per epoch so the GIF stays light.
+            if "pred_dalitz_x_values" in val_metrics:
+                _dx = val_metrics["pred_dalitz_x_values"]
+                _dy = val_metrics["pred_dalitz_y_values"]
+                _db = val_metrics.get("pred_is_bkg_values")
+                _cap = 4000
+                if _dx.shape[0] > _cap:
+                    _dx, _dy = _dx[:_cap], _dy[:_cap]
+                    _db = _db[:_cap] if _db is not None else None
+                val_dalitz_history.append((epoch + 1, training_phase, _dx, _dy, _db))
 
             # Log
             phase_tag = f"[P{training_phase}]" if phase1_active else ""
@@ -688,6 +919,7 @@ def train(config_path: str | None = None, data_path: str | None = None):
             # Per-epoch live-monitoring plots (overwrite fixed "latest" files so a
             # viewer that auto-refreshes (e.g. an open PDF) always shows current progress).
             _plot_training_curves(log_path, phase2_start_epoch=phase2_start_epoch, tag="latest")
+            # Distribution animations always show signal AND QCD together.
             if val_asym_history:
                 _make_mass_asym_gif(
                     val_asym_history,
@@ -699,6 +931,14 @@ def train(config_path: str | None = None, data_path: str | None = None):
                     val_mass_sum_history,
                     phase2_start_epoch=phase2_start_epoch,
                     gif_path=Path("plots") / "mass_sum_anim_latest.gif",
+                )
+            # One combined trend overlaying signal and QCD means vs epoch
+            # (mass asymmetry and average candidate mass).
+            if val_asym_history or val_mass_sum_history:
+                _make_trend_plot(
+                    _trend_panels(val_asym_history, val_mass_sum_history),
+                    phase2_start_epoch=phase2_start_epoch,
+                    out_path=Path("plots") / "trends_latest.pdf",
                 )
             if val_max_triplet_pt_history:
                 _make_max_triplet_pt_gif(
@@ -717,6 +957,24 @@ def train(config_path: str | None = None, data_path: str | None = None):
                     val_democracy_history,
                     phase2_start_epoch=phase2_start_epoch,
                     gif_path=Path("plots") / "democracy_anim_latest.gif",
+                )
+            if val_max_boost_history:
+                _make_max_boost_gif(
+                    val_max_boost_history,
+                    phase2_start_epoch=phase2_start_epoch,
+                    gif_path=Path("plots") / "max_boost_anim_latest.gif",
+                )
+            if val_avg_boost_history:
+                _make_avg_boost_gif(
+                    val_avg_boost_history,
+                    phase2_start_epoch=phase2_start_epoch,
+                    gif_path=Path("plots") / "avg_boost_anim_latest.gif",
+                )
+            if val_dalitz_history:
+                _make_dalitz_gif(
+                    val_dalitz_history,
+                    phase2_start_epoch=phase2_start_epoch,
+                    gif_path=Path("plots") / "dalitz_anim_latest.gif",
                 )
 
             # ---------------------------------------------------------------
@@ -851,6 +1109,15 @@ def train(config_path: str | None = None, data_path: str | None = None):
         if mass_sum_gif is not None:
             plot_paths.append(mass_sum_gif)
 
+    # One combined trend overlaying signal and QCD means vs epoch (mass asymmetry
+    # and average candidate mass), with the QCD "best achievable" ceiling.
+    trend = _make_trend_plot(
+        _trend_panels(val_asym_history, val_mass_sum_history),
+        phase2_start_epoch=phase2_start_epoch,
+    )
+    if trend is not None:
+        plot_paths.append(trend)
+
     # Animated GIF of the validation max-triplet scalar-sum pT distribution.
     if val_max_triplet_pt_history:
         mpt_gif = _make_max_triplet_pt_gif(val_max_triplet_pt_history, phase2_start_epoch=phase2_start_epoch)
@@ -869,6 +1136,20 @@ def train(config_path: str | None = None, data_path: str | None = None):
         if dem_gif is not None:
             plot_paths.append(dem_gif)
 
+    # Triplet Lorentz-boost animations and the 2-D Dalitz plot.
+    if val_max_boost_history:
+        mb_gif = _make_max_boost_gif(val_max_boost_history, phase2_start_epoch=phase2_start_epoch)
+        if mb_gif is not None:
+            plot_paths.append(mb_gif)
+    if val_avg_boost_history:
+        ab_gif = _make_avg_boost_gif(val_avg_boost_history, phase2_start_epoch=phase2_start_epoch)
+        if ab_gif is not None:
+            plot_paths.append(ab_gif)
+    if val_dalitz_history:
+        dalitz = _make_dalitz_gif(val_dalitz_history, phase2_start_epoch=phase2_start_epoch)
+        if dalitz is not None:
+            plot_paths.append(dalitz)
+
     # Full timestamped snapshot bundle (ML model + classical solver + plots),
     # mirroring the Phase 1 snapshot produced by _export_phase1_snapshot.
     _export_onnx_snapshot(
@@ -885,136 +1166,19 @@ def _make_mass_asym_gif(
     phase2_start_epoch: int | None = None,
     gif_path: str | Path | None = None,
 ) -> "Path | None":
-    """Build an animated GIF of the validation mass-asymmetry distribution.
-
-    Each frame shows a histogram of log₁₀(mass asymmetry) for the model's
-    chosen interpretation across all validation events for that epoch.  When a
-    per-event correctness mask is available (4-tuple history entries) the bars
-    are stacked by correct vs incorrect network outputs.  A vertical line marks
-    the per-epoch mean.  When two-phase training was used, frames from Phase 2
-    onward carry a "Phase 2" annotation so the transition is immediately
-    visible.
-
-    When *gif_path* is ``None`` the file is written to
-    ``plots/mass_asym_anim_{timestamp}_{commit}.gif``; pass an explicit path
-    (e.g. ``plots/mass_asym_anim_latest.gif``) to overwrite a fixed file on
-    every call and requires ``pillow`` (pip install pillow).
-
-    Args:
-        val_asym_history: List of ``(epoch, phase, values_array[, correct_mask])``
-            tuples collected during training, one entry per epoch.  The optional
-            fourth element is a boolean NumPy array aligned with *values_array*
-            (True = model chose the correct assignment).
-        phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
-            ``None`` for single-phase runs.
-        gif_path: Destination file path.  When ``None`` a timestamped path
-            inside ``plots/`` is generated automatically.
-    """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import matplotlib.animation as animation
-    except ImportError:
-        print("  Warning: matplotlib not available; skipping mass-asym GIF.")
-        return None
-
-    if not val_asym_history:
-        return None
-
-    plots_dir = Path("plots")
-    plots_dir.mkdir(exist_ok=True)
-
-    if gif_path is None:
-        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        commit = _get_git_commit_hash()
-        gif_path = plots_dir / f"mass_asym_anim_{ts}_{commit}.gif"
-    gif_path = Path(gif_path)
-
+    """Combined mass-asymmetry GIF: signal correct/wrong stack + normalized QCD outline."""
     import numpy as np
-
-    # Unpack history: support both 3-tuple (legacy) and 4-tuple (with correct mask).
-    def _unpack(entry):
-        if len(entry) == 4:
-            return entry
-        return entry[0], entry[1], entry[2], None
-
-    # x-axis in log10 space: mass_asym ∈ (0, 1] → log10 ∈ (-∞, 0].
-    # Clip values below 1e-4 to avoid -inf.
-    LOG_CLIP = 1e-4
-    x_min, x_max = -4.0, 0.0
-    n_bins = 50
-    bin_edges = np.linspace(x_min, x_max, n_bins + 1)
-
-    # Pre-compute stacked counts for every frame to fix the y-axis.
-    max_count = 0
-    for entry in val_asym_history:
-        _, _, values, correct_mask = _unpack(entry)
-        log_vals = np.log10(np.clip(values, LOG_CLIP, 1.0))
-        counts_total, _ = np.histogram(log_vals, bins=bin_edges)
-        if counts_total.max() > max_count:
-            max_count = int(counts_total.max())
-    y_max = max_count * 1.1
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bar_width = (x_max - x_min) / n_bins
-    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-    def _draw_frame(frame_idx):
-        _, _, values, correct_mask = _unpack(val_asym_history[frame_idx])
-        epoch, phase = val_asym_history[frame_idx][0], val_asym_history[frame_idx][1]
-        ax.cla()
-        log_vals = np.log10(np.clip(values, LOG_CLIP, 1.0))
-        mean_val = float(log_vals.mean())
-
-        if correct_mask is not None:
-            log_correct   = log_vals[correct_mask]
-            log_incorrect = log_vals[~correct_mask]
-            counts_correct,   _ = np.histogram(log_correct,   bins=bin_edges)
-            counts_incorrect, _ = np.histogram(log_incorrect, bins=bin_edges)
-            ax.bar(centers, counts_correct,   width=bar_width,
-                   color="steelblue", alpha=0.85, align="center", label="Correct")
-            ax.bar(centers, counts_incorrect, width=bar_width,
-                   color="coral",     alpha=0.85, align="center", label="Incorrect",
-                   bottom=counts_correct)
-        else:
-            counts, _ = np.histogram(log_vals, bins=bin_edges)
-            ax.bar(centers, counts, width=bar_width,
-                   color="steelblue", alpha=0.75, align="center")
-
-        ax.axvline(mean_val, color="darkorange", linewidth=2.0,
-                   label=f"Mean = {mean_val:.2f}")
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(0, y_max)
-        ax.set_xlabel("log₁₀(mass asymmetry of chosen interpretation)")
-        ax.set_ylabel("Validation events")
-        phase_label = ""
-        if phase2_start_epoch is not None:
-            phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
-        elif phase == 2:
-            phase_label = " [Phase 2]"
-        ax.set_title(f"Epoch {epoch}{phase_label}")
-        ax.legend(loc="upper left")
-        ax.grid(True, alpha=0.3)
-
-    anim = animation.FuncAnimation(
-        fig,
-        _draw_frame,
-        frames=len(val_asym_history),
-        interval=200,
-        repeat=False,
+    return _make_distribution_gif(
+        val_asym_history,
+        value_fn=lambda v: np.log10(np.clip(v, 1e-4, 1.0)),
+        xlabel=r"$\log_{10}$(mass asymmetry of chosen interpretation)",
+        title_prefix="Mass asymmetry",
+        short_name="mass_asym_anim",
+        subset="combined",
+        x_range=(-4.0, 0.0),
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
     )
-
-    try:
-        anim.save(str(gif_path), writer="pillow", fps=5)
-        print(f"  -> Saved mass asym GIF : {gif_path}")
-        return gif_path
-    except Exception as exc:
-        print(f"  Warning: could not save mass-asym GIF ({exc}). "
-              "Is pillow installed?  pip install pillow")
-        return None
-    finally:
-        plt.close(fig)
 
 
 def _make_mass_sum_gif(
@@ -1022,136 +1186,301 @@ def _make_mass_sum_gif(
     phase2_start_epoch: int | None = None,
     gif_path: str | Path | None = None,
 ) -> "Path | None":
-    """Build an animated GIF of the validation average-candidate-mass distribution.
+    """Combined average-mass GIF: signal correct/wrong stack + normalized QCD outline."""
+    return _make_distribution_gif(
+        val_mass_sum_history,
+        value_fn=lambda v: v / 2.0,
+        xlabel=r"Average candidate mass $(m_1{+}m_2)/2$ of chosen interpretation",
+        title_prefix="Average candidate mass",
+        short_name="mass_sum_anim",
+        subset="combined",
+        x_range=None,
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
+    )
 
-    Each frame shows a histogram of ``(m₁ + m₂) / 2`` for the model's chosen
-    interpretation across all validation events for that epoch.  When a
-    per-event correctness mask is available (4-tuple history entries) the bars
-    are stacked by correct vs incorrect network outputs.  A vertical line marks
-    the per-epoch mean.  When two-phase training was used, frames from Phase 2
-    onward carry a "Phase 2" annotation so the transition is immediately
-    visible.
 
-    When *gif_path* is ``None`` the file is written to
-    ``plots/mass_sum_anim_{timestamp}_{commit}.gif``; pass an explicit path
-    (e.g. ``plots/mass_sum_anim_latest.gif``) to overwrite a fixed file on
-    every call.  Requires ``pillow`` (pip install pillow).
+def _make_distribution_gif(
+    history: list,
+    value_fn,
+    xlabel: str,
+    title_prefix: str,
+    short_name: str,
+    *,
+    subset: str = "combined",
+    gif_path: str | Path | None = None,
+    phase2_start_epoch: int | None = None,
+    x_range: tuple[float, float] | None = None,
+    n_bins: int = 50,
+    ylabel: str | None = None,
+) -> "Path | None":
+    """Animated per-epoch histogram of a per-event quantity, with consistent colours.
 
-    Args:
-        val_mass_sum_history: List of ``(epoch, phase, values_array[, correct_mask])``
-            tuples where *values_array* contains ``mass_sum_flat`` at the
-            predicted assignment for each validation event.  The optional
-            fourth element is a boolean NumPy array aligned with *values_array*
-            (True = model chose the correct assignment).
-        phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
-            ``None`` for single-phase runs.
-        gif_path: Destination file path.  When ``None`` a timestamped path
-            inside ``plots/`` is generated automatically.
+    History entries are ``(epoch, phase, values, correct_mask, is_bkg[, achievable])``.
+    *subset* selects what each frame shows:
+
+      - ``"signal"``  : signal events only, a filled stack of correct (green) on
+                        the bottom and wrong (orange) on top.
+      - ``"qcd"``     : QCD/background events only, a single filled histogram (red).
+      - ``"combined"``: the signal correct/wrong stack (filled) PLUS the QCD
+                        distribution drawn as a separate **unfilled step outline**,
+                        area-normalised to the signal stack so the shapes compare.
+
+    *value_fn* maps the raw per-event values to the plotted quantity.  Returns
+    ``None`` when the chosen subset has no events in any frame (e.g. "qcd"/"combined"
+    on a signal-only run produce no QCD content; "qcd" returns None entirely).
     """
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.animation as animation
+        _init_plot_style(plt)
     except ImportError:
-        print("  Warning: matplotlib not available; skipping mass-sum GIF.")
+        print(f"  Warning: matplotlib not available; skipping {title_prefix} GIF.")
+        return None
+    if not history:
         return None
 
-    if not val_mass_sum_history:
+    import numpy as np
+    C = _HIST_COLORS
+
+    def _parts(entry):
+        vals = value_fn(np.asarray(entry[2]))
+        n = len(vals)
+        correct = entry[3] if len(entry) >= 4 else None
+        correct = np.asarray(correct, dtype=bool) if correct is not None else None
+        is_bkg = entry[4] if len(entry) >= 5 else None
+        is_bkg = np.asarray(is_bkg, dtype=bool) if is_bkg is not None else np.zeros(n, dtype=bool)
+        return entry[0], entry[1], vals, correct, is_bkg
+
+    parsed = [_parts(e) for e in history]
+
+    def _sel(vals, is_bkg):
+        if subset == "qcd":
+            return vals[is_bkg]
+        if subset == "signal":
+            return vals[~is_bkg]
+        return vals  # combined
+
+    usable = [p for p in parsed if len(_sel(p[2], p[4])) > 0]
+    if not usable:
         return None
 
     plots_dir = Path("plots")
     plots_dir.mkdir(exist_ok=True)
-
     if gif_path is None:
         ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
         commit = _get_git_commit_hash()
-        gif_path = plots_dir / f"mass_sum_anim_{ts}_{commit}.gif"
+        gif_path = plots_dir / f"{short_name}_{ts}_{commit}.gif"
     gif_path = Path(gif_path)
 
-    import numpy as np
-
-    # Unpack history: support both 3-tuple (legacy) and 4-tuple (with correct mask).
-    def _unpack(entry):
-        if len(entry) == 4:
-            return entry
-        return entry[0], entry[1], entry[2], None
-
-    # The average mass per candidate is mass_sum / 2.
-    all_avg_mass = [v / 2.0 for *_, v, _ in [_unpack(e) for e in val_mass_sum_history]]
-
-    # Fixed x-axis determined from the global data range (1st–99th percentile).
-    all_concat = np.concatenate(all_avg_mass)
-    x_min = float(np.percentile(all_concat, 1))
-    x_max = float(np.percentile(all_concat, 99))
-    if x_min >= x_max:
-        x_min, x_max = float(all_concat.min()), float(all_concat.max())
-    n_bins = 50
+    all_concat = np.concatenate([_sel(p[2], p[4]) for p in usable])
+    if x_range is not None:
+        x_min, x_max = x_range
+    else:
+        x_min = float(np.percentile(all_concat, 1))
+        x_max = float(np.percentile(all_concat, 99))
+        if x_min >= x_max:
+            x_min, x_max = float(all_concat.min()), float(all_concat.max()) + 1e-6
     bin_edges = np.linspace(x_min, x_max, n_bins + 1)
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    bar_width = (x_max - x_min) / n_bins
 
-    # Pre-compute total counts for every frame to fix the y-axis.
-    max_count = 0
-    for avg_mass in all_avg_mass:
-        counts, _ = np.histogram(avg_mass, bins=bin_edges)
-        if counts.max() > max_count:
-            max_count = int(counts.max())
-    y_max = max_count * 1.1
+    def _frame_hist(vals, correct, is_bkg):
+        sig = ~is_bkg
+        sig_corr = np.zeros(n_bins)
+        sig_wrong = np.zeros(n_bins)
+        qcd_out = np.zeros(n_bins)
+        if subset in ("signal", "combined"):
+            if correct is not None:
+                sig_corr = np.histogram(vals[sig & correct], bins=bin_edges)[0]
+                sig_wrong = np.histogram(vals[sig & ~correct], bins=bin_edges)[0]
+            else:
+                sig_corr = np.histogram(vals[sig], bins=bin_edges)[0]
+        qc_raw = np.histogram(vals[is_bkg], bins=bin_edges)[0]
+        if subset == "qcd":
+            qcd_out = qc_raw.astype(float)
+        elif subset == "combined":
+            sig_total = float(sig_corr.sum() + sig_wrong.sum())
+            qc_total = float(qc_raw.sum())
+            qcd_out = qc_raw * (sig_total / qc_total) if (qc_total > 0 and sig_total > 0) else qc_raw.astype(float)
+        return sig_corr, sig_wrong, qcd_out
+
+    y_max = 1.0
+    for _, _, vals, correct, is_bkg in usable:
+        sc, sw, qo = _frame_hist(vals, correct, is_bkg)
+        top = max(float((sc + sw).max()), float(qo.max()) if qo.size else 0.0)
+        y_max = max(y_max, top)
+    y_max *= 1.15
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    bar_width = (x_max - x_min) / n_bins
-    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 
     def _draw_frame(frame_idx):
-        epoch, phase, values, correct_mask = _unpack(val_mass_sum_history[frame_idx])
-        avg_mass = values / 2.0
+        epoch, phase, vals, correct, is_bkg = usable[frame_idx]
         ax.cla()
-        mean_val = float(avg_mass.mean())
-
-        if correct_mask is not None:
-            avg_correct   = avg_mass[correct_mask]
-            avg_incorrect = avg_mass[~correct_mask]
-            counts_correct,   _ = np.histogram(avg_correct,   bins=bin_edges)
-            counts_incorrect, _ = np.histogram(avg_incorrect, bins=bin_edges)
-            ax.bar(centers, counts_correct,   width=bar_width,
-                   color="mediumseagreen", alpha=0.85, align="center", label="Correct")
-            ax.bar(centers, counts_incorrect, width=bar_width,
-                   color="coral",           alpha=0.85, align="center", label="Incorrect",
-                   bottom=counts_correct)
-        else:
-            counts, _ = np.histogram(avg_mass, bins=bin_edges)
-            ax.bar(centers, counts, width=bar_width,
-                   color="mediumseagreen", alpha=0.75, align="center")
-
-        ax.axvline(mean_val, color="darkorange", linewidth=2.0,
-                   label=f"Mean = {mean_val:.3f}")
+        sc, sw, qo = _frame_hist(vals, correct, is_bkg)
+        # Filled areas have NO per-bar edge; the histogram envelope is drawn once
+        # as an unfilled step outline on top, for a clean ROOT-like look.
+        if subset in ("signal", "combined"):
+            ax.bar(centers, sc, width=bar_width, align="center", linewidth=0,
+                   facecolor=_rgba(C["signal_correct"], 0.82), label="Signal correct")
+            ax.bar(centers, sw, width=bar_width, align="center", bottom=sc, linewidth=0,
+                   facecolor=_rgba(C["signal_wrong"], 0.82), label="Signal wrong")
+            ax.stairs(sc, bin_edges, color=_edge(C["signal_correct"]), linewidth=1.1)
+            ax.stairs(sc + sw, bin_edges, color=_edge(C["signal_wrong"]), linewidth=1.1)
+        if subset == "qcd":
+            ax.bar(centers, qo, width=bar_width, align="center", linewidth=0,
+                   facecolor=_rgba(C["qcd"], 0.82), label="QCD background")
+            ax.stairs(qo, bin_edges, color=_edge(C["qcd"]), linewidth=1.1)
+        if subset == "combined" and qo.sum() > 0:
+            ax.stairs(qo, bin_edges, color=C["qcd"], linewidth=1.6,
+                      label="QCD (area-normalized)")
+        # Mean reference line(s) — thin, understated.
+        sig_vals = vals[~is_bkg]
+        qcd_vals = vals[is_bkg]
+        if subset in ("signal", "combined") and len(sig_vals):
+            m = float(sig_vals.mean())
+            ax.axvline(m, color=C["mean"], linewidth=1.3,
+                       label=f"{'Signal ' if subset == 'combined' else ''}mean = {m:.3f}")
+        if subset == "qcd" and len(qcd_vals):
+            m = float(qcd_vals.mean())
+            ax.axvline(m, color=C["mean"], linewidth=1.3, label=f"Mean = {m:.3f}")
+        if subset == "combined" and len(qcd_vals):
+            m = float(qcd_vals.mean())
+            ax.axvline(m, color=C["qcd"], linewidth=1.3, linestyle="--",
+                       label=f"QCD mean = {m:.3f}")
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(0, y_max)
-        ax.set_xlabel("Average candidate mass (m₁+m₂)/2 of chosen interpretation")
-        ax.set_ylabel("Validation events")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel or "Validation events")
         phase_label = ""
         if phase2_start_epoch is not None:
             phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
         elif phase == 2:
             phase_label = " [Phase 2]"
-        ax.set_title(f"Epoch {epoch}{phase_label}")
-        ax.legend(loc="upper right")
-        ax.grid(True, alpha=0.3)
+        ax.set_title(f"{title_prefix} — Epoch {epoch}{phase_label}", loc="left", fontsize=11)
+        ax.legend(loc="upper right", fontsize=11, frameon=False)
+        _style_axis(ax, grid_axis="y")
 
     anim = animation.FuncAnimation(
-        fig,
-        _draw_frame,
-        frames=len(val_mass_sum_history),
-        interval=200,
-        repeat=False,
+        fig, _draw_frame, frames=len(usable), interval=200, repeat=False
     )
-
     try:
         anim.save(str(gif_path), writer="pillow", fps=5)
-        print(f"  -> Saved mass sum GIF  : {gif_path}")
+        print(f"  -> Saved {title_prefix} GIF: {gif_path}")
         return gif_path
     except Exception as exc:
-        print(f"  Warning: could not save mass-sum GIF ({exc}). "
-              "Is pillow installed?  pip install pillow")
+        print(f"  Warning: could not save {title_prefix} GIF ({exc}).")
+        return None
+    finally:
+        plt.close(fig)
+
+
+def _trend_panels(asym_hist, mass_hist):
+    """Build the (history, transform, ylabel, title, show_achievable) panel list
+    for the combined trend plot: mass asymmetry and average candidate mass."""
+    return [
+        (asym_hist, lambda v: v,
+         r"Mass asymmetry $|m_1{-}m_2|/(m_1{+}m_2)$", "Mass asymmetry vs epoch", True),
+        (mass_hist, lambda v: v / 2.0,
+         r"Average candidate mass $(m_1{+}m_2)/2$", "Average candidate mass vs epoch", True),
+    ]
+
+
+def _make_trend_plot(
+    panels: list,
+    phase2_start_epoch: int | None = None,
+    out_path: str | Path | None = None,
+) -> "Path | None":
+    """Grid of mean(±1σ)-vs-epoch trends, each panel overlaying the signal and
+    QCD-background means (with markers), laid out two per row.
+
+    *panels* is a list of ``(history, transform, ylabel, title, show_achievable)``
+    tuples.  ``show_achievable`` adds the dashed QCD "best achievable" ceiling
+    (for the asymmetry / average-mass panels).  Returns ``None`` when there are
+    no validation events.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        _init_plot_style(plt)
+    except ImportError:
+        return None
+
+    import numpy as np
+
+    def _series(history, transform, subset):
+        xs, means, stds, ach = [], [], [], []
+        for entry in history:
+            vals = np.asarray(entry[2])
+            is_bkg = entry[4] if len(entry) >= 5 else None
+            is_bkg = np.asarray(is_bkg, dtype=bool) if is_bkg is not None else np.zeros(len(vals), dtype=bool)
+            sel = is_bkg if subset == "qcd" else ~is_bkg
+            if not sel.any():
+                continue
+            v = transform(vals[sel])
+            xs.append(entry[0])
+            means.append(float(v.mean()))
+            stds.append(float(v.std()))
+            ach_arr = entry[5] if len(entry) >= 6 else None
+            ach.append(float(transform(np.asarray(ach_arr)[sel]).mean())
+                       if ach_arr is not None else float("nan"))
+        return np.array(xs), np.array(means), np.array(stds), np.array(ach)
+
+    subsets = [("signal", "Signal", _HIST_COLORS["signal_correct"]),
+               ("qcd", "QCD background", _HIST_COLORS["qcd"])]
+
+    n = len(panels)
+    ncols = 2 if n > 1 else 1
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6.2 * ncols, 4.6 * nrows), squeeze=False)
+    axes_flat = list(axes.ravel())
+    any_data = False
+    for ax, (history, transform, ylabel, title, show_ach) in zip(axes_flat, panels):
+        for subset, label, color in subsets:
+            e, m, s, a = _series(history, transform, subset)
+            if not len(e):
+                continue
+            any_data = True
+            ax.plot(e, m, label=f"{label} mean", marker="o", markersize=4,
+                    markeredgecolor="white", markeredgewidth=0.6, linewidth=1.6, color=color)
+            ax.fill_between(e, m - s, m + s, facecolor=_rgba(color, 0.15),
+                            edgecolor=_rgba(color, 0.45), linewidth=0.6)
+            # The "best achievable" ceiling is only meaningful for QCD (how far it
+            # could be pushed out); the signal max-asymmetry ceiling is not useful.
+            if show_ach and subset == "qcd" and np.isfinite(a).any():
+                ax.plot(e, a, "--", marker="o", markersize=3, color=color, alpha=0.55,
+                        label=f"{label} best achievable")
+        if phase2_start_epoch is not None:
+            ax.axvline(phase2_start_epoch, color="#777777", linestyle=":", linewidth=1.0,
+                       label="Phase 2 start")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, loc="left")
+        _style_axis(ax, grid_axis="both")
+        ax.legend(loc="best", frameon=False, fontsize=10)
+    for ax in axes_flat[n:]:
+        ax.set_visible(False)
+    if not any_data:
+        plt.close(fig)
+        return None
+    fig.tight_layout()
+
+    plots_dir = Path("plots")
+    plots_dir.mkdir(exist_ok=True)
+    if out_path is None:
+        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        commit = _get_git_commit_hash()
+        out_path = plots_dir / f"trends_{ts}_{commit}.pdf"
+    out_path = Path(out_path)
+    try:
+        fig.savefig(str(out_path))
+        print(f"  -> Saved trend plot: {out_path}")
+        return out_path
+    except Exception as exc:
+        print(f"  Warning: could not save trend plot ({exc}).")
         return None
     finally:
         plt.close(fig)
@@ -1162,138 +1491,19 @@ def _make_max_triplet_pt_gif(
     phase2_start_epoch: int | None = None,
     gif_path: str | Path | None = None,
 ) -> "Path | None":
-    """Build an animated GIF of the max-triplet scalar-sum-pT distribution.
-
-    For each event the scalar sum pT of each of the two triplets in the
-    predicted interpretation is computed and the larger of the two is
-    recorded.  Each frame shows the histogram of this quantity over all
-    validation events for that epoch.  When a per-event correctness mask is
-    available (4-tuple history entries) the bars are stacked by correct vs
-    incorrect network outputs.  A vertical line marks the per-epoch mean.
-    When two-phase training was used, frames from Phase 2 onward carry a
-    "Phase 2" annotation so the transition is immediately visible.
-
-    When *gif_path* is ``None`` the file is written to
-    ``plots/max_triplet_pt_anim_{timestamp}_{commit}.gif``; pass an explicit
-    path (e.g. ``plots/max_triplet_pt_anim_latest.gif``) to overwrite a fixed
-    file on every call.  Requires ``pillow`` (pip install pillow).
-
-    Args:
-        val_max_triplet_pt_history: List of ``(epoch, phase, values_array[, correct_mask])``
-            tuples where *values_array* contains the max-triplet scalar-sum pT at the
-            predicted assignment for each validation event.  The optional
-            fourth element is a boolean NumPy array aligned with *values_array*
-            (True = model chose the correct assignment).
-        phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
-            ``None`` for single-phase runs.
-        gif_path: Destination file path.  When ``None`` a timestamped path
-            inside ``plots/`` is generated automatically.
-    """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import matplotlib.animation as animation
-    except ImportError:
-        print("  Warning: matplotlib not available; skipping max-triplet-pT GIF.")
-        return None
-
-    if not val_max_triplet_pt_history:
-        return None
-
-    plots_dir = Path("plots")
-    plots_dir.mkdir(exist_ok=True)
-
-    if gif_path is None:
-        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        commit = _get_git_commit_hash()
-        gif_path = plots_dir / f"max_triplet_pt_anim_{ts}_{commit}.gif"
-    gif_path = Path(gif_path)
-
-    import numpy as np
-
-    # Unpack history: support both 3-tuple (legacy) and 4-tuple (with correct mask).
-    def _unpack(entry):
-        if len(entry) == 4:
-            return entry
-        return entry[0], entry[1], entry[2], None
-
-    all_values = [_unpack(e)[2] for e in val_max_triplet_pt_history]
-
-    # Fixed x-axis determined from the global data range (1st–99th percentile).
-    all_concat = np.concatenate(all_values)
-    x_min = float(np.percentile(all_concat, 1))
-    x_max = float(np.percentile(all_concat, 99))
-    if x_min >= x_max:
-        x_min, x_max = float(all_concat.min()), float(all_concat.max())
-    n_bins = 50
-    bin_edges = np.linspace(x_min, x_max, n_bins + 1)
-
-    # Pre-compute total counts for every frame to fix the y-axis.
-    max_count = 0
-    for vals in all_values:
-        counts, _ = np.histogram(vals, bins=bin_edges)
-        if counts.max() > max_count:
-            max_count = int(counts.max())
-    y_max = max_count * 1.1
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bar_width = (x_max - x_min) / n_bins
-    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-    def _draw_frame(frame_idx):
-        epoch, phase, values, correct_mask = _unpack(val_max_triplet_pt_history[frame_idx])
-        ax.cla()
-        mean_val = float(values.mean())
-
-        if correct_mask is not None:
-            vals_correct   = values[correct_mask]
-            vals_incorrect = values[~correct_mask]
-            counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
-            counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
-            ax.bar(centers, counts_correct,   width=bar_width,
-                   color="mediumorchid", alpha=0.85, align="center", label="Correct")
-            ax.bar(centers, counts_incorrect, width=bar_width,
-                   color="coral",        alpha=0.85, align="center", label="Incorrect",
-                   bottom=counts_correct)
-        else:
-            counts, _ = np.histogram(values, bins=bin_edges)
-            ax.bar(centers, counts, width=bar_width,
-                   color="mediumorchid", alpha=0.75, align="center")
-
-        ax.axvline(mean_val, color="darkorange", linewidth=2.0,
-                   label=f"Mean = {mean_val:.3f}")
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(0, y_max)
-        ax.set_xlabel("Max-triplet scalar sum pT of chosen interpretation")
-        ax.set_ylabel("Validation events")
-        phase_label = ""
-        if phase2_start_epoch is not None:
-            phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
-        elif phase == 2:
-            phase_label = " [Phase 2]"
-        ax.set_title(f"Epoch {epoch}{phase_label}")
-        ax.legend(loc="upper right")
-        ax.grid(True, alpha=0.3)
-
-    anim = animation.FuncAnimation(
-        fig,
-        _draw_frame,
-        frames=len(val_max_triplet_pt_history),
-        interval=200,
-        repeat=False,
+    """Combined max-triplet scalar-sum-pT animation: signal correct/wrong stack
+    plus the area-normalised QCD outline (signal AND QCD shown together)."""
+    return _make_distribution_gif(
+        val_max_triplet_pt_history,
+        value_fn=lambda v: v,
+        xlabel="Max-triplet scalar sum pT of chosen interpretation",
+        title_prefix="Max-triplet scalar-sum pT",
+        short_name="max_triplet_pt_anim",
+        subset="combined",
+        x_range=None,
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
     )
-
-    try:
-        anim.save(str(gif_path), writer="pillow", fps=5)
-        print(f"  -> Saved max-triplet-pT GIF: {gif_path}")
-        return gif_path
-    except Exception as exc:
-        print(f"  Warning: could not save max-triplet-pT GIF ({exc}). "
-              "Is pillow installed?  pip install pillow")
-        return None
-    finally:
-        plt.close(fig)
 
 
 def _make_delta_phi_gif(
@@ -1301,128 +1511,18 @@ def _make_delta_phi_gif(
     phase2_start_epoch: int | None = None,
     gif_path: str | Path | None = None,
 ) -> "Path | None":
-    """Build an animated GIF of the Δφ distribution between the two parent candidates.
-
-    For each event Δφ = |φ(triplet1) − φ(triplet2)| is folded into [0, π],
-    where φᵢ = atan2(ΣPy, ΣPx) over the jets assigned to candidate i.  Each
-    frame shows a histogram over all validation events for that epoch.  When a
-    per-event correctness mask is available (4-tuple history entries) the bars
-    are stacked by correct vs incorrect network outputs.  A vertical line marks
-    the per-epoch mean.  When two-phase training was used, frames from Phase 2
-    onward carry a "Phase 2" annotation.
-
-    When *gif_path* is ``None`` the file is written to
-    ``plots/delta_phi_anim_{timestamp}_{commit}.gif``.  Requires ``pillow``
-    (pip install pillow).
-
-    Args:
-        val_delta_phi_history: List of ``(epoch, phase, values_array[, correct_mask])``
-            tuples where *values_array* contains the per-event Δφ in [0, π].
-            The optional fourth element is a boolean NumPy array (True = correct).
-        phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
-            ``None`` for single-phase runs.
-        gif_path: Destination file path.  When ``None`` a timestamped path
-            inside ``plots/`` is generated automatically.
-    """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import matplotlib.animation as animation
-    except ImportError:
-        print("  Warning: matplotlib not available; skipping Δφ GIF.")
-        return None
-
-    if not val_delta_phi_history:
-        return None
-
-    plots_dir = Path("plots")
-    plots_dir.mkdir(exist_ok=True)
-
-    if gif_path is None:
-        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        commit = _get_git_commit_hash()
-        gif_path = plots_dir / f"delta_phi_anim_{ts}_{commit}.gif"
-    gif_path = Path(gif_path)
-
-    import numpy as np
-    import math as _math_gif
-
-    def _unpack(entry):
-        if len(entry) == 4:
-            return entry
-        return entry[0], entry[1], entry[2], None
-
-    x_min, x_max = 0.0, _math_gif.pi
-    n_bins = 50
-    bin_edges = np.linspace(x_min, x_max, n_bins + 1)
-
-    # Pre-compute total counts to fix the y-axis.
-    max_count = 0
-    for entry in val_delta_phi_history:
-        _, _, values, _ = _unpack(entry)
-        counts, _ = np.histogram(values, bins=bin_edges)
-        if counts.max() > max_count:
-            max_count = int(counts.max())
-    y_max = max_count * 1.1
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bar_width = (x_max - x_min) / n_bins
-    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-    def _draw_frame(frame_idx):
-        epoch, phase, values, correct_mask = _unpack(val_delta_phi_history[frame_idx])
-        ax.cla()
-        mean_val = float(values.mean())
-
-        if correct_mask is not None:
-            vals_correct   = values[correct_mask]
-            vals_incorrect = values[~correct_mask]
-            counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
-            counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
-            ax.bar(centers, counts_correct,   width=bar_width,
-                   color="steelblue", alpha=0.85, align="center", label="Correct")
-            ax.bar(centers, counts_incorrect, width=bar_width,
-                   color="coral",     alpha=0.85, align="center", label="Incorrect",
-                   bottom=counts_correct)
-        else:
-            counts, _ = np.histogram(values, bins=bin_edges)
-            ax.bar(centers, counts, width=bar_width,
-                   color="steelblue", alpha=0.75, align="center")
-
-        ax.axvline(mean_val, color="darkorange", linewidth=2.0,
-                   label=f"Mean = {mean_val:.3f}")
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(0, y_max)
-        ax.set_xlabel("Δφ between parent candidates (rad)")
-        ax.set_ylabel("Validation events")
-        phase_label = ""
-        if phase2_start_epoch is not None:
-            phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
-        elif phase == 2:
-            phase_label = " [Phase 2]"
-        ax.set_title(f"Epoch {epoch}{phase_label}")
-        ax.legend(loc="upper left")
-        ax.grid(True, alpha=0.3)
-
-    anim = animation.FuncAnimation(
-        fig,
-        _draw_frame,
-        frames=len(val_delta_phi_history),
-        interval=200,
-        repeat=False,
+    """Combined Δφ animation: signal correct/wrong stack + area-normalised QCD outline."""
+    return _make_distribution_gif(
+        val_delta_phi_history,
+        value_fn=lambda v: v,
+        xlabel=r"$\Delta\phi$ between parent candidates (rad)",
+        title_prefix=r"$\Delta\phi$ between parent candidates",
+        short_name="delta_phi_anim",
+        subset="combined",
+        x_range=(0.0, math.pi),
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
     )
-
-    try:
-        anim.save(str(gif_path), writer="pillow", fps=5)
-        print(f"  -> Saved Δφ GIF        : {gif_path}")
-        return gif_path
-    except Exception as exc:
-        print(f"  Warning: could not save Δφ GIF ({exc}). "
-              "Is pillow installed?  pip install pillow")
-        return None
-    finally:
-        plt.close(fig)
 
 
 def _make_democracy_gif(
@@ -1430,127 +1530,148 @@ def _make_democracy_gif(
     phase2_start_epoch: int | None = None,
     gif_path: str | Path | None = None,
 ) -> "Path | None":
-    """Build an animated GIF of the pT-democracy distribution.
+    """Combined pT-democracy animation: signal correct/wrong stack + area-normalised QCD outline."""
+    return _make_distribution_gif(
+        val_democracy_history,
+        value_fn=lambda v: v,
+        xlabel="pT democracy = avg(min pT / max pT) per triplet",
+        title_prefix="pT democracy",
+        short_name="democracy_anim",
+        subset="combined",
+        x_range=(0.0, 1.0),
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
+    )
 
-    For each event the pT-democracy of a triplet is defined as
-    ``min(pT) / max(pT)`` over its three jets, which equals 1 when all jets
-    carry equal pT and approaches 0 when one jet dominates.  The per-event
-    score is the average democracy across the two triplets in the predicted
-    assignment.  Each frame shows a histogram over all validation events for
-    that epoch.  When a per-event correctness mask is available (4-tuple
-    history entries) the bars are stacked by correct vs incorrect outputs.
-    A vertical line marks the per-epoch mean.  When two-phase training was
-    used, frames from Phase 2 onward carry a "Phase 2" annotation.
 
-    When *gif_path* is ``None`` the file is written to
-    ``plots/democracy_anim_{timestamp}_{commit}.gif``.  Requires ``pillow``
-    (pip install pillow).
+def _make_max_boost_gif(
+    val_max_boost_history: list,
+    phase2_start_epoch: int | None = None,
+    gif_path: str | Path | None = None,
+) -> "Path | None":
+    """Combined animation of the larger triplet Lorentz boost γ=E/m (signal + QCD)."""
+    return _make_distribution_gif(
+        val_max_boost_history,
+        value_fn=lambda v: v,
+        xlabel="Max triplet Lorentz boost  γ = E/m",
+        title_prefix="Max triplet boost",
+        short_name="max_boost_anim",
+        subset="combined",
+        x_range=None,
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
+    )
 
-    Args:
-        val_democracy_history: List of ``(epoch, phase, values_array[, correct_mask])``
-            tuples where *values_array* contains the per-event average pT
-            democracy in (0, 1].  The optional fourth element is a boolean
-            NumPy array (True = correct).
-        phase2_start_epoch: 1-based epoch index at which Phase 2 began, or
-            ``None`` for single-phase runs.
-        gif_path: Destination file path.  When ``None`` a timestamped path
-            inside ``plots/`` is generated automatically.
+
+def _make_avg_boost_gif(
+    val_avg_boost_history: list,
+    phase2_start_epoch: int | None = None,
+    gif_path: str | Path | None = None,
+) -> "Path | None":
+    """Combined animation of the average triplet Lorentz boost γ=E/m (signal + QCD)."""
+    return _make_distribution_gif(
+        val_avg_boost_history,
+        value_fn=lambda v: v,
+        xlabel="Average triplet Lorentz boost  γ = E/m",
+        title_prefix="Average triplet boost",
+        short_name="avg_boost_anim",
+        subset="combined",
+        x_range=None,
+        gif_path=gif_path,
+        phase2_start_epoch=phase2_start_epoch,
+    )
+
+
+def _make_dalitz_gif(
+    val_dalitz_history: list,
+    phase2_start_epoch: int | None = None,
+    gif_path: str | Path | None = None,
+) -> "Path | None":
+    """Animated two-panel Dalitz plot (Signal | QCD) over epochs.
+
+    For each parent-candidate triplet the jets are pT-ordered and the normalised
+    pairwise invariant-mass-squared are plotted: x = m²(lead,sub)/M²,
+    y = m²(lead,third)/M².  Each event contributes its two triplets.  A genuine
+    3-body decay fills the Dalitz interior, while combinatorial/QCD triplets
+    cluster near the low-mass edges — so the two panels (and their evolution over
+    epochs) reveal whether the network's chosen groupings have real 3-body
+    structure.  Each panel's colour scale is fixed across frames for comparability.
+
+    *val_dalitz_history* entries are ``(epoch, phase, x, y, is_bkg)`` with x, y of
+    shape (N, 2) (the two triplets per event) and is_bkg of shape (N,).
     """
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.animation as animation
+        _init_plot_style(plt)
     except ImportError:
-        print("  Warning: matplotlib not available; skipping democracy GIF.")
         return None
-
-    if not val_democracy_history:
+    if not val_dalitz_history:
         return None
-
-    plots_dir = Path("plots")
-    plots_dir.mkdir(exist_ok=True)
-
-    if gif_path is None:
-        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        commit = _get_git_commit_hash()
-        gif_path = plots_dir / f"democracy_anim_{ts}_{commit}.gif"
-    gif_path = Path(gif_path)
 
     import numpy as np
 
-    def _unpack(entry):
-        if len(entry) == 4:
-            return entry
-        return entry[0], entry[1], entry[2], None
+    lim = 1.05
+    nb = 44
+    edges = np.linspace(0.0, lim, nb + 1)
 
-    x_min, x_max = 0.0, 1.0
-    n_bins = 50
-    bin_edges = np.linspace(x_min, x_max, n_bins + 1)
-
-    # Pre-compute total counts to fix the y-axis.
-    max_count = 0
-    for entry in val_democracy_history:
-        _, _, values, _ = _unpack(entry)
-        counts, _ = np.histogram(values, bins=bin_edges)
-        if counts.max() > max_count:
-            max_count = int(counts.max())
-    y_max = max_count * 1.1
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bar_width = (x_max - x_min) / n_bins
-    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-    def _draw_frame(frame_idx):
-        epoch, phase, values, correct_mask = _unpack(val_democracy_history[frame_idx])
-        ax.cla()
-        mean_val = float(values.mean())
-
-        if correct_mask is not None:
-            vals_correct   = values[correct_mask]
-            vals_incorrect = values[~correct_mask]
-            counts_correct,   _ = np.histogram(vals_correct,   bins=bin_edges)
-            counts_incorrect, _ = np.histogram(vals_incorrect, bins=bin_edges)
-            ax.bar(centers, counts_correct,   width=bar_width,
-                   color="mediumseagreen", alpha=0.85, align="center", label="Correct")
-            ax.bar(centers, counts_incorrect, width=bar_width,
-                   color="coral",           alpha=0.85, align="center", label="Incorrect",
-                   bottom=counts_correct)
+    def _counts(entry):
+        epoch, phase, x, y, bk = entry
+        x = np.asarray(x, dtype=float).reshape(-1)
+        y = np.asarray(y, dtype=float).reshape(-1)
+        if bk is not None:
+            b = np.asarray(bk, dtype=bool).reshape(-1)
+            bkg = np.repeat(b, 2) if b.size * 2 == x.size else np.zeros(x.size, dtype=bool)
         else:
-            counts, _ = np.histogram(values, bins=bin_edges)
-            ax.bar(centers, counts, width=bar_width,
-                   color="mediumseagreen", alpha=0.75, align="center")
+            bkg = np.zeros(x.size, dtype=bool)
+        hs, _, _ = np.histogram2d(x[~bkg], y[~bkg], bins=[edges, edges])
+        hq, _, _ = np.histogram2d(x[bkg], y[bkg], bins=[edges, edges])
+        return epoch, phase, hs.T, hq.T  # transpose -> rows = y for imshow
 
-        ax.axvline(mean_val, color="darkorange", linewidth=2.0,
-                   label=f"Mean = {mean_val:.3f}")
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(0, y_max)
-        ax.set_xlabel("pT democracy = avg(min pT / max pT) per triplet")
-        ax.set_ylabel("Validation events")
-        phase_label = ""
-        if phase2_start_epoch is not None:
-            phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
-        elif phase == 2:
-            phase_label = " [Phase 2]"
-        ax.set_title(f"Epoch {epoch}{phase_label}")
-        ax.legend(loc="upper left")
-        ax.grid(True, alpha=0.3)
+    frames = [_counts(e) for e in val_dalitz_history]
+    vmax_s = max((float(f[2].max()) for f in frames if f[2].size), default=1.0) or 1.0
+    vmax_q = max((float(f[3].max()) for f in frames if f[3].size), default=1.0) or 1.0
 
-    anim = animation.FuncAnimation(
-        fig,
-        _draw_frame,
-        frames=len(val_democracy_history),
-        interval=200,
-        repeat=False,
-    )
+    plots_dir = Path("plots")
+    plots_dir.mkdir(exist_ok=True)
+    if gif_path is None:
+        ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        commit = _get_git_commit_hash()
+        gif_path = plots_dir / f"dalitz_anim_{ts}_{commit}.gif"
+    gif_path = Path(gif_path)
 
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 5.4))
+
+    def _draw_frame(i):
+        epoch, phase, hs, hq = frames[i]
+        for ax, h, cmap, label, vmax in (
+            (a1, hs, "Greens", "Signal", vmax_s),
+            (a2, hq, "OrRd", "QCD background", vmax_q),
+        ):
+            ax.cla()
+            ax.imshow(h, origin="lower", extent=(0, lim, 0, lim), cmap=cmap,
+                      vmin=0.0, vmax=vmax, aspect="auto", interpolation="nearest")
+            phase_label = ""
+            if phase2_start_epoch is not None:
+                phase_label = " [Phase 2]" if epoch >= phase2_start_epoch else " [Phase 1]"
+            elif phase == 2:
+                phase_label = " [Phase 2]"
+            ax.set_xlabel(r"$m^2(\mathrm{lead,sub})\,/\,M^2$")
+            ax.set_ylabel(r"$m^2(\mathrm{lead,third})\,/\,M^2$")
+            ax.set_title(f"{label} Dalitz — Epoch {epoch}{phase_label}", loc="left")
+            _style_axis(ax, grid_axis="both")
+            ax.set_xlim(0, lim)
+            ax.set_ylim(0, lim)
+
+    anim = animation.FuncAnimation(fig, _draw_frame, frames=len(frames), interval=250, repeat=False)
     try:
-        anim.save(str(gif_path), writer="pillow", fps=5)
-        print(f"  -> Saved democracy GIF : {gif_path}")
+        anim.save(str(gif_path), writer="pillow", fps=4)
+        print(f"  -> Saved Dalitz GIF: {gif_path}")
         return gif_path
     except Exception as exc:
-        print(f"  Warning: could not save democracy GIF ({exc}). "
-              "Is pillow installed?  pip install pillow")
+        print(f"  Warning: could not save Dalitz GIF ({exc}).")
         return None
     finally:
         plt.close(fig)
@@ -1590,6 +1711,7 @@ def _plot_training_curves(
         import matplotlib
         matplotlib.use("Agg")  # non-interactive backend, safe in all environments
         import matplotlib.pyplot as plt
+        _init_plot_style(plt)
     except ImportError:
         print("  Warning: matplotlib not available; skipping training curve plots.")
         return []
@@ -1642,6 +1764,19 @@ def _plot_training_curves(
         print("  Warning: empty training log; skipping plots.")
         return []
 
+    # Draw every trend curve below with point markers, consistent with the
+    # QCD/signal trend plots.  Saved and restored at the end so the marker style
+    # does not leak into the GIF mean lines drawn later in the same epoch.
+    _marker_keys = ("lines.marker", "lines.markersize", "lines.markeredgecolor",
+                    "lines.markeredgewidth")
+    _saved_rc = {k: plt.rcParams[k] for k in _marker_keys}
+    plt.rcParams.update({
+        "lines.marker": "o",
+        "lines.markersize": 3.5,
+        "lines.markeredgecolor": "white",
+        "lines.markeredgewidth": 0.5,
+    })
+
     # --- Output directory and file tag ---
     if tag is None:
         ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -1668,7 +1803,7 @@ def _plot_training_curves(
                 color="gray",
                 linestyle="--",
                 linewidth=1.2,
-                label="Phase 1 → 2" if idx == 0 else None,
+                label=r"Phase 1 $\rightarrow$ 2" if idx == 0 else None,
             )
 
     saved_paths: list[Path] = []
@@ -1682,8 +1817,12 @@ def _plot_training_curves(
     ax.set_ylabel("Loss")
     ax.set_yscale("log")
     ax.set_title("Loss vs Epoch")
-    ax.legend()
-    ax.grid(True, alpha=0.3, which="both")
+    # Plain-decimal log ticks (avoid mathtext 10^{-n} minus missing from serif fonts).
+    from matplotlib import ticker as _mticker
+    ax.yaxis.set_major_formatter(_mticker.FuncFormatter(lambda y, _pos: f"{y:g}"))
+    ax.yaxis.set_minor_formatter(_mticker.NullFormatter())
+    ax.legend(frameon=False)
+    _style_axis(ax)
     fig.tight_layout()
     loss_path = plots_dir / f"loss_{tag}.pdf"
     fig.savefig(loss_path)
@@ -1699,8 +1838,8 @@ def _plot_training_curves(
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Accuracy")
     ax.set_title("Accuracy vs Epoch")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.legend(frameon=False)
+    _style_axis(ax)
     fig.tight_layout()
     acc_path = plots_dir / f"accuracy_{tag}.pdf"
     fig.savefig(acc_path)
@@ -1726,7 +1865,7 @@ def _plot_training_curves(
             asym_epochs,
             [m - s for m, s in zip(asym_train_avg, asym_train_std)],
             [m + s for m, s in zip(asym_train_avg, asym_train_std)],
-            color="steelblue", alpha=0.2, label="Train ±1σ",
+            color="steelblue", alpha=0.2, label=r"Train $\pm1\sigma$",
         )
 
         # Val: line + ±1σ shaded band
@@ -1735,7 +1874,7 @@ def _plot_training_curves(
             asym_epochs,
             [m - s for m, s in zip(asym_val_avg, asym_val_std)],
             [m + s for m, s in zip(asym_val_avg, asym_val_std)],
-            color="darkorange", alpha=0.2, label="Val ±1σ",
+            color="darkorange", alpha=0.2, label=r"Val $\pm1\sigma$",
         )
 
         _add_phase_lines(ax)
@@ -1743,8 +1882,13 @@ def _plot_training_curves(
         ax.set_ylabel("Mass asymmetry of chosen interpretation")
         ax.set_title("Mass Asymmetry of Chosen Interpretation vs Epoch")
         ax.set_yscale("log")
-        ax.legend()
-        ax.grid(True, alpha=0.3, which="both")
+        # Render log-axis ticks as plain decimals (avoids mathtext 10^{-n} whose
+        # minus sign is missing from refined serif fonts like Garamond).
+        from matplotlib import ticker as _mticker
+        ax.yaxis.set_major_formatter(_mticker.FuncFormatter(lambda y, _pos: f"{y:g}"))
+        ax.yaxis.set_minor_formatter(_mticker.NullFormatter())
+        ax.legend(frameon=False)
+        _style_axis(ax)
         fig.tight_layout()
         asym_path = plots_dir / f"mass_asym_{tag}.pdf"
         fig.savefig(asym_path)
@@ -1767,8 +1911,8 @@ def _plot_training_curves(
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Grouping accuracy")
         ax.set_title("GRP Score (Grouping Accuracy) vs Epoch")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.legend(frameon=False)
+        _style_axis(ax)
         fig.tight_layout()
         grp_path = plots_dir / f"grp_acc_{tag}.pdf"
         fig.savefig(grp_path)
@@ -1791,7 +1935,7 @@ def _plot_training_curves(
             mpt_epochs,
             [m - s for m, s in zip(mpt_train_avg, mpt_train_std)],
             [m + s for m, s in zip(mpt_train_avg, mpt_train_std)],
-            color="steelblue", alpha=0.2, label="Train ±1σ",
+            color="steelblue", alpha=0.2, label=r"Train $\pm1\sigma$",
         )
 
         ax.plot(mpt_epochs, mpt_val_avg, label="Val mean max-triplet pT", color="darkorange")
@@ -1799,15 +1943,15 @@ def _plot_training_curves(
             mpt_epochs,
             [m - s for m, s in zip(mpt_val_avg, mpt_val_std)],
             [m + s for m, s in zip(mpt_val_avg, mpt_val_std)],
-            color="darkorange", alpha=0.2, label="Val ±1σ",
+            color="darkorange", alpha=0.2, label=r"Val $\pm1\sigma$",
         )
 
         _add_phase_lines(ax)
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Max-triplet scalar sum pT of chosen interpretation")
         ax.set_title("Max-Triplet Scalar Sum pT of Chosen Interpretation vs Epoch")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.legend(frameon=False)
+        _style_axis(ax)
         fig.tight_layout()
         mpt_path = plots_dir / f"max_triplet_pt_{tag}.pdf"
         fig.savefig(mpt_path)
@@ -1824,26 +1968,26 @@ def _plot_training_curves(
         dphi_val_std   = [v for e, v in zip(epochs, val_std_dphi)   if e in set(dphi_epochs) and not _math2.isnan(v)]
 
         fig, ax = plt.subplots(figsize=(9, 5))
-        ax.plot(dphi_epochs, dphi_train_avg, label="Train mean Δφ", color="steelblue")
+        ax.plot(dphi_epochs, dphi_train_avg, label=r"Train mean $\Delta\phi$", color="steelblue")
         ax.fill_between(
             dphi_epochs,
             [m - s for m, s in zip(dphi_train_avg, dphi_train_std)],
             [m + s for m, s in zip(dphi_train_avg, dphi_train_std)],
-            color="steelblue", alpha=0.2, label="Train ±1σ",
+            color="steelblue", alpha=0.2, label=r"Train $\pm1\sigma$",
         )
-        ax.plot(dphi_epochs, dphi_val_avg, label="Val mean Δφ", color="darkorange")
+        ax.plot(dphi_epochs, dphi_val_avg, label=r"Val mean $\Delta\phi$", color="darkorange")
         ax.fill_between(
             dphi_epochs,
             [m - s for m, s in zip(dphi_val_avg, dphi_val_std)],
             [m + s for m, s in zip(dphi_val_avg, dphi_val_std)],
-            color="darkorange", alpha=0.2, label="Val ±1σ",
+            color="darkorange", alpha=0.2, label=r"Val $\pm1\sigma$",
         )
         _add_phase_lines(ax)
         ax.set_xlabel("Epoch")
-        ax.set_ylabel("Δφ between parent candidates (rad)")
-        ax.set_title("Δφ Between Parent Candidates of Chosen Interpretation vs Epoch")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.set_ylabel(r"$\Delta\phi$ between parent candidates (rad)")
+        ax.set_title(r"$\Delta\phi$ Between Parent Candidates of Chosen Interpretation vs Epoch")
+        ax.legend(frameon=False)
+        _style_axis(ax)
         fig.tight_layout()
         dphi_path = plots_dir / f"delta_phi_{tag}.pdf"
         fig.savefig(dphi_path)
@@ -1865,21 +2009,21 @@ def _plot_training_curves(
             dem_epochs,
             [m - s for m, s in zip(dem_train_avg, dem_train_std)],
             [m + s for m, s in zip(dem_train_avg, dem_train_std)],
-            color="mediumseagreen", alpha=0.2, label="Train ±1σ",
+            color="mediumseagreen", alpha=0.2, label=r"Train $\pm1\sigma$",
         )
         ax.plot(dem_epochs, dem_val_avg, label="Val mean democracy", color="darkorange")
         ax.fill_between(
             dem_epochs,
             [m - s for m, s in zip(dem_val_avg, dem_val_std)],
             [m + s for m, s in zip(dem_val_avg, dem_val_std)],
-            color="darkorange", alpha=0.2, label="Val ±1σ",
+            color="darkorange", alpha=0.2, label=r"Val $\pm1\sigma$",
         )
         _add_phase_lines(ax)
         ax.set_xlabel("Epoch")
         ax.set_ylabel("pT democracy = avg(min pT / max pT) per triplet")
         ax.set_title("pT Democracy of Chosen Interpretation vs Epoch")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.legend(frameon=False)
+        _style_axis(ax)
         fig.tight_layout()
         dem_path = plots_dir / f"democracy_{tag}.pdf"
         fig.savefig(dem_path)
@@ -1887,6 +2031,7 @@ def _plot_training_curves(
         print(f"  -> Saved democracy plot: {dem_path}")
         saved_paths.append(dem_path)
 
+    plt.rcParams.update(_saved_rc)
     return saved_paths
 
 
@@ -1895,6 +2040,7 @@ def _run_epoch(
     tf_ratio=1.0, lambda_sym=0.0, lambda_qcd=0.0, lambda_isr=1.0, lambda_isr_direct=0.0,
     lambda_distill=0.0, distill_temperature=4.0,
     lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
+    lambda_bg=0.0, beta_bg=1.0, bg_soft_weight=1.0, bg_asym_cut=0.0,
     phase1_only=False,
     pt_smear_frac=0.0,
 ):
@@ -1921,14 +2067,43 @@ def _run_epoch(
     all_pred_max_triplet_pt = []
     all_pred_delta_phi = []
     all_pred_democracy = []
+    all_pred_max_boost = []
+    all_pred_avg_boost = []
+    all_pred_dalitz_x = []   # validation only; per-event (B, 2) for the two triplets
+    all_pred_dalitz_y = []
     all_mass_pred = []
     all_mass_true = []
+    all_pred_is_bkg = []
+    all_pred_asym_max = []   # per-event achievable max asymmetry (over assignments)
+    all_pred_mass_min = []   # per-event achievable min mass_sum (over assignments)
+    total_sig_samples = 0
     factored = model.has_isr
+    # Label smoothing used by ce_loss_fn, replicated here so the per-event
+    # cross-entropies (needed for signal/background masking) match the
+    # scalar ce_loss_fn exactly when no background events are present.
+    label_smoothing = getattr(ce_loss_fn, "label_smoothing", 0.0)
+
+    def _masked_mean(per_event, mask):
+        """Mean of a per-event (B,) tensor over the events selected by *mask*.
+
+        Returns 0 (no loss contribution, no gradient) when the mask is empty,
+        so an all-signal or all-background batch is handled gracefully.
+        """
+        mask_f = mask.to(per_event.dtype)
+        return (per_event * mask_f).sum() / mask_f.sum().clamp(min=1.0)
 
     for batch in loader:
         four_mom = batch["four_momenta"].to(device)
         labels = batch["label"].to(device)
         parent_mass = batch["parent_mass"].to(device)
+        # Per-event signal/background tag.  Background (QCD) events have no truth
+        # assignment: they are excluded from the supervised loss and instead
+        # drive the background-rejection term.  Default all-signal when absent.
+        if "is_background" in batch:
+            is_bkg = batch["is_background"].to(device).bool()
+        else:
+            is_bkg = torch.zeros(labels.shape[0], dtype=torch.bool, device=device)
+        sig_mask = ~is_bkg
 
         # φ/η augmentation during training (hard symmetries of the problem)
         if optimizer is not None:
@@ -2020,8 +2195,8 @@ def _run_epoch(
                 batch_idx = torch.arange(labels.shape[0], device=device)
                 gt_grp_logits = grouping_logits[batch_idx, isr_labels]
                 grouping_labels = model.flat_to_factored[labels, 1]
-                total_isr_correct += (isr_logits.argmax(dim=-1) == isr_labels).sum().item()
-                total_grp_correct += (gt_grp_logits.argmax(dim=-1) == grouping_labels).sum().item()
+                total_isr_correct += ((isr_logits.argmax(dim=-1) == isr_labels) & sig_mask).sum().item()
+                total_grp_correct += ((gt_grp_logits.argmax(dim=-1) == grouping_labels) & sig_mask).sum().item()
         else:
             # ---------------------------------------------------------------
             # Phase 2 (or legacy single-phase) training: full loss.
@@ -2035,11 +2210,19 @@ def _run_epoch(
                 isr_labels = model.flat_to_factored[labels, 0]
                 grouping_labels = model.flat_to_factored[labels, 1]
 
-                loss_isr = ce_loss_fn(isr_logits, isr_labels)
+                # Per-event cross-entropies (reduction="none") so signal and
+                # background events can be combined with different objectives;
+                # reduced to a scalar with the signal mask below.  Equivalent to
+                # the original ce_loss_fn(...) when every event is signal.
+                loss_isr = F.cross_entropy(
+                    isr_logits, isr_labels, label_smoothing=label_smoothing, reduction="none"
+                )
 
                 batch_idx = torch.arange(labels.shape[0], device=device)
                 gt_grp_logits = grouping_logits[batch_idx, isr_labels]
-                loss_grp_tf = ce_loss_fn(gt_grp_logits, grouping_labels)
+                loss_grp_tf = F.cross_entropy(
+                    gt_grp_logits, grouping_labels, label_smoothing=label_smoothing, reduction="none"
+                )
 
                 # Blend teacher-forced factored loss with flat end-to-end loss
                 # tf_ratio=1: fully teacher-forced (original); tf_ratio=0: flat CE only
@@ -2048,11 +2231,15 @@ def _run_epoch(
                 # produces num_groupings gradient paths per signal jet while the ISR jet
                 # (excluded from every group) receives gradient only from loss_isr.
                 # Scaling loss_isr by lambda_isr partially rebalances this asymmetry.
-                loss_flat = ce_loss_fn(logits, labels)
+                loss_flat = F.cross_entropy(
+                    logits, labels, label_smoothing=label_smoothing, reduction="none"
+                )
+                # loss_ce is kept per-event (B,) and reduced with the signal mask
+                # below; background events feed only the bg-rejection term.
                 loss_ce = tf_ratio * (lambda_isr * loss_isr + loss_grp_tf) + (1.0 - tf_ratio) * loss_flat
 
-                total_isr_correct += (isr_logits.argmax(dim=-1) == isr_labels).sum().item()
-                total_grp_correct += (gt_grp_logits.argmax(dim=-1) == grouping_labels).sum().item()
+                total_isr_correct += ((isr_logits.argmax(dim=-1) == isr_labels) & sig_mask).sum().item()
+                total_grp_correct += ((gt_grp_logits.argmax(dim=-1) == grouping_labels) & sig_mask).sum().item()
 
                 # Direct ISR supervision from flat logits: for each ISR candidate j, take
                 # the max grouping score assuming jet j is ISR.  This marginalises out the
@@ -2065,10 +2252,14 @@ def _run_epoch(
                         labels.shape[0], model.num_jets, model.num_groupings
                     )
                     isr_logits_direct = logits_fac.max(dim=2).values   # (batch, num_jets)
-                    loss_isr_direct = ce_loss_fn(isr_logits_direct, isr_labels)
+                    loss_isr_direct = F.cross_entropy(
+                        isr_logits_direct, isr_labels, label_smoothing=label_smoothing, reduction="none"
+                    )
                     loss_ce = loss_ce + lambda_isr_direct * loss_isr_direct
             else:
-                loss_ce = ce_loss_fn(logits, labels)
+                loss_ce = F.cross_entropy(
+                    logits, labels, label_smoothing=label_smoothing, reduction="none"
+                )
 
             # Classical distillation loss: pull NN logits toward the classical
             # mass-asymmetry solver (argmin |m1-m2|/(m1+m2) = argmax -mass_asym).
@@ -2091,14 +2282,18 @@ def _run_epoch(
                 # of 32, amplifying the gradient enough to oppose the CE signal
                 # (KL pushes student_prob toward uniform teacher ≈ 1/70) and cap
                 # the model at ~1.6% accuracy for the entire 20-epoch decay period.
-                loss_distill = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
+                # Per-event KL (summed over assignments); reduced with the signal
+                # mask below.  Equals reduction="batchmean" when all events are signal.
+                loss_distill = F.kl_div(
+                    student_log_probs, teacher_probs, reduction="none"
+                ).sum(dim=-1)                                  # (batch,)
                 loss_ce = loss_ce + lambda_distill * loss_distill
 
             # Mass symmetry auxiliary loss: minimize expected |m1-m2|/(m1+m2) over assignments
             if lambda_sym > 0 and "mass_asym_flat" in output:
                 mass_asym = output["mass_asym_flat"].detach()  # (batch, num_assignments)
                 probs = logits.softmax(dim=-1)
-                loss_sym = (probs * mass_asym).sum(dim=-1).mean()
+                loss_sym = (probs * mass_asym).sum(dim=-1)     # (batch,) per-event
                 loss_ce = loss_ce + lambda_sym * loss_sym
 
             # QCD hierarchy penalty: events with large pT hierarchies (QCD-like) are pushed
@@ -2122,7 +2317,7 @@ def _run_epoch(
                 probs_qcd = logits.softmax(dim=-1)
                 expected_asym = (probs_qcd * mass_asym_qcd).sum(dim=-1)    # (batch,)
                 # Negative sign: minimising drives H * expected_asym upward for high-H events
-                loss_qcd_term = -(H * expected_asym).mean()
+                loss_qcd_term = -(H * expected_asym)                       # (batch,) per-event
                 loss_ce = loss_ce + lambda_qcd * loss_qcd_term
 
             # Entropy-weighted physics prior losses.
@@ -2155,14 +2350,73 @@ def _run_epoch(
                 if lambda_entropy_asym > 0:
                     mass_asym_ent = output["mass_asym_flat"].detach()                    # (B, N)
                     expected_asym_ent = (probs_ent * mass_asym_ent).sum(dim=-1)         # (batch,)
-                    loss_entropy_asym = -(norm_entropy * expected_asym_ent).mean()
+                    loss_entropy_asym = -(norm_entropy * expected_asym_ent)             # (batch,)
                     loss_ce = loss_ce + lambda_entropy_asym * loss_entropy_asym
 
                 if lambda_entropy_mass > 0 and "mass_sum_flat" in output:
                     mass_sum_ent = output["mass_sum_flat"].detach()                      # (B, N)
                     expected_mass_sum = (probs_ent * mass_sum_ent).sum(dim=-1)          # (batch,)
-                    loss_entropy_mass_term = (norm_entropy * expected_mass_sum).mean()
+                    loss_entropy_mass_term = (norm_entropy * expected_mass_sum)         # (batch,)
                     loss_ce = loss_ce + lambda_entropy_mass * loss_entropy_mass_term
+
+            # Reduce the per-event supervised loss over SIGNAL events only.
+            # Background (QCD) events contribute nothing here; they are handled
+            # by the background-rejection term below.  When every event is signal
+            # this is identical to the previous batch-mean reductions.
+            loss_ce = _masked_mean(loss_ce, sig_mask)
+
+            # Background-rejection loss.  For each QCD/background event we want the
+            # network to COMMIT to the interpretation that is most obviously not
+            # signal-like and duck out of the signal region, rather than settling
+            # on a mildly-asymmetric / mildly-low-mass compromise.
+            #
+            # Anti-signal score per assignment is an OR of two normalised extremes
+            # (each in [0,1]): high mass asymmetry, or low average mass relative to
+            # what is achievable for that event.  Taking the max (not a sum) means
+            # the target is the single interpretation that is extreme in EITHER
+            # dimension — the blatantly-non-signal choice the event affords.
+            #   (a) hard CE toward argmax(bg_score) commits to that choice;
+            #   (b) a soft term maximises the expected anti-signal score so the
+            #       bulk of the QCD probability (not just the argmax) is pushed out;
+            #   (c) an optional asymmetry cut explicitly evacuates the signal region
+            #       by penalising probability left on low-asymmetry interpretations.
+            # Masked to background events, so signal reconstruction is untouched.
+            if (
+                lambda_bg > 0
+                and is_bkg.any()
+                and "mass_sum_flat" in output
+                and "mass_asym_flat" in output
+            ):
+                asym = output["mass_asym_flat"].detach()       # (batch, N) in [0, 1]
+                msum = output["mass_sum_flat"].detach()        # (batch, N), HT units
+                probs = logits.softmax(dim=-1)
+
+                # Per-event mass "lowness" in [0,1] (1 = lowest-mass interpretation
+                # available), so the low-mass route is comparable to the asymmetry
+                # route regardless of the event's absolute mass scale.
+                msum_min = msum.min(dim=-1, keepdim=True).values
+                msum_max = msum.max(dim=-1, keepdim=True).values
+                mass_low = (msum_max - msum) / (msum_max - msum_min).clamp(min=1e-6)
+
+                # OR of the two extremes; beta_bg tilts toward the low-mass route.
+                bg_score = torch.maximum(asym, beta_bg * mass_low)          # (batch, N)
+
+                # (a) commit to the single most anti-signal interpretation.
+                bg_target = bg_score.argmax(dim=-1)                          # (batch,)
+                loss_bg = F.cross_entropy(logits, bg_target, reduction="none")   # (batch,)
+
+                # (b) push the whole distribution toward high anti-signal score.
+                if bg_soft_weight > 0:
+                    loss_bg = loss_bg + bg_soft_weight * (1.0 - (probs * bg_score).sum(dim=-1))
+
+                # (c) explicit signal-region exit: penalise probability on
+                #     low-asymmetry (signal-like) interpretations below the cut.
+                if bg_asym_cut > 0:
+                    tau = max(0.25 * bg_asym_cut, 1e-3)
+                    in_sr = torch.sigmoid((bg_asym_cut - asym) / tau)        # ~1 below cut
+                    loss_bg = loss_bg + (probs * in_sr).sum(dim=-1)
+
+                loss_ce = loss_ce + lambda_bg * _masked_mean(loss_bg, is_bkg)
 
             # Adversarial mass loss
             mass_mask = parent_mass > 0
@@ -2183,12 +2437,19 @@ def _run_epoch(
         batch_size = labels.shape[0]
         total_loss += loss.item() * batch_size
         total_samples += batch_size
+        total_sig_samples += int(sig_mask.sum().item())
 
         preds = logits.argmax(dim=-1)
-        total_correct += (preds == labels).sum().item()
+        # Assignment accuracy is only defined for signal events (background/QCD
+        # events have no truth assignment), so restrict the counters to signal.
+        total_correct += ((preds == labels) & sig_mask).sum().item()
 
         _, top5 = logits.topk(5, dim=-1)
-        total_correct5 += (top5 == labels.unsqueeze(-1)).any(dim=-1).sum().item()
+        total_correct5 += ((top5 == labels.unsqueeze(-1)).any(dim=-1) & sig_mask).sum().item()
+
+        # Per-event background flag, aligned with the per-event distribution
+        # arrays below so downstream plotting can split signal vs QCD.
+        all_pred_is_bkg.append(is_bkg.detach().cpu())
 
         if "mass_asym_flat" in output:
             mass_asym_flat = output["mass_asym_flat"].detach()  # (batch, num_assignments)
@@ -2197,11 +2458,15 @@ def _run_epoch(
             total_mass_asym_samples += batch_size
             all_pred_asym.append(pred_asym.cpu())
             all_pred_correct.append((preds == labels).cpu())  # aligned with pred_asym
+            # Best achievable asymmetry for this event (ceiling for the bg push).
+            all_pred_asym_max.append(mass_asym_flat.max(dim=-1).values.cpu())
 
         if "mass_sum_flat" in output:
             mass_sum_flat = output["mass_sum_flat"].detach()  # (batch, num_assignments)
             pred_mass_sum = mass_sum_flat.gather(1, preds.unsqueeze(1)).squeeze(1)  # (batch,)
             all_pred_mass_sum.append(pred_mass_sum.cpu())
+            # Lowest achievable mass_sum for this event (floor for the bg push).
+            all_pred_mass_min.append(mass_sum_flat.min(dim=-1).values.cpu())
 
         # Max-triplet scalar-sum pT: look up the two triplets for each event's
         # predicted assignment and take the larger of the two per-triplet pT sums.
@@ -2246,14 +2511,53 @@ def _run_epoch(
             democracy = (dem_g1 + dem_g2) / 2.0        # (batch,)
             all_pred_democracy.append(democracy.detach().cpu())
 
+            # Lorentz boost γ = E/m of each parent candidate (E/m is a ratio, so it
+            # is invariant under the HT normalisation of the inputs).  Track the
+            # larger of the two and the average across the two triplets.
+            E_b = four_mom[:, :, 0]
+            pz_b = four_mom[:, :, 3]
+            E_g1 = E_b.gather(1, g1_jets).sum(dim=1)
+            E_g2 = E_b.gather(1, g2_jets).sum(dim=1)
+            pz_g1 = pz_b.gather(1, g1_jets).sum(dim=1)
+            pz_g2 = pz_b.gather(1, g2_jets).sum(dim=1)
+            m2_g1 = (E_g1**2 - sum_px_g1**2 - sum_py_g1**2 - pz_g1**2).clamp(min=1e-8)
+            m2_g2 = (E_g2**2 - sum_px_g2**2 - sum_py_g2**2 - pz_g2**2).clamp(min=1e-8)
+            gamma1 = (E_g1 / m2_g1.sqrt()).clamp(max=200.0)
+            gamma2 = (E_g2 / m2_g2.sqrt()).clamp(max=200.0)
+            all_pred_max_boost.append(torch.maximum(gamma1, gamma2).detach().cpu())
+            all_pred_avg_boost.append(((gamma1 + gamma2) / 2.0).detach().cpu())
+
+            # Dalitz coordinates (validation only, used for the 2-D Dalitz plot):
+            # for each triplet, the pairwise invariant-mass-squared of its pT-ordered
+            # jets normalised by the triplet m²:  x = m²(lead,sub)/M², y = m²(lead,third)/M².
+            if optimizer is None:
+                def _dalitz_xy(idx, m2_parent):
+                    tri = torch.gather(four_mom, 1, idx.unsqueeze(-1).expand(-1, -1, 4))  # (B,3,4)
+                    ptt = torch.sqrt(tri[..., 1] ** 2 + tri[..., 2] ** 2)
+                    order = torch.argsort(ptt, dim=1, descending=True)
+                    tri = torch.gather(tri, 1, order.unsqueeze(-1).expand(-1, -1, 4))
+                    a, b, c = tri[:, 0], tri[:, 1], tri[:, 2]
+
+                    def _m2(p, q):
+                        s = p + q
+                        return s[:, 0] ** 2 - s[:, 1] ** 2 - s[:, 2] ** 2 - s[:, 3] ** 2
+                    denom = m2_parent.clamp(min=1e-8)
+                    return _m2(a, b) / denom, _m2(a, c) / denom
+
+                x1, y1 = _dalitz_xy(g1_jets, m2_g1)
+                x2, y2 = _dalitz_xy(g2_jets, m2_g2)
+                all_pred_dalitz_x.append(torch.stack([x1, x2], dim=1).detach().cpu())  # (B, 2)
+                all_pred_dalitz_y.append(torch.stack([y1, y2], dim=1).detach().cpu())
+
         mass_mask = parent_mass > 0
         if mass_mask.any():
             all_mass_pred.append(mass_pred[mass_mask].detach().cpu())
             all_mass_true.append(parent_mass[mass_mask].detach().cpu())
 
     avg_loss = total_loss / max(total_samples, 1)
-    acc = total_correct / max(total_samples, 1)
-    acc5 = total_correct5 / max(total_samples, 1)
+    # Accuracy is over signal events only (background events have no truth label).
+    acc = total_correct / max(total_sig_samples, 1)
+    acc5 = total_correct5 / max(total_sig_samples, 1)
 
     adv_r2 = 0.0
     if all_mass_pred:
@@ -2271,8 +2575,12 @@ def _run_epoch(
         result["std_mass_asym"] = pred_asym_cat.std().item()
         result["pred_asym_values"] = pred_asym_cat.numpy()  # full per-event array
         result["pred_correct_values"] = torch.cat(all_pred_correct).numpy()  # bool per-event
+    if all_pred_asym_max:
+        result["pred_asym_achievable_values"] = torch.cat(all_pred_asym_max).numpy()
     if all_pred_mass_sum:
         result["pred_mass_sum_values"] = torch.cat(all_pred_mass_sum).numpy()  # full per-event array
+    if all_pred_mass_min:
+        result["pred_mass_sum_achievable_values"] = torch.cat(all_pred_mass_min).numpy()
     if all_pred_max_triplet_pt:
         mpt_cat = torch.cat(all_pred_max_triplet_pt)
         result["pred_max_triplet_pt_values"] = mpt_cat.numpy()
@@ -2288,15 +2596,35 @@ def _run_epoch(
         result["pred_democracy_values"] = dem_cat.numpy()
         result["avg_democracy"] = dem_cat.mean().item()
         result["std_democracy"] = dem_cat.std().item()
+    if all_pred_max_boost:
+        result["pred_max_boost_values"] = torch.cat(all_pred_max_boost).numpy()
+    if all_pred_avg_boost:
+        result["pred_avg_boost_values"] = torch.cat(all_pred_avg_boost).numpy()
+    if all_pred_dalitz_x:
+        result["pred_dalitz_x_values"] = torch.cat(all_pred_dalitz_x).numpy()  # (N, 2)
+        result["pred_dalitz_y_values"] = torch.cat(all_pred_dalitz_y).numpy()  # (N, 2)
+    if all_pred_is_bkg:
+        result["pred_is_bkg_values"] = torch.cat(all_pred_is_bkg).numpy()
     if factored:
-        result["isr_acc"] = total_isr_correct / max(total_samples, 1)
-        result["grp_acc"] = total_grp_correct / max(total_samples, 1)
+        result["isr_acc"] = total_isr_correct / max(total_sig_samples, 1)
+        result["grp_acc"] = total_grp_correct / max(total_sig_samples, 1)
     return result
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train jet assignment model")
     parser.add_argument("--config", type=str, default=None, help="Path to config YAML")
-    parser.add_argument("--data", type=str, default=None, help="Path to HDF5 data (glob pattern)")
+    parser.add_argument("--data", type=str, default=None, help="Path to signal HDF5 data (glob pattern)")
+    parser.add_argument(
+        "--qcd-data",
+        type=str,
+        default=None,
+        help=(
+            "Path to QCD/background HDF5 data (glob pattern).  Providing this "
+            "automatically turns on the background-rejection loss (lambda_bg), "
+            "training signal and QCD jointly in a single step.  Overrides "
+            "data.qcd_data_path in the config."
+        ),
+    )
     args = parser.parse_args()
-    train(config_path=args.config, data_path=args.data)
+    train(config_path=args.config, data_path=args.data, qcd_data_path=args.qcd_data)

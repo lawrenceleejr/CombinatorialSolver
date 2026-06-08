@@ -105,13 +105,77 @@ def generate_event(parent_mass: float, include_isr: bool = False) -> dict:
     }
 
 
+def generate_background_event(include_isr: bool = False) -> dict:
+    """Generate one QCD-like multijet background event (no resonance).
+
+    Jets are drawn from a steeply falling pT spectrum with roughly uncorrelated
+    angles, so there is no pair of equal-mass triplets — exactly the structure
+    the network must learn to push to low average mass.  ``is_signal`` is 0 for
+    every jet and the event carries no real parent.  Used to exercise the
+    background-rejection training path before real MadGraph QCD is available.
+    """
+    n_jets = 7 if include_isr else 6
+    max_jets = 20
+
+    # Steeply falling jet pT spectrum (leading jet hardest), uncorrelated angles.
+    scale = np.random.uniform(80.0, 160.0)
+    pts = np.sort(np.random.exponential(scale, size=n_jets))[::-1]
+    pts = np.maximum(pts, 25.0)
+
+    pt = np.zeros(max_jets, dtype=np.float32)
+    eta = np.zeros(max_jets, dtype=np.float32)
+    phi = np.zeros(max_jets, dtype=np.float32)
+    mass = np.zeros(max_jets, dtype=np.float32)
+    mask = np.zeros(max_jets, dtype=bool)
+
+    for i in range(n_jets):
+        pt[i] = float(pts[i])
+        eta[i] = float(np.random.uniform(-2.5, 2.5))
+        phi[i] = float(np.random.uniform(-np.pi, np.pi))
+        mass[i] = float(np.random.exponential(0.005))  # near-massless partons
+        mask[i] = True
+
+    px = pt * np.cos(phi)
+    py = pt * np.sin(phi)
+    pz = pt * np.sinh(eta)
+    energy = np.sqrt(px**2 + py**2 + pz**2 + mass**2)
+    ht = pt[mask].sum()
+
+    # jet_features: [pt, eta, phi, mass, parent_idx, is_signal] — all background.
+    jet_features = np.zeros((max_jets, 6), dtype=np.float32)
+    for i in range(n_jets):
+        jet_features[i, 0] = pt[i]
+        jet_features[i, 1] = eta[i]
+        jet_features[i, 2] = phi[i]
+        jet_features[i, 3] = mass[i]
+        jet_features[i, 4] = 0.0  # no parent
+        jet_features[i, 5] = 0.0  # is_signal = 0 (background)
+
+    # event_features: n_signal = 0 for background.
+    event_features = np.array([n_jets, 0.0, 0.0, 0.0, ht, 0, 1.0], dtype=np.float32)
+
+    return {
+        "jet_features": jet_features,
+        "jet_mask": mask,
+        "event_features": event_features,
+        "pt": pt, "eta": eta, "phi": phi, "mass": mass,
+        "energy": energy, "mask": mask,
+    }
+
+
 def generate_dataset(
     output_path: str,
     n_events: int = 10000,
     parent_masses: list[float] | None = None,
     include_isr: bool = False,
+    background: bool = False,
 ):
-    """Generate a full HDF5 dataset matching the real data layout."""
+    """Generate a full HDF5 dataset matching the real data layout.
+
+    When ``background`` is True, QCD-like multijet events (no resonance,
+    ``is_signal=0``) are produced instead of signal events — a synthetic stand-in
+    for a MadGraph QCD sample to test the background-rejection training path.
+    """
     if parent_masses is None:
         parent_masses = [300.0, 500.0, 700.0, 1000.0, 1500.0]
 
@@ -149,8 +213,11 @@ def generate_dataset(
     g2_j3 = np.full(n_events, 5, dtype=np.int32)
 
     for i in range(n_events):
-        mass = np.random.choice(parent_masses)
-        event = generate_event(parent_mass=mass, include_isr=include_isr)
+        if background:
+            event = generate_background_event(include_isr=include_isr)
+        else:
+            mass = np.random.choice(parent_masses)
+            event = generate_event(parent_mass=mass, include_isr=include_isr)
 
         jet_features_all[i] = event["jet_features"]
         jet_mask_all[i] = event["jet_mask"]
@@ -210,7 +277,10 @@ def generate_dataset(
         ev.create_dataset("normweight", data=np.ones(n_events, dtype=np.float32))
 
     print(f"Generated {n_events} events -> {output_path}")
-    print(f"  Parent masses sampled from: {parent_masses} GeV")
+    if background:
+        print("  Sample type: QCD-like background (is_signal=0, no resonance)")
+    else:
+        print(f"  Parent masses sampled from: {parent_masses} GeV")
     print(f"  Jets per event: {n_jets_per_event} ({'with' if include_isr else 'without'} ISR)")
     print(f"  File size: {Path(output_path).stat().st_size / 1e6:.1f} MB")
 
@@ -221,5 +291,12 @@ if __name__ == "__main__":
     parser.add_argument("--n-events", type=int, default=10000)
     parser.add_argument("--masses", type=float, nargs="+", default=None)
     parser.add_argument("--include-isr", action="store_true", help="Add ISR jet (7 jets)")
+    parser.add_argument(
+        "--background",
+        action="store_true",
+        help="Generate QCD-like multijet background events (is_signal=0, no resonance)",
+    )
     args = parser.parse_args()
-    generate_dataset(args.output, args.n_events, args.masses, args.include_isr)
+    generate_dataset(
+        args.output, args.n_events, args.masses, args.include_isr, background=args.background
+    )

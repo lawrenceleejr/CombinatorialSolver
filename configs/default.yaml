@@ -53,6 +53,51 @@ training:
   lambda_entropy_asym_rampup: 20
   lambda_entropy_mass: 0.05
   lambda_entropy_mass_rampup: 20
+  # --- Background (QCD) rejection ---------------------------------------------
+  # Requires a QCD sample provided via data.qcd_data_path (or --qcd-data), loaded
+  # as background.  For every background event the network is driven to COMMIT to
+  # the interpretation that is most obviously not signal-like and duck out of the
+  # signal region.  The per-assignment anti-signal score is an OR of two
+  # normalised extremes (each in [0,1]): high mass asymmetry, OR low average mass
+  # relative to what the event can achieve -- i.e. max(asym, beta_bg * mass_low).
+  # Three pieces act on background events only (signal is untouched):
+  #   (a) hard cross-entropy toward argmax(anti-signal score) -- commit to the
+  #       single most blatantly-non-signal interpretation;
+  #   (b) a soft term (bg_soft_weight) maximising the expected anti-signal score
+  #       so the *bulk* of the QCD probability moves to the extreme, not just the
+  #       argmax;
+  #   (c) an optional asymmetry cut (bg_asym_cut) that explicitly evacuates the
+  #       signal region by penalising probability left below the cut.
+  # Active only when a QCD sample is present (no effect on signal-only runs, where
+  # the term is masked out).  Providing a QCD sample with lambda_bg<=0 auto-enables
+  # it at 2.0.
+  #
+  # When training WITH a QCD sample, also set the redundant signal-side proxies to 0:
+  #     lambda_qcd: 0.0            # redundant pT-hierarchy proxy; would act on signal
+  #     lambda_entropy_asym: 0.0   # ditto (network-uncertainty proxy)
+  #     lambda_entropy_mass: 0.0   # ditto
+  # (keep lambda_sym so the signal stays a symmetric bump).
+  #
+  # Tuning for "more extreme" QCD (defaults below are already cranked up and biased
+  # toward the asymmetry route):
+  #   beta_bg: weight of the low-mass route vs the asymmetry route in the OR
+  #     max(asym, beta_bg*mass_low).  1.0 = balanced; <1 favours high asymmetry
+  #     (0.5 here); >1 favours low mass.  Lower it further (e.g. 0.3) to lean even
+  #     harder on asymmetry.
+  #   bg_soft_weight: strength of the distribution-level push that drags the bulk
+  #     (not just the argmax) to the extreme.  Raise toward 3-4 to push harder.
+  #   lambda_bg: overall weight; raise (e.g. 3-5) to push harder still (watch the
+  #     signal accuracy — too high starts to cost reconstruction).
+  #   bg_asym_cut: if your signal region is defined by a mass-asymmetry cut
+  #     A < A_cut, set this to A_cut (e.g. 0.1) to explicitly evacuate QCD
+  #     probability from below the cut.  0 = relative OR push only.
+  # The qcd_trends plot draws a dashed "best achievable" line so you can see how
+  # much headroom remains before the per-event data limit.
+  lambda_bg: 2.0
+  lambda_bg_rampup: 20
+  beta_bg: 0.5
+  bg_soft_weight: 2.0
+  bg_asym_cut: 0.0
   # Distillation from the classical mass-asymmetry solver.
   # At Phase 2 epoch 0 this loss pulls the NN logits toward the assignment with
   # the smallest |m1-m2|/(m1+m2).  It decays linearly to zero over
@@ -86,7 +131,7 @@ training:
   #             lambda_distill_max over lambda_distill_epochs measured from the
   #             Phase 2 start epoch.
   #   Set phase1_patience: 0 to disable two-phase training (legacy behaviour).
-  phase1_patience: 15
+  phase1_patience: 10
   # LR cap for Phase 1.  Phase 1 uses a pure 10-class grouping-CE loss (no
   # auxiliary sym/qcd/adversary terms); this simple objective is stable at the
   # full cosine-schedule LR.  Setting phase1_max_lr_fraction: 1.0 lets Phase 1
@@ -100,6 +145,14 @@ data:
   normalize_by_ht: true
   num_jets: 7
   pt_smear_frac: 0.20
+  # Signal sample glob.  Overridden by the --data CLI flag when provided.
+  data_path: "data/*.h5"
+  # Optional QCD/background sample glob.  When set (and files match), these
+  # events are loaded with is_background=True and feed the background-rejection
+  # loss (training.lambda_bg) instead of the supervised assignment loss.  They
+  # should be MadGraphMLProducer-format h5 with is_signal=0 for every jet and no
+  # TARGETS group.  Leave null for signal-only training.
+  qcd_data_path: null
   # Compute truth labels as argmin |m1-m2| over all 70 interpretations (recommended).
   # This is the physically correct ground truth for equal-mass pair-produced resonances
   # and removes dependence on potentially incorrect TARGETS entries in the HDF5 file.

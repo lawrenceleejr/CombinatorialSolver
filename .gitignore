@@ -22,6 +22,12 @@ checkpoints/
 *.pt
 *.pth
 
+# Generated training/eval artifacts
+plots/
+onnx_snapshots/
+onnx_models/
+results/
+
 # Logs
 logs/
 *.log
