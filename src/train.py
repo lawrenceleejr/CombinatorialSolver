@@ -933,11 +933,10 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     gif_path=Path("plots") / "mass_sum_anim_latest.gif",
                 )
             # One combined trend overlaying signal and QCD means vs epoch
-            # (asymmetry, average mass, and the max / average triplet boosts).
+            # (mass asymmetry and average candidate mass).
             if val_asym_history or val_mass_sum_history:
                 _make_trend_plot(
-                    _trend_panels(val_asym_history, val_mass_sum_history,
-                                  val_max_boost_history, val_avg_boost_history),
+                    _trend_panels(val_asym_history, val_mass_sum_history),
                     phase2_start_epoch=phase2_start_epoch,
                     out_path=Path("plots") / "trends_latest.pdf",
                 )
@@ -1110,11 +1109,10 @@ def train(config_path: str | None = None, data_path: str | None = None,
         if mass_sum_gif is not None:
             plot_paths.append(mass_sum_gif)
 
-    # One combined trend overlaying signal and QCD means vs epoch (asymmetry,
-    # average mass, max & average triplet boost), with the QCD achievable ceiling.
+    # One combined trend overlaying signal and QCD means vs epoch (mass asymmetry
+    # and average candidate mass), with the QCD "best achievable" ceiling.
     trend = _make_trend_plot(
-        _trend_panels(val_asym_history, val_mass_sum_history,
-                      val_max_boost_history, val_avg_boost_history),
+        _trend_panels(val_asym_history, val_mass_sum_history),
         phase2_start_epoch=phase2_start_epoch,
     )
     if trend is not None:
@@ -1379,19 +1377,14 @@ def _make_distribution_gif(
         plt.close(fig)
 
 
-def _trend_panels(asym_hist, mass_hist, max_boost_hist, avg_boost_hist):
+def _trend_panels(asym_hist, mass_hist):
     """Build the (history, transform, ylabel, title, show_achievable) panel list
-    for the combined trend plot: mass asymmetry, average candidate mass, and the
-    max / average triplet Lorentz boosts."""
+    for the combined trend plot: mass asymmetry and average candidate mass."""
     return [
         (asym_hist, lambda v: v,
          r"Mass asymmetry $|m_1{-}m_2|/(m_1{+}m_2)$", "Mass asymmetry vs epoch", True),
         (mass_hist, lambda v: v / 2.0,
          r"Average candidate mass $(m_1{+}m_2)/2$", "Average candidate mass vs epoch", True),
-        (max_boost_hist, lambda v: v,
-         r"Max triplet boost $\gamma=E/m$", "Max triplet boost vs epoch", False),
-        (avg_boost_hist, lambda v: v,
-         r"Average triplet boost $\gamma=E/m$", "Average triplet boost vs epoch", False),
     ]
 
 
