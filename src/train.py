@@ -29,7 +29,7 @@ from .cut_plots import draw_roc_curves, draw_working_point_cloud
 from .dataset import JetAssignmentDataset
 from .export_onnx import export_classical_solver, export_ml_model
 from .model import JetAssignmentTransformer
-from .utils import get_config, get_device
+from .utils import get_config, get_device, load_compatible_state_dict
 
 
 # Consistent colour palette shared by all training animations and trend plots.
@@ -270,7 +270,8 @@ def export_onnx(model, num_jets, device, val_acc):
             self.m = m
 
         def forward(self, four_momenta):
-            return self.m(four_momenta)["logits"]
+            out = self.m(four_momenta)
+            return out["logits"], out["score_logit"]
 
     wrapper = _Wrapper(model)
     wrapper.eval()
@@ -280,12 +281,16 @@ def export_onnx(model, num_jets, device, val_acc):
         dummy,
         onnx_path,
         input_names=["four_momenta"],
-        output_names=["logits"],
+        output_names=["logits", "score_logit"],
         dynamic_axes={
             "four_momenta": {0: "batch_size"},
             "logits": {0: "batch_size"},
+            "score_logit": {0: "batch_size"},
         },
         opset_version=18,
+        # Legacy exporter: the dynamo exporter (torch >= 2.9 default) fails on
+        # the GroupTransformer's reshape of expanded tensors.
+        dynamo=False,
     )
     print(f"  -> Exported ONNX model to {onnx_path} (val_acc={val_acc:.4f})")
 
@@ -571,6 +576,21 @@ def train(config_path: str | None = None, data_path: str | None = None,
     beta_bg = tc.get("beta_bg", 0.5)
     bg_soft_weight = tc.get("bg_soft_weight", 2.0)
     bg_asym_cut = tc.get("bg_asym_cut", 0.0)
+    # Event-level signal-vs-QCD classification (score head).  BCE with signal=1,
+    # background=0; needs a QCD sample so both classes are present.  The score
+    # head reads the adversarially mass-decorrelated pooled embedding, so the
+    # resulting score can define a signal-region category without sculpting the
+    # QCD m_avg shape (verify with the sculpting panel in src.background_estimate).
+    # Ramps up from Phase 2 start like the other auxiliary losses.
+    lambda_cls_max = tc.get("lambda_cls", 0.0)
+    lambda_cls_rampup = tc.get("lambda_cls_rampup", 10)
+    if lambda_cls_max > 0 and not qcd_present:
+        print("lambda_cls > 0 but no QCD sample provided -> score head will not "
+              "train (BCE needs both classes); disabling.")
+        lambda_cls_max = 0.0
+    if lambda_cls_max > 0:
+        print(f"Event-level signal score: lambda_cls={lambda_cls_max} "
+              f"(rampup={lambda_cls_rampup})")
     # Handing the trainer a QCD sample turns on the background-rejection objective
     # automatically: if lambda_bg was left at its default 0, enable it so the QCD
     # events actually penalise high-average-mass interpretations.  Set
@@ -625,10 +645,15 @@ def train(config_path: str | None = None, data_path: str | None = None,
     # The simple grouping-CE pseudolabel loss diverges at that scale, so we cap
     # Phase 1 LR at phase1_max_lr_fraction * initial_lr.
     phase1_lr_fraction = tc.get("phase1_max_lr_fraction", 0.1)
-    training_phase = 1  # 1 or 2
+    # With two-phase training disabled (phase1_patience=0) we start directly in
+    # Phase 2 (full supervised loss from epoch 0) — the documented legacy
+    # behaviour.  Previously training_phase stayed 1 in that case, silently
+    # running the Phase-1-only pseudolabel loss for the whole run.
+    training_phase = 1 if phase1_active else 2
     phase1_best_acc = 0.0
     phase1_no_improve = 0
-    phase2_start_epoch = None   # absolute epoch index when Phase 2 begins
+    # Absolute epoch index when Phase 2 begins (0 when starting in Phase 2).
+    phase2_start_epoch = None if phase1_active else 0
 
     if phase1_active:
         if model.has_isr:
@@ -696,6 +721,7 @@ def train(config_path: str | None = None, data_path: str | None = None,
                 lambda_entropy_asym = 0.0
                 lambda_entropy_mass = 0.0
                 lambda_bg = 0.0
+                lambda_cls = 0.0
                 phase1_only_train = True
             else:
                 # Phase 2: teacher forcing, auxiliary losses, decaying distillation
@@ -744,6 +770,11 @@ def train(config_path: str | None = None, data_path: str | None = None,
                 else:
                     lambda_bg = lambda_bg_max
 
+                if lambda_cls_rampup > 0:
+                    lambda_cls = lambda_cls_max * min(1.0, phase2_epoch / lambda_cls_rampup)
+                else:
+                    lambda_cls = lambda_cls_max
+
                 # Distillation decays from max to zero over lambda_distill_epochs
                 if lambda_distill_epochs > 0:
                     lambda_distill = lambda_distill_max * max(
@@ -766,6 +797,7 @@ def train(config_path: str | None = None, data_path: str | None = None,
                 lambda_entropy_mass=lambda_entropy_mass,
                 lambda_bg=lambda_bg, beta_bg=beta_bg,
                 bg_soft_weight=bg_soft_weight, bg_asym_cut=bg_asym_cut,
+                lambda_cls=lambda_cls,
                 phase1_only=phase1_only_train,
                 pt_smear_frac=dc.get("pt_smear_frac", 0.0),
             )
@@ -783,6 +815,7 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
                     lambda_bg=0.0, beta_bg=beta_bg,
                     bg_soft_weight=bg_soft_weight, bg_asym_cut=bg_asym_cut,
+                    lambda_cls=0.0,
                     pt_smear_frac=dc.get("pt_smear_frac", 0.0),
                 )
 
@@ -896,12 +929,17 @@ def train(config_path: str | None = None, data_path: str | None = None,
                 if "avg_mass_asym" in val_metrics
                 else ""
             )
+            score_str = (
+                f" | ScoreAUC={val_metrics['score_auc']:.3f}"
+                if "score_auc" in val_metrics
+                else ""
+            )
 
             print(
                 f"Epoch {epoch+1:3d}/{tc['num_epochs']} {phase_tag} | "
                 f"Train loss={train_metrics['loss']:.4f} acc={train_metrics['acc']:.3f} | "
                 f"Val loss={val_metrics['loss']:.4f} acc={val_metrics['acc']:.3f}"
-                f"{isr_str}{adv_str}{asym_str} | "
+                f"{isr_str}{adv_str}{asym_str}{score_str} | "
                 f"LR={current_lr:.2e}"
             )
 
@@ -1113,7 +1151,7 @@ def train(config_path: str | None = None, data_path: str | None = None,
 
     # Reload best checkpoint before ONNX export
     ckpt = torch.load(final_checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
+    load_compatible_state_dict(model, ckpt["model_state_dict"])
 
     # Plain ONNX for quick access at the well-known path
     export_onnx(model, dc["num_jets"], device, best_val_acc)
@@ -1943,7 +1981,11 @@ def _plot_training_curves(
     _add_phase_lines(ax)
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
-    ax.set_yscale("log")
+    # Log scale requires positive finite data; a NaN/diverged loss otherwise
+    # crashes the per-epoch plotting (and with it the whole training run).
+    import math as _math_loss
+    if any(v > 0 and _math_loss.isfinite(v) for v in train_loss + val_loss):
+        ax.set_yscale("log")
     ax.set_title("Loss vs Epoch")
     # Plain-decimal log ticks (avoid mathtext 10^{-n} minus missing from serif fonts).
     from matplotlib import ticker as _mticker
@@ -2169,6 +2211,7 @@ def _run_epoch(
     lambda_distill=0.0, distill_temperature=4.0,
     lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
     lambda_bg=0.0, beta_bg=1.0, bg_soft_weight=1.0, bg_asym_cut=0.0,
+    lambda_cls=0.0,
     phase1_only=False,
     pt_smear_frac=0.0,
 ):
@@ -2202,6 +2245,7 @@ def _run_epoch(
     all_mass_pred = []
     all_mass_true = []
     all_pred_is_bkg = []
+    all_pred_score = []     # per-event sigmoid(score_logit), when the head exists
     all_pred_asym_max = []   # per-event achievable max asymmetry (over assignments)
     all_pred_mass_min = []   # per-event achievable min mass_sum (over assignments)
     total_sig_samples = 0
@@ -2546,6 +2590,31 @@ def _run_epoch(
 
                 loss_ce = loss_ce + lambda_bg * _masked_mean(loss_bg, is_bkg)
 
+            # Event-level signal-vs-QCD classification loss for the score head.
+            # BCE with signal=1, background=0; only meaningful when the batch
+            # contains both classes (otherwise the gradient just saturates the
+            # head, so it is skipped).  The head reads the adversarially
+            # mass-decorrelated pooled embedding, which is what protects the
+            # score from sculpting the QCD m_avg shape.
+            if (
+                lambda_cls > 0
+                and "score_logit" in output
+                and is_bkg.any()
+                and sig_mask.any()
+            ):
+                # pos_weight balances the classes per batch: with (say) 4x more
+                # QCD than signal, an unweighted BCE calibrates the score to the
+                # class prior (~0.2), compressing the distribution and making
+                # absolute thresholds meaningless.  Clamped so a fluctuating
+                # batch composition cannot blow up the gradient.
+                n_pos = sig_mask.float().sum().clamp(min=1.0)
+                n_neg = is_bkg.float().sum().clamp(min=1.0)
+                pos_weight = (n_neg / n_pos).clamp(0.1, 10.0)
+                loss_cls = F.binary_cross_entropy_with_logits(
+                    output["score_logit"], sig_mask.float(), pos_weight=pos_weight
+                )
+                loss_ce = loss_ce + lambda_cls * loss_cls
+
             # Adversarial mass loss
             mass_mask = parent_mass > 0
             if mass_mask.any() and lambda_adv > 0:
@@ -2578,6 +2647,9 @@ def _run_epoch(
         # Per-event background flag, aligned with the per-event distribution
         # arrays below so downstream plotting can split signal vs QCD.
         all_pred_is_bkg.append(is_bkg.detach().cpu())
+
+        if "score_logit" in output:
+            all_pred_score.append(torch.sigmoid(output["score_logit"]).detach().cpu())
 
         if "mass_asym_flat" in output:
             mass_asym_flat = output["mass_asym_flat"].detach()  # (batch, num_assignments)
@@ -2733,6 +2805,20 @@ def _run_epoch(
         result["pred_dalitz_y_values"] = torch.cat(all_pred_dalitz_y).numpy()  # (N, 2)
     if all_pred_is_bkg:
         result["pred_is_bkg_values"] = torch.cat(all_pred_is_bkg).numpy()
+    if all_pred_score:
+        scores_np = torch.cat(all_pred_score).numpy()
+        result["pred_score_values"] = scores_np
+        # Signal-vs-QCD ROC AUC via the Mann-Whitney U statistic (rank-based,
+        # threshold-free).  Only defined when both classes are present.
+        if all_pred_is_bkg:
+            bkg_np = result["pred_is_bkg_values"].astype(bool)
+            if bkg_np.any() and (~bkg_np).any():
+                import numpy as _np
+                ranks = _np.argsort(_np.argsort(scores_np)).astype(float) + 1.0
+                n_sig = int((~bkg_np).sum())
+                n_bkg = int(bkg_np.sum())
+                u = ranks[~bkg_np].sum() - n_sig * (n_sig + 1) / 2.0
+                result["score_auc"] = float(u / (n_sig * n_bkg))
     if factored:
         result["isr_acc"] = total_isr_correct / max(total_sig_samples, 1)
         result["grp_acc"] = total_grp_correct / max(total_sig_samples, 1)

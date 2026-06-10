@@ -30,6 +30,20 @@ from .combinatorics import build_assignment_tensors, build_factored_tensors
 from .utils import compute_invariant_mass
 
 
+def _asinh(x: torch.Tensor) -> torch.Tensor:
+    """ONNX-exportable asinh: sign(x) * log(|x| + sqrt(x^2 + 1)).
+
+    The legacy TorchScript ONNX exporter (needed because the dynamo exporter
+    fails on this model's expanded-tensor reshapes) has no symbolic for
+    aten::asinh, so pseudorapidity is computed from the identity instead.
+    The odd-symmetry form is used because the naive log(x + sqrt(x^2+1))
+    catastrophically cancels for large NEGATIVE x in float32 (log(0) = -inf,
+    which poisons training with NaNs); with |x| the two terms always add.
+    """
+    ax = x.abs()
+    return torch.sign(x) * torch.log(ax + torch.sqrt(ax * ax + 1.0))
+
+
 class GradientReversalFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, lambda_):
@@ -236,6 +250,20 @@ class JetAssignmentTransformer(nn.Module):
             nn.Linear(d_model // 2, 1),
         )
 
+        # Event-level signal-vs-QCD score head.  Reads the same mean-pooled
+        # encoder embedding the mass adversary acts on: the gradient-reversed
+        # adversary penalises parent-mass information in that embedding, so a
+        # score built from it inherits the mass decorrelation — the score can
+        # be cut on without sculpting a bump into the QCD m_avg spectrum.
+        # Trained with BCE (signal=1, background=0) via training.lambda_cls;
+        # with lambda_cls=0 the head exists but is untrained (score is
+        # meaningless) and contributes nothing to the loss.
+        self.score_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 1),
+        )
+
     def _compute_pt_bias(self, four_momenta: torch.Tensor) -> torch.Tensor:
         """Log pT ratio matrix: log(pT_i/pT_j). Returns (batch, J, J)."""
         px, py = four_momenta[..., 1], four_momenta[..., 2]
@@ -275,7 +303,7 @@ class JetAssignmentTransformer(nn.Module):
         ht = pt.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         pt_frac = pt / ht
 
-        eta = torch.asinh(pz / pt)
+        eta = _asinh(pz / pt)
         abs_eta = torch.abs(eta)
 
         phi = torch.atan2(py, px)
@@ -365,7 +393,7 @@ class JetAssignmentTransformer(nn.Module):
         pt_cv = pt_std / pt_mean                                        # (...,)
 
         # --- Angular quantities ---
-        eta = torch.asinh(pz / pt)                                      # (..., 3)
+        eta = _asinh(pz / pt)                                      # (..., 3)
         phi = torch.atan2(py, px)                                       # (..., 3)
 
         # --- All 3 intra-group pairs ---
@@ -470,7 +498,7 @@ class JetAssignmentTransformer(nn.Module):
         def eta_phi(p):
             px, py, pz = p[..., 1], p[..., 2], p[..., 3]
             pt = torch.sqrt(px**2 + py**2).clamp(min=1e-8)
-            return torch.asinh(pz / pt), torch.atan2(py, px)
+            return _asinh(pz / pt), torch.atan2(py, px)
 
         eta1, phi1 = eta_phi(g1_4vec)
         eta2, phi2 = eta_phi(g2_4vec)
@@ -643,6 +671,7 @@ class JetAssignmentTransformer(nn.Module):
     def forward(self, four_momenta: torch.Tensor) -> dict[str, torch.Tensor]:
         jet_embeddings = self.encode_jets(four_momenta)
         mass_pred = self.predict_mass(jet_embeddings)
+        score_logit = self.score_head(jet_embeddings.mean(dim=1)).squeeze(-1)
         if self.has_isr:
             # Compute groupings first so the ISR head can see grouping quality
             grouping_logits, mass_asym_flat, mass_sum_flat, grp_summary = (
@@ -659,6 +688,7 @@ class JetAssignmentTransformer(nn.Module):
                 "mass_asym_flat": mass_asym_flat,
                 "mass_sum_flat": mass_sum_flat,
                 "mass_pred": mass_pred,
+                "score_logit": score_logit,
             }
         else:
             logits, mass_asym_flat, mass_sum_flat = self._score_assignments_flat(
@@ -669,6 +699,7 @@ class JetAssignmentTransformer(nn.Module):
                 "mass_asym_flat": mass_asym_flat,
                 "mass_sum_flat": mass_sum_flat,
                 "mass_pred": mass_pred,
+                "score_logit": score_logit,
             }
 
 
@@ -789,8 +820,8 @@ class MassAsymmetryClassicalSolver(nn.Module):
         px2, py2, pz2 = g2_sum[..., 1], g2_sum[..., 2], g2_sum[..., 3]
         pt1 = torch.sqrt(px1**2 + py1**2).clamp(min=1e-8)
         pt2 = torch.sqrt(px2**2 + py2**2).clamp(min=1e-8)
-        eta1 = torch.asinh(pz1 / pt1)
-        eta2 = torch.asinh(pz2 / pt2)
+        eta1 = _asinh(pz1 / pt1)
+        eta2 = _asinh(pz2 / pt2)
         phi1 = torch.atan2(py1, px1)
         phi2 = torch.atan2(py2, px2)
         dphi = JetAssignmentTransformer.wrap_dphi(phi1 - phi2)

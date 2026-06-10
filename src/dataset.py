@@ -95,18 +95,21 @@ class JetAssignmentDataset(Dataset):
         all_labels = []
         all_masses = []
         all_ht = []
+        all_weights = []
 
         for fpath in files:
-            four_mom, labels, parent_mass, ht = self._load_file(fpath)
+            four_mom, labels, parent_mass, ht, weights = self._load_file(fpath)
             all_four_momenta.append(four_mom)
             all_labels.append(labels)
             all_masses.append(parent_mass)
             all_ht.append(ht)
+            all_weights.append(weights)
 
         self.four_momenta = torch.cat(all_four_momenta, dim=0)
         self.labels = torch.cat(all_labels, dim=0)
         self.parent_masses = torch.cat(all_masses, dim=0)
         self.ht = torch.cat(all_ht, dim=0)
+        self.weights = torch.cat(all_weights, dim=0)
 
         # Per-event background tag.  Every event in this dataset is signal or
         # QCD background depending on the is_background constructor flag.
@@ -129,6 +132,7 @@ class JetAssignmentDataset(Dataset):
         self.labels = self.labels[valid]
         self.parent_masses = self.parent_masses[valid]
         self.ht = self.ht[valid]
+        self.weights = self.weights[valid]
         self.is_background = self.is_background[valid]
         n_after = len(self.labels)
 
@@ -209,12 +213,24 @@ class JetAssignmentDataset(Dataset):
             if parent_mass_arr is None:
                 parent_mass_arr = np.zeros(n_events, dtype=np.float32)
 
+            # Per-event physics weights: EventVars/normweight (preferred),
+            # falling back to event_features column 6, else unit weights.
+            # Kept aligned with the events through the validity filtering so
+            # downstream analysis can produce properly weighted yields.
+            if "EventVars" in f and "normweight" in f["EventVars"]:
+                weights = f["EventVars/normweight"][:].astype(np.float32)
+            elif "event_features" in f and f["event_features"].shape[1] >= 7:
+                weights = f["event_features"][:, 6].astype(np.float32)
+            else:
+                weights = np.ones(n_events, dtype=np.float32)
+
             four_mom_t = torch.tensor(sorted_four_mom, dtype=torch.float32)
             labels_t = torch.tensor(labels, dtype=torch.long)
             parent_mass_t = torch.tensor(parent_mass_arr, dtype=torch.float32)
             ht_t = torch.tensor(ht, dtype=torch.float32)
+            weights_t = torch.tensor(weights, dtype=torch.float32)
 
-            return four_mom_t, labels_t, parent_mass_t, ht_t
+            return four_mom_t, labels_t, parent_mass_t, ht_t, weights_t
 
     def _read_inputs_source(self, f):
         """Read kinematics from INPUTS/Source group."""

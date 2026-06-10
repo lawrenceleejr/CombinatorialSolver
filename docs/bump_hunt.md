@@ -1,5 +1,10 @@
 # From combinatorial solver to an LHC bump-hunt search
 
+> **Status:** the full chain described in §6 below is now implemented:
+> `src.analysis` → `src.background_estimate` (chi-sideband QCD transfer +
+> closure) → `src.bump_hunt` (pyhf p0 scan / CLs limits / signal injection).
+> See §6 for the runbook.
+
 This note explains how the pieces in this repo fit together into an actual
 dijet-of-trijets bump-hunt search (pair-produced RPV gluinos → 6 jets, possibly
 + ISR), how the setup is made robust to signals with **resonant structure inside
@@ -175,12 +180,99 @@ asymmetry rather than to a mass *window*). **Verify it:**
 ---
 
 ## 5. Suggested next steps in this repo
-1. Wire per-event **weights** from the HDF5 into `src/analysis.py` for true yields.
-2. Add a **QCD-shape-stability / sculpting** panel to `cut_plots.py` (QCD `m_avg`
-   shape vs cut tightness).
-3. Add an **ABCD closure** helper (pick two variables, print the four-region
-   prediction and closure).
-4. Add a thin **`pyhf` template-fit** script that consumes `observables.npz` and a
-   background template to produce a limit/significance vs mass.
+1. ~~Wire per-event **weights** from the HDF5 into `src/analysis.py`~~ — **done**
+   (`EventVars/normweight` → `Observables.weight`, used in all yields).
+2. ~~Add a **QCD-shape-stability / sculpting** panel~~ — **done** (score-cut
+   sculpting panel in `background_estimate.pdf`).
+3. ~~Add a region-based closure helper~~ — **done** as the χ-sideband transfer
+   (`src/background_estimate.py`), which generalises the ABCD idea to a binned
+   shape transfer with fitted `R(m_avg)`.
+4. ~~Add a **`pyhf` template-fit** script~~ — **done** (`src/bump_hunt.py`).
 5. When a real cascade (`g̃→q+q̃→qq`) MadGraph sample lands, mix it into training and
    re-validate the `m_avg` peak and Dalitz-cut efficiencies with `src/analysis.py`.
+
+---
+
+## 6. The implemented search chain (runbook)
+
+The full analysis is three commands, each consuming the previous one's output:
+
+```bash
+# 1. Observables on the final network (per-event m_avg, y*, chi, cuts, NN score)
+python -m src.analysis --checkpoint checkpoints/best_model.pt \
+    --signal "data/sig*.h5" --background "data/qcd*.h5" \
+    --output results/bump_hunt [--soft-mass-topk 5]
+
+# 2. Chi-sideband QCD estimate + closure suite (SR/VR/CR in y*)
+python -m src.background_estimate \
+    --observables results/bump_hunt/observables.npz \
+    --output results/bkg_estimate \
+    --blind 900 1100 --poly-degree 2 [--score-min 0.5]
+
+# 3. pyhf statistics: p0 scan, CLs limits, signal injection
+python -m src.bump_hunt --templates results/bkg_estimate/templates.npz \
+    --output results/bump_hunt_stats [--inject-mu 0.02]
+```
+
+**Stage 2 — the background estimate** (`src/background_estimate.py`):
+- Regions in `y* = |y₁−y₂|/2` by data percentiles (SR < 60% < VR < 85% < CR),
+  with the SR cuts (Δφ, asym, NN score) applied identically in all regions.
+- QCD `m_avg` template from the CR, corrected by a polynomial transfer factor
+  `R(m_avg)`; **use the lowest degree that closes in the VR** — the tool prints a
+  hint when the degree is insufficient (χ²/ndf > 2).
+- Closure outputs: VR predicted-vs-observed (χ²/ndf, pulls), SR-sideband closure
+  (blind window excluded), stat-subtracted non-closure systematic, signal
+  contamination in CR/VR, and the **score-sculpting panel** (normalised SR data
+  `m_avg` shape vs score cut — must stay smooth/stable before cutting on the score).
+- CR-empty tail bins are assigned `0 (+1.84·R)` Poisson-bounded predictions so a
+  couple of events in a sparse tail cannot fake a discovery.
+
+**Stage 3 — statistics** (`src/bump_hunt.py`):
+- Single-channel HistFactory model per probed mass: signal template (MC at the MC
+  mass, Gaussian surrogate elsewhere), background with per-bin `shapesys`
+  (CR stat ⊕ transfer fit) and a `normsys` for the VR non-closure.
+- Local p₀/Z scan, trials-factor global p-value, observed + expected (±1/2σ)
+  95% CLs limits on μ, and an Asimov **signal-injection recovery test**
+  (fitted μ̂ vs injected, with profile-likelihood uncertainty).
+- μ = 1 corresponds to the normalisation of the supplied signal sample — convert
+  with your cross-section × luminosity when real samples are used.
+
+**Validation gates before unblinding** (in order): VR closure χ²/ndf ≈ 1 →
+SR-sideband closure ≈ 1 → sculpting panel stable vs score cut → background-only
+p₀ scan flat → injection pull ≈ 0. The toy QCD passes these by construction;
+**the χ-factorisation must be re-validated on realistic QCD MC or data sidebands.**
+
+---
+
+## 7. ML sensitivity improvements (implemented + proposed)
+
+**Implemented:**
+- **Event-level signal score head** (`model.score_head`, trained with
+  `training.lambda_cls`, requires `--qcd-data`): a signal-vs-QCD classifier on the
+  mean-pooled encoder embedding. Because that embedding is shared with the
+  gradient-reversal **mass adversary**, the score inherits the mass decorrelation —
+  it can define the SR category without sculpting a bump (verify with the
+  sculpting panel). The BCE is **class-balanced** (per-batch `pos_weight`) so an
+  imbalanced signal/QCD mix doesn't compress the score toward the class prior.
+  Validation logs the score AUC; the score is exported in ONNX (second output
+  `score_logit`) and flows through `src.analysis`. In the background estimate,
+  prefer the calibration-robust `--score-quantile q` (keep the top 1−q most
+  signal-like data) over an absolute `--score-min`.
+- **Soft m_avg** (`--soft-mass-topk K` in `src.analysis`): probability-weighted
+  m_avg over the top-K assignments — combinatorially ambiguous events contribute a
+  smeared-but-centred value instead of a randomly wrong one, sharpening the peak.
+- **Cascade-robust training recipe**: mix `--cascade` samples (resonant triplet)
+  with flat-RPV samples and multiple mass points in the training glob; the
+  argmin-|m₁−m₂| labels remain correct for both topologies.
+
+**Proposed (not implemented):**
+- **Δy / pT-balance assignment features**: add `|Δy|` between candidate parents and
+  triplet-pT balance to the inter-group physics features. Likely helps the
+  assignment, but changes `n_group_physics` (breaks old checkpoints) — gate behind
+  a config flag when needed.
+- **χ-adversary**: if the score-sculpting check ever shows the score correlating
+  with y*, add a second gradient-reversal head predicting y* so the χ-transfer
+  regions stay unbiased under the score cut.
+- **Response-smearing augmentation** (Rebalance-&-Smear flavoured): train with
+  jet-response-shaped pT smearing rather than Gaussian, hardening the assignment
+  against non-Gaussian mismeasurement tails.

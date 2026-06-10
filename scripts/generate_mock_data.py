@@ -24,12 +24,17 @@ def generate_event(parent_mass: float, include_isr: bool = False) -> dict:
     """
     jets = []
 
-    # Generate two parent particles (roughly back-to-back in transverse plane)
+    # Generate two parent particles (roughly back-to-back in transverse plane).
+    # Heavy pair production happens near threshold, so the parents are CENTRAL
+    # with a small, correlated rapidity separation (shared longitudinal boost
+    # plus a small y*), unlike QCD's forward-peaked t-channel topology.
     parent_pt = np.random.exponential(parent_mass * 0.3)
     parent_phi1 = np.random.uniform(-np.pi, np.pi)
     parent_phi2 = parent_phi1 + np.pi
-    parent_eta1 = np.random.normal(0, 1.5)
-    parent_eta2 = np.random.normal(0, 1.5)
+    y_boost = np.random.normal(0, 0.5)
+    y_star_pair = np.random.normal(0, 0.35)
+    parent_eta1 = y_boost + y_star_pair
+    parent_eta2 = y_boost - y_star_pair
 
     for p_phi, p_eta in [(parent_phi1, parent_eta1), (parent_phi2, parent_eta2)]:
         fracs = np.random.dirichlet([2, 2, 2])
@@ -175,10 +180,14 @@ def generate_cascade_event(
         raise ValueError("squark_mass must be < gluino_mass for an on-shell cascade")
 
     jets = []
-    # Two gluinos, roughly back-to-back in the transverse plane.
+    # Two gluinos, roughly back-to-back in the transverse plane and CENTRAL in
+    # rapidity (near-threshold pair production: shared longitudinal boost plus
+    # a small correlated y*), unlike QCD's forward-peaked t-channel topology.
     parent_pt = np.random.exponential(gluino_mass * 0.3)
     phi1 = np.random.uniform(-np.pi, np.pi)
-    for sign, p_eta in [(0.0, np.random.normal(0, 1.5)), (np.pi, np.random.normal(0, 1.5))]:
+    y_boost = np.random.normal(0, 0.5)
+    y_star_pair = np.random.normal(0, 0.35)
+    for sign, p_eta in [(0.0, y_boost + y_star_pair), (np.pi, y_boost - y_star_pair)]:
         p_phi = phi1 + sign
         # Gluino lab four-vector.
         glu_pt = parent_pt
@@ -244,59 +253,75 @@ def _assemble_event(jets: list[dict], include_isr: bool) -> dict:
 def generate_background_event(include_isr: bool = False) -> dict:
     """Generate one QCD-like multijet background event (no resonance).
 
-    Jets are drawn from a steeply falling pT spectrum with roughly uncorrelated
-    angles, so there is no pair of equal-mass triplets — exactly the structure
-    the network must learn to push to low average mass.  ``is_signal`` is 0 for
-    every jet and the event carries no real parent.  Used to exercise the
-    background-rejection training path before real MadGraph QCD is available.
+    Modeled as a t-channel-like 2->2 dijet skeleton with collinear splitting,
+    so the toy reproduces the QCD correlations the analysis exploits:
+
+      - the two leading partons are back-to-back in phi with a falling pT
+        spectrum (so the assembled triplets are roughly back-to-back, like
+        real QCD recoil — Delta-phi is NOT a free discriminator);
+      - the rapidity separation is drawn forward-peaked (flat in chi = e^{2y*},
+        the Rutherford t-channel limit), so high-y* is QCD-enriched — the
+        chi-sideband background transfer has a populated control region;
+      - each parton splits collinearly into 3 jets with soft/collinear-enhanced
+        energy sharing, populating the Dalitz edges/corners.
+
+    Jets respect the analysis acceptance (pT > 30 GeV, |eta| < 2.4).
+    ``is_signal`` is 0 for every jet and the event carries no real parent.
+    Used to exercise the background-rejection / chi-transfer paths before real
+    MadGraph QCD is available.
     """
-    n_jets = 7 if include_isr else 6
-    max_jets = 20
+    # --- Hard 2->2 skeleton -------------------------------------------------
+    # Falling parton pT spectrum; back-to-back in phi with a small acoplanarity
+    # kick (toy ISR recoil).  The scale is chosen so the reconstructed m_avg
+    # spectrum falls steeply but keeps a populated tail through the TeV search
+    # range (a zero-background search region would make the toy bump hunt
+    # degenerate).
+    parton_pt = 30.0 + np.random.exponential(200.0)
+    phi1 = np.random.uniform(-np.pi, np.pi)
+    phi2 = phi1 + np.pi + np.random.normal(0.0, 0.25)
 
-    # Steeply falling jet pT spectrum (leading jet hardest), uncorrelated angles.
-    scale = np.random.uniform(80.0, 160.0)
-    pts = np.sort(np.random.exponential(scale, size=n_jets))[::-1]
-    pts = np.maximum(pts, 25.0)
+    # Forward-peaked rapidity separation: flat in chi (t-channel Rutherford
+    # limit), i.e. y* = ln(chi)/2 with chi uniform in [1, chi_max].  The boost
+    # of the dijet system spreads events in y_boost (PDF proxy).
+    chi_max = 12.0
+    y_star = 0.5 * np.log(np.random.uniform(1.0, chi_max))
+    y_boost = np.random.normal(0.0, 0.6)
+    eta1 = y_boost + y_star
+    eta2 = y_boost - y_star
 
-    pt = np.zeros(max_jets, dtype=np.float32)
-    eta = np.zeros(max_jets, dtype=np.float32)
-    phi = np.zeros(max_jets, dtype=np.float32)
-    mass = np.zeros(max_jets, dtype=np.float32)
-    mask = np.zeros(max_jets, dtype=bool)
+    jets: list[dict] = []
+    for p_phi, p_eta in ((phi1, eta1), (phi2, eta2)):
+        # Soft/collinear-enhanced energy sharing: Dirichlet with small alpha
+        # gives one hard + two soft fragments (DGLAP-like), populating the
+        # Dalitz edges — unlike a resonance decay's flat interior.
+        fracs = np.random.dirichlet([1.0, 1.0, 1.0])
+        for frac in np.sort(fracs)[::-1]:
+            pt_j = max(parton_pt * frac + np.random.normal(0.0, 8.0), 30.0)
+            # Collinear spread shrinks for harder fragments.
+            spread = 0.25 + 0.25 * (1.0 - frac)
+            eta_j = np.clip(p_eta + np.random.normal(0.0, spread), -2.4, 2.4)
+            phi_j = p_phi + np.random.normal(0.0, spread)
+            phi_j = ((phi_j + np.pi) % (2 * np.pi)) - np.pi
+            jets.append({
+                "pt": float(pt_j),
+                "eta": float(eta_j),
+                "phi": float(phi_j),
+                "mass": float(np.random.exponential(0.005)),
+            })
 
-    for i in range(n_jets):
-        pt[i] = float(pts[i])
-        eta[i] = float(np.random.uniform(-2.5, 2.5))
-        phi[i] = float(np.random.uniform(-np.pi, np.pi))
-        mass[i] = float(np.random.exponential(0.005))  # near-massless partons
-        mask[i] = True
+    if include_isr:
+        jets.append({
+            "pt": float(max(np.random.exponential(40.0), 30.0)),
+            "eta": float(np.random.uniform(-2.4, 2.4)),
+            "phi": float(np.random.uniform(-np.pi, np.pi)),
+            "mass": float(np.random.exponential(0.003)),
+        })
 
-    px = pt * np.cos(phi)
-    py = pt * np.sin(phi)
-    pz = pt * np.sinh(eta)
-    energy = np.sqrt(px**2 + py**2 + pz**2 + mass**2)
-    ht = pt[mask].sum()
-
-    # jet_features: [pt, eta, phi, mass, parent_idx, is_signal] — all background.
-    jet_features = np.zeros((max_jets, 6), dtype=np.float32)
-    for i in range(n_jets):
-        jet_features[i, 0] = pt[i]
-        jet_features[i, 1] = eta[i]
-        jet_features[i, 2] = phi[i]
-        jet_features[i, 3] = mass[i]
-        jet_features[i, 4] = 0.0  # no parent
-        jet_features[i, 5] = 0.0  # is_signal = 0 (background)
-
-    # event_features: n_signal = 0 for background.
-    event_features = np.array([n_jets, 0.0, 0.0, 0.0, ht, 0, 1.0], dtype=np.float32)
-
-    return {
-        "jet_features": jet_features,
-        "jet_mask": mask,
-        "event_features": event_features,
-        "pt": pt, "eta": eta, "phi": phi, "mass": mass,
-        "energy": energy, "mask": mask,
-    }
+    event = _assemble_event(jets, include_isr)
+    # Background: no parent, n_signal = 0.
+    event["jet_features"][:, 4] = 0.0
+    event["event_features"][5] = 0
+    return event
 
 
 def generate_dataset(

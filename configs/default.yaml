@@ -98,6 +98,14 @@ training:
   beta_bg: 0.5
   bg_soft_weight: 2.0
   bg_asym_cut: 0.0
+  # Event-level signal-vs-QCD score head (BCE: signal=1, background=0).
+  # Requires a QCD sample (--qcd-data); auto-disabled otherwise.  The head reads
+  # the adversarially mass-decorrelated pooled embedding, so the score can define
+  # the bump-hunt signal-region category without sculpting the QCD m_avg shape —
+  # verify with the sculpting panel produced by src.background_estimate.
+  # Ramps up from Phase 2 start.  Validation logs the signal-vs-QCD score AUC.
+  lambda_cls: 1.0
+  lambda_cls_rampup: 10
   # Distillation from the classical mass-asymmetry solver.
   # At Phase 2 epoch 0 this loss pulls the NN logits toward the assignment with
   # the smallest |m1-m2|/(m1+m2).  It decays linearly to zero over

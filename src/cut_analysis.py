@@ -94,6 +94,9 @@ OBS_LABELS = {
     "avg_boost":     r"Average triplet boost  $\gamma = E/m$",
     "dalitz_corner": r"Dalitz corner distance  median$(d_1,d_2,d_3)$",
     "dalitz_edge":   r"Dalitz edge distance  min$(d_1,d_2,d_3)$",
+    "y_star":        r"$y^* = |y_1 - y_2|/2$ between parent candidates",
+    "chi":           r"$\chi = e^{2y^*}$",
+    "score":         r"NN signal score",
 }
 
 
@@ -135,7 +138,16 @@ def dalitz_edge_corner(dalitz_x: np.ndarray, dalitz_y: np.ndarray) -> tuple[np.n
 # --------------------------------------------------------------------------- #
 @dataclass
 class Observables:
-    """Per-event analysis observables for one sample (signal OR background)."""
+    """Per-event analysis observables for one sample (signal OR background).
+
+    ``y_star``/``chi`` are the rapidity-separation variables of the two chosen
+    triplets (``y* = |y1-y2|/2``, ``chi = exp(2 y*)``): QCD's t-channel angular
+    shape in chi is approximately mass-invariant (scale invariance), which is
+    the factorisation the chi-sideband background transfer relies on.  ``score``
+    is the event-level NN signal-vs-QCD probability (sigmoid of the score head),
+    when the model provides one.  All three default to ``None`` so the original
+    six-observable construction keeps working unchanged.
+    """
 
     avg_mass: np.ndarray
     mass_asym: np.ndarray
@@ -145,6 +157,9 @@ class Observables:
     dalitz_corner: np.ndarray
     weight: np.ndarray | None = None
     extra: dict = field(default_factory=dict)
+    y_star: np.ndarray | None = None
+    chi: np.ndarray | None = None
+    score: np.ndarray | None = None
 
     def __len__(self) -> int:
         return len(self.avg_mass)
@@ -389,3 +404,81 @@ def _pareto_front(x: np.ndarray, y: np.ndarray) -> np.ndarray:
             keep.append(idx)
             best_y = y[idx]
     return np.array(sorted(keep))
+
+
+# --------------------------------------------------------------------------- #
+# Analysis regions (chi-sideband transfer)
+# --------------------------------------------------------------------------- #
+# The bump hunt uses three regions in y* = |y1-y2|/2 between the two chosen
+# triplets.  Signal (pair production) is central (low y*); QCD's t-channel
+# exchange is forward-peaked, so high y* is QCD-rich and signal-poor:
+#
+#   SR (low y*)    : search region — bump hunt in m_avg, blinded in the window
+#   VR (mid y*)    : validation — transfer-factor derivation & closure
+#   CR (high y*)   : QCD m_avg template source
+#
+# With the |eta| < 2.4 jet acceptance the y* reach is modest, so boundaries are
+# defined by *percentiles of the background-like data* rather than fixed chi
+# values — this directly controls the region yields (the binding constraint is
+# the CR population at high mass, not the SR).
+DEFAULT_SR_QUANTILE = 0.60   # SR = bottom 60% of the y* distribution
+DEFAULT_VR_QUANTILE = 0.85   # VR = 60-85%; CR = top 15%
+
+
+def region_boundaries(
+    y_star: np.ndarray,
+    weights: np.ndarray | None = None,
+    sr_quantile: float = DEFAULT_SR_QUANTILE,
+    vr_quantile: float = DEFAULT_VR_QUANTILE,
+) -> tuple[float, float]:
+    """y* boundaries (b1, b2) such that SR: y* < b1, VR: b1 <= y* < b2, CR: y* >= b2.
+
+    Derived from the (weighted) percentiles of the supplied y* sample — use the
+    background-like data (or the QCD sample) here, NOT signal, so the region
+    populations are controlled.
+    """
+    y = np.asarray(y_star, dtype=float)
+    if weights is None:
+        b1 = float(np.percentile(y, 100.0 * sr_quantile))
+        b2 = float(np.percentile(y, 100.0 * vr_quantile))
+    else:
+        w = np.asarray(weights, dtype=float)
+        order = np.argsort(y)
+        cw = np.cumsum(w[order])
+        cw = cw / cw[-1]
+        b1 = float(np.interp(sr_quantile, cw, y[order]))
+        b2 = float(np.interp(vr_quantile, cw, y[order]))
+    return b1, b2
+
+
+def region_masks(
+    obs: Observables,
+    boundaries: tuple[float, float],
+    sr_cuts: dict[str, tuple[str, float]] | None = None,
+    score_min: float | None = None,
+) -> dict[str, np.ndarray]:
+    """Boolean masks for SR / VR / CR.
+
+    The y* split defines the three regions.  ``sr_cuts`` (e.g. delta_phi > 2.5,
+    mass_asym < 0.4) and the NN ``score_min`` requirement are applied to ALL
+    three regions identically — the transfer is only valid if the CR and SR see
+    the same selection apart from the y* split itself.
+    """
+    if obs.y_star is None:
+        raise ValueError("Observables.y_star is not set; compute it first.")
+    b1, b2 = boundaries
+    y = np.asarray(obs.y_star, dtype=float)
+
+    common = np.ones(len(obs), dtype=bool)
+    if sr_cuts:
+        common &= combined_mask(obs, sr_cuts)
+    if score_min is not None:
+        if obs.score is None:
+            raise ValueError("score_min requested but Observables.score is not set.")
+        common &= np.asarray(obs.score, dtype=float) >= score_min
+
+    return {
+        "SR": common & (y < b1),
+        "VR": common & (y >= b1) & (y < b2),
+        "CR": common & (y >= b2),
+    }

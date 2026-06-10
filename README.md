@@ -93,6 +93,35 @@ before/after cuts. The same plots are **animated per epoch** during training
 (`plots/bump_hunt_roc_anim_latest.gif`) whenever a `--qcd-data` background sample
 is supplied.
 
+### 5. Full search chain: background estimate + statistics
+
+```bash
+# Chi-sideband data-driven QCD estimate (SR/VR/CR in y*) + closure suite
+python -m src.background_estimate --observables results/bump_hunt/observables.npz \
+    --output results/bkg_estimate --blind 900 1100 --poly-degree 2
+
+# pyhf bump hunt: local p0 scan, trials-corrected global p, CLs limits,
+# signal-injection recovery test
+python -m src.bump_hunt --templates results/bkg_estimate/templates.npz \
+    --output results/bump_hunt_stats --inject-mu 0.02
+```
+
+The background estimate measures the QCD `m_avg` shape in the forward (high-y\*)
+control region and transfers it to the central signal region with a fitted
+polynomial `R(m_avg)`, validated by VR closure, SR-sideband closure, a
+score-sculpting stability panel, and signal-contamination reports. See
+[`docs/bump_hunt.md`](docs/bump_hunt.md) §6 for the full runbook and validation
+gates.
+
+### Event-level signal score (`training.lambda_cls`)
+
+When training with `--qcd-data`, the model also learns an **event-level
+signal-vs-QCD score** (`lambda_cls`, BCE) on the same adversarially
+mass-decorrelated embedding the mass adversary acts on, so the score can define
+the signal region without sculpting the QCD `m_avg` shape. The score is logged
+as a validation AUC, exported as a second ONNX output (`score_logit`), and flows
+through `src.analysis` (`--score-min` in `src.background_estimate`).
+
 See [`docs/bump_hunt.md`](docs/bump_hunt.md) for the full search roadmap
 (background estimation, decorrelation/no-sculpting checks, limits/significance,
 look-elsewhere, systematics) and for how the setup stays robust to signals with

@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from .combinatorics import enumerate_assignments
 from .dataset import JetAssignmentDataset
 from .model import JetAssignmentTransformer, MassAsymmetryClassicalSolver
-from .utils import compute_invariant_mass, get_config, get_device
+from .utils import compute_invariant_mass, get_config, get_device, load_compatible_state_dict
 
 
 def evaluate(
@@ -70,7 +70,7 @@ def evaluate(
         dropout=mc.get("dropout", 0.1),
         num_jets=dc["num_jets"],
     ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    load_compatible_state_dict(model, checkpoint["model_state_dict"])
     model.eval()
 
     # Data — load WITHOUT HT normalization so we can compute physical masses

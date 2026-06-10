@@ -29,7 +29,7 @@ from pathlib import Path
 import torch
 
 from .model import JetAssignmentTransformer, MassAsymmetryClassicalSolver
-from .utils import get_config, get_device
+from .utils import get_config, get_device, load_compatible_state_dict
 
 
 class _LogitsOnly(torch.nn.Module):
@@ -41,6 +41,20 @@ class _LogitsOnly(torch.nn.Module):
 
     def forward(self, four_momenta: torch.Tensor) -> torch.Tensor:
         return self.inner(four_momenta)["logits"]
+
+
+class _LogitsAndScore(torch.nn.Module):
+    """Wrapper exposing both the assignment logits and the event-level signal
+    score logit, for models with a score head.  ONNX consumers that only need
+    the assignment can read the first output and ignore the second."""
+
+    def __init__(self, inner: torch.nn.Module):
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, four_momenta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        out = self.inner(four_momenta)
+        return out["logits"], out["score_logit"]
 
 
 def export_ml_model(
@@ -73,10 +87,10 @@ def export_ml_model(
         input_dim=dc.get("input_dim", 4),
         group_num_layers=mc.get("group_num_layers", 1),
     ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    load_compatible_state_dict(model, checkpoint["model_state_dict"])
     model.eval()
 
-    wrapped = _LogitsOnly(model).to(device)
+    wrapped = _LogitsAndScore(model).to(device)
     wrapped.eval()
 
     dummy = torch.zeros(1, num_jets, 4, device=device)
@@ -87,11 +101,19 @@ def export_ml_model(
         dummy,
         output_path,
         input_names=["four_momenta"],
-        output_names=["logits"],
-        dynamic_axes={"four_momenta": {0: "batch"}, "logits": {0: "batch"}},
-        opset_version=17,
+        output_names=["logits", "score_logit"],
+        dynamic_axes={
+            "four_momenta": {0: "batch"},
+            "logits": {0: "batch"},
+            "score_logit": {0: "batch"},
+        },
+        opset_version=18,
+        # The dynamo exporter (default in torch >= 2.9) fails on the
+        # GroupTransformer's reshape of expanded (non-contiguous) tensors;
+        # the legacy TorchScript exporter handles it fine.
+        dynamo=False,
     )
-    print(f"ML model exported → {output_path}")
+    print(f"ML model exported → {output_path} (outputs: logits, score_logit)")
 
 
 def export_classical_solver(
@@ -123,7 +145,7 @@ def export_classical_solver(
         input_names=["four_momenta"],
         output_names=["logits"],
         dynamic_axes={"four_momenta": {0: "batch"}, "logits": {0: "batch"}},
-        opset_version=17,
+        opset_version=18,
     )
     print(f"Classical solver exported → {output_path}")
 

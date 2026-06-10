@@ -6,3 +6,8 @@ onnx>=1.14.0
 onnxscript>=0.1.0
 matplotlib>=3.7.0
 pillow>=9.0.0
+# Statistical inference for the bump hunt (src.bump_hunt)
+pyhf>=0.7.0
+iminuit>=2.0.0
+# ONNX inference for the standalone analysis (src.analysis)
+onnxruntime>=1.16.0

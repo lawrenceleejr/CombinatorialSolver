@@ -74,6 +74,33 @@ def get_config(config_path: str | None = None) -> dict:
     return config
 
 
+def load_compatible_state_dict(model: torch.nn.Module, state_dict: dict) -> None:
+    """Load a checkpoint, tolerating ONLY a missing/extra ``score_head``.
+
+    Checkpoints written before the event-level score head was added lack its
+    weights; loading them with ``strict=True`` would fail even though every
+    other parameter matches.  This loads with ``strict=False`` but re-raises if
+    anything *other* than ``score_head.*`` is missing or unexpected, so real
+    architecture mismatches still fail loudly.  When the score head is left at
+    its random initialisation a warning is printed — the score output is
+    meaningless for such checkpoints and must not be cut on.
+    """
+    result = model.load_state_dict(state_dict, strict=False)
+    bad_missing = [k for k in result.missing_keys if not k.startswith("score_head.")]
+    bad_unexpected = [k for k in result.unexpected_keys if not k.startswith("score_head.")]
+    if bad_missing or bad_unexpected:
+        raise RuntimeError(
+            f"Checkpoint/model mismatch beyond the score head: "
+            f"missing={bad_missing}, unexpected={bad_unexpected}"
+        )
+    if any(k.startswith("score_head.") for k in result.missing_keys):
+        print(
+            "  Note: checkpoint has no score_head weights (pre-score-head "
+            "checkpoint). The NN signal score is untrained/meaningless for "
+            "this model — do not cut on it."
+        )
+
+
 def compute_invariant_mass(four_momenta: torch.Tensor) -> torch.Tensor:
     """Compute invariant mass from summed four-momenta.
 

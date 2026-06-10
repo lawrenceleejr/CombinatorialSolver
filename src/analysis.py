@@ -10,6 +10,10 @@ computes the analysis observables on the chosen triplets, and produces:
     points with the Pareto front;
   - the average-mass bump-hunt histogram before/after the cuts.
 
+The per-event ``observables.npz`` written here is the input to the next stages
+of the search: ``src.background_estimate`` (chi-sideband QCD transfer +
+closure) and ``src.bump_hunt`` (pyhf p0 scan / limits / signal injection).
+
 This is the offline counterpart of the per-epoch ROC animation produced during
 training (``src.train``); both share the cut/observable logic in
 ``src.cut_analysis`` and the plotting in ``src.cut_plots``.
@@ -31,6 +35,10 @@ The cut thresholds default to the requested working point
 (Δφ > 2.5, mass asymmetry < 0.4, average boost < 2); the Dalitz edge/corner
 cuts are off by default and can be dialled in with ``--dalitz-edge`` /
 ``--dalitz-corner`` or explored via the ROC working-point cloud.
+``--soft-mass-topk K`` switches m_avg to the probability-weighted mean over the
+network's top-K assignments (sharper signal peak on combinatorially ambiguous
+events).  When the model carries a trained score head, the per-event NN signal
+score is exported alongside the observables.
 """
 
 from __future__ import annotations
@@ -45,6 +53,13 @@ from .cut_analysis import DEFAULT_CUTS, Observables, cutflow, format_cutflow
 from .cut_plots import make_summary_figure
 from .dataset import JetAssignmentDataset
 
+# Observable keys exported to observables.npz (score handled separately since
+# it may be absent for models without a trained score head).
+NPZ_KEYS = (
+    "avg_mass", "mass_asym", "delta_phi", "avg_boost",
+    "dalitz_edge", "dalitz_corner", "y_star", "chi",
+)
+
 
 # --------------------------------------------------------------------------- #
 # Observable computation from raw four-momenta + chosen assignment
@@ -54,11 +69,56 @@ def _inv_mass(p: np.ndarray) -> np.ndarray:
     return np.sqrt(np.clip(m2, 0.0, None))
 
 
+def _rapidity(p: np.ndarray) -> np.ndarray:
+    """Rapidity y = 0.5 ln((E+pz)/(E-pz)) of four-vectors ``(..., 4)``."""
+    E, pz = p[..., 0], p[..., 3]
+    return 0.5 * np.log(np.clip(E + pz, 1e-9, None) / np.clip(E - pz, 1e-9, None))
+
+
+def soft_avg_mass(
+    raw_four_mom: np.ndarray,
+    logits: np.ndarray,
+    num_jets: int,
+    k: int,
+) -> np.ndarray:
+    """Probability-weighted average candidate mass over the top-k assignments.
+
+    Instead of committing to the argmax interpretation, m_avg is averaged over
+    the network's k most probable assignments with softmax weights
+    (renormalised over the k).  Combinatorially ambiguous events — where the
+    argmax is a coin flip between near-degenerate interpretations — then
+    contribute a smeared-but-centred value rather than a randomly wrong one,
+    sharpening the signal peak; confident events (near-one-hot softmax) are
+    unchanged.
+    """
+    assignments = enumerate_assignments(num_jets)
+    g1_arr = np.array([list(a[1]) for a in assignments], dtype=int)
+    g2_arr = np.array([list(a[2]) for a in assignments], dtype=int)
+
+    N = raw_four_mom.shape[0]
+    k = min(k, logits.shape[1])
+    topk_idx = np.argpartition(-logits, k - 1, axis=1)[:, :k]            # (N, k)
+    topk_logits = np.take_along_axis(logits, topk_idx, axis=1)
+    topk_logits = topk_logits - topk_logits.max(axis=1, keepdims=True)
+    w = np.exp(topk_logits)
+    w /= w.sum(axis=1, keepdims=True)                                     # (N, k)
+
+    rows = np.arange(N)[:, None, None]
+    j1 = raw_four_mom[rows, g1_arr[topk_idx]]    # (N, k, 3, 4)
+    j2 = raw_four_mom[rows, g2_arr[topk_idx]]
+    m1 = _inv_mass(j1.sum(axis=2))               # (N, k)
+    m2 = _inv_mass(j2.sum(axis=2))
+    return ((m1 + m2) / 2.0 * w).sum(axis=1)
+
+
 def compute_observables_from_momenta(
     raw_four_mom: np.ndarray,
     pred_idx: np.ndarray,
     num_jets: int,
     weight: np.ndarray | None = None,
+    score: np.ndarray | None = None,
+    logits: np.ndarray | None = None,
+    soft_mass_topk: int = 0,
 ) -> Observables:
     """Compute the analysis observables for each event's chosen interpretation.
 
@@ -68,6 +128,12 @@ def compute_observables_from_momenta(
             :func:`enumerate_assignments`.
         num_jets: 6 or 7.
         weight: optional ``(N,)`` per-event weights.
+        score: optional ``(N,)`` NN signal score (sigmoid of the score head).
+        logits: optional ``(N, n_assign)`` assignment logits (needed for
+            ``soft_mass_topk``).
+        soft_mass_topk: when > 0 (and logits given), ``avg_mass`` becomes the
+            probability-weighted top-k mean (:func:`soft_avg_mass`); the argmax
+            value is kept in ``extra["avg_mass_argmax"]``.
     """
     assignments = enumerate_assignments(num_jets)
     g1_arr = np.array([list(a[1]) for a in assignments], dtype=int)  # (na, 3)
@@ -89,11 +155,24 @@ def compute_observables_from_momenta(
     avg_mass = msum / 2.0
     mass_asym = np.abs(m1 - m2) / np.clip(msum, 1e-8, None)
 
+    extra: dict = {}
+    if soft_mass_topk > 0 and logits is not None:
+        extra["avg_mass_argmax"] = avg_mass
+        avg_mass = soft_avg_mass(raw_four_mom, logits, num_jets, soft_mass_topk)
+
     # Δφ between the two parent sums, folded to [0, π].
     phi1 = np.arctan2(p1[:, 2], p1[:, 1])
     phi2 = np.arctan2(p2[:, 2], p2[:, 1])
     dphi = np.abs(phi1 - phi2)
     dphi = np.where(dphi > np.pi, 2 * np.pi - dphi, dphi)
+
+    # Rapidity-separation variables of the two triplets: y* = |y1-y2|/2 and
+    # chi = exp(2 y*).  QCD's t-channel angular shape in chi is approximately
+    # independent of the mass scale (QCD scale invariance), which is what the
+    # chi-sideband background transfer (src.background_estimate) relies on;
+    # pair-produced signal is central (low y*).
+    y_star = 0.5 * np.abs(_rapidity(p1) - _rapidity(p2))
+    chi = np.exp(2.0 * y_star)
 
     # Average Lorentz boost γ = E/m of the two triplets.  Clamp at 200 to match
     # the model's training-time definition (degenerate near-massless triplets
@@ -125,34 +204,51 @@ def compute_observables_from_momenta(
         avg_mass=avg_mass, mass_asym=mass_asym, delta_phi=dphi,
         avg_boost=avg_boost, dalitz_edge=edge, dalitz_corner=corner,
         weight=None if weight is None else np.asarray(weight, dtype=float),
+        extra=extra,
+        y_star=y_star, chi=chi,
+        score=None if score is None else np.asarray(score, dtype=float),
     )
 
 
 # --------------------------------------------------------------------------- #
-# Inference back-ends
+# Inference back-ends — both return (logits, score_logit_or_None)
 # --------------------------------------------------------------------------- #
-def _predict_onnx(onnx_path: str, four_mom: np.ndarray, batch: int = 2048) -> np.ndarray:
-    """Run an ONNX model and return argmax assignment indices."""
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -30.0, 30.0)))
+
+
+def _predict_onnx(
+    onnx_path: str, four_mom: np.ndarray, batch: int = 2048
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Run an ONNX model; returns (logits, score_logit or None)."""
     import onnxruntime as ort
 
     sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
     in_name = sess.get_inputs()[0].name
-    out_name = sess.get_outputs()[0].name
-    preds = []
+    out_names = [o.name for o in sess.get_outputs()]
+    has_score = "score_logit" in out_names
+    fetch = ["logits", "score_logit"] if has_score and "logits" in out_names else [out_names[0]]
+
+    logits_parts, score_parts = [], []
     for i in range(0, len(four_mom), batch):
         chunk = four_mom[i:i + batch].astype(np.float32)
-        logits = sess.run([out_name], {in_name: chunk})[0]
-        preds.append(logits.argmax(axis=-1))
-    return np.concatenate(preds)
+        outs = sess.run(fetch, {in_name: chunk})
+        logits_parts.append(outs[0])
+        if has_score:
+            score_parts.append(outs[1])
+    logits = np.concatenate(logits_parts)
+    score = np.concatenate(score_parts).reshape(-1) if score_parts else None
+    return logits, score
 
 
-def _predict_checkpoint(checkpoint: str, four_mom: np.ndarray, config_path: str | None,
-                        batch: int = 2048) -> np.ndarray:
-    """Run a ``.pt`` checkpoint and return argmax assignment indices."""
+def _predict_checkpoint(
+    checkpoint: str, four_mom: np.ndarray, config_path: str | None, batch: int = 2048
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Run a ``.pt`` checkpoint; returns (logits, score_logit or None)."""
     import torch
 
     from .model import JetAssignmentTransformer
-    from .utils import get_config, get_device
+    from .utils import get_config, get_device, load_compatible_state_dict
 
     device = get_device()
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
@@ -164,15 +260,19 @@ def _predict_checkpoint(checkpoint: str, four_mom: np.ndarray, config_path: str 
         num_jets=dc["num_jets"], input_dim=dc.get("input_dim", 4),
         group_num_layers=mc.get("group_num_layers", 1),
     ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    load_compatible_state_dict(model, ckpt["model_state_dict"])
     model.eval()
-    preds = []
+    logits_parts, score_parts = [], []
     with torch.no_grad():
         for i in range(0, len(four_mom), batch):
             chunk = torch.tensor(four_mom[i:i + batch], dtype=torch.float32, device=device)
-            logits = model(chunk)["logits"]
-            preds.append(logits.argmax(dim=-1).cpu().numpy())
-    return np.concatenate(preds)
+            out = model(chunk)
+            logits_parts.append(out["logits"].cpu().numpy())
+            if "score_logit" in out:
+                score_parts.append(out["score_logit"].cpu().numpy())
+    logits = np.concatenate(logits_parts)
+    score = np.concatenate(score_parts).reshape(-1) if score_parts else None
+    return logits, score
 
 
 def _is_classical(name: str) -> bool:
@@ -180,17 +280,20 @@ def _is_classical(name: str) -> bool:
 
 
 def _load_sample(path: str, num_jets: int):
-    """Load a sample twice: HT-normalised (model input) and raw (observables)."""
+    """Load a sample twice: HT-normalised (model input) and raw (observables).
+
+    Returns (normalised four-momenta, raw four-momenta, per-event weights).
+    """
     norm = JetAssignmentDataset(data_paths=path, num_jets=num_jets, normalize_by_ht=True)
     raw = JetAssignmentDataset(data_paths=path, num_jets=num_jets, normalize_by_ht=False)
     assert len(norm) == len(raw), f"normalised/raw size mismatch for {path}"
-    return norm.four_momenta.numpy(), raw.four_momenta.numpy()
+    return norm.four_momenta.numpy(), raw.four_momenta.numpy(), raw.weights.numpy()
 
 
 def _observables_for(path: str, num_jets: int, *, onnx: str | None,
                      checkpoint: str | None, config: str | None,
-                     input_norm: str) -> Observables:
-    norm_fm, raw_fm = _load_sample(path, num_jets)
+                     input_norm: str, soft_mass_topk: int = 0) -> Observables:
+    norm_fm, raw_fm, weights = _load_sample(path, num_jets)
 
     # Decide which input the model expects.
     model_name = onnx or checkpoint or ""
@@ -201,13 +304,18 @@ def _observables_for(path: str, num_jets: int, *, onnx: str | None,
     model_input = raw_fm if use_raw_input else norm_fm
 
     if onnx:
-        pred = _predict_onnx(onnx, model_input)
+        logits, score_logit = _predict_onnx(onnx, model_input)
     elif checkpoint:
-        pred = _predict_checkpoint(checkpoint, model_input, config)
+        logits, score_logit = _predict_checkpoint(checkpoint, model_input, config)
     else:
         raise ValueError("Provide --onnx or --checkpoint.")
 
-    return compute_observables_from_momenta(raw_fm, pred, num_jets)
+    pred = logits.argmax(axis=-1)
+    score = _sigmoid(score_logit) if score_logit is not None else None
+    return compute_observables_from_momenta(
+        raw_fm, pred, num_jets, weight=weights, score=score,
+        logits=logits, soft_mass_topk=soft_mass_topk,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -224,18 +332,26 @@ def run_analysis(
     input_norm: str = "auto",
     cuts: dict | None = None,
     logy: bool = False,
+    soft_mass_topk: int = 0,
 ) -> None:
     cuts = cuts or dict(DEFAULT_CUTS)
     print(f"Signal sample     : {signal}")
     print(f"Background sample : {background}")
     model_desc = onnx or checkpoint
     print(f"Model             : {model_desc}")
+    if soft_mass_topk > 0:
+        print(f"m_avg definition  : soft (probability-weighted top-{soft_mass_topk})")
 
     sig = _observables_for(signal, num_jets, onnx=onnx, checkpoint=checkpoint,
-                           config=config, input_norm=input_norm)
+                           config=config, input_norm=input_norm,
+                           soft_mass_topk=soft_mass_topk)
     bkg = _observables_for(background, num_jets, onnx=onnx, checkpoint=checkpoint,
-                           config=config, input_norm=input_norm)
+                           config=config, input_norm=input_norm,
+                           soft_mass_topk=soft_mass_topk)
     print(f"Signal events: {len(sig)} | Background events: {len(bkg)}")
+    if sig.score is not None:
+        print("NN signal score   : available "
+              f"(sig mean {sig.score.mean():.3f}, bkg mean {bkg.score.mean():.3f})")
 
     rows = cutflow(sig, bkg, cuts)
     print("\n" + format_cutflow(rows) + "\n")
@@ -243,19 +359,22 @@ def run_analysis(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # Save the cutflow as CSV and the observable arrays for re-plotting.
+    # Save the cutflow as CSV and the observable arrays for re-plotting and for
+    # the downstream background-estimate / bump-hunt stages.
     import csv
     with open(out / "cutflow.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
-    np.savez(
-        out / "observables.npz",
-        **{f"sig_{k}": sig.get(k) for k in
-           ("avg_mass", "mass_asym", "delta_phi", "avg_boost", "dalitz_edge", "dalitz_corner")},
-        **{f"bkg_{k}": bkg.get(k) for k in
-           ("avg_mass", "mass_asym", "delta_phi", "avg_boost", "dalitz_edge", "dalitz_corner")},
-    )
+
+    npz_payload = {}
+    for tag, obs in (("sig", sig), ("bkg", bkg)):
+        for k in NPZ_KEYS:
+            npz_payload[f"{tag}_{k}"] = obs.get(k)
+        npz_payload[f"{tag}_weight"] = obs.weights
+        if obs.score is not None:
+            npz_payload[f"{tag}_score"] = obs.score
+    np.savez(out / "observables.npz", **npz_payload)
 
     fig_path = make_summary_figure(
         sig, bkg, cuts, out / "bump_hunt_summary.pdf",
@@ -263,7 +382,8 @@ def run_analysis(
     )
     print(f"Results written to {out}/")
     print(f"  cutflow.csv              : per-stage signal/background fractions")
-    print(f"  observables.npz          : per-event observable arrays")
+    print(f"  observables.npz          : per-event observable arrays "
+          f"(input to src.background_estimate / src.bump_hunt)")
     if fig_path:
         print(f"  bump_hunt_summary.pdf    : ROC, working points, cutflow, bump hunt")
 
@@ -292,6 +412,9 @@ if __name__ == "__main__":
                    help="Input normalisation: 'ht' (ML model), 'none' (classical), "
                         "'auto' (infer from filename).")
     p.add_argument("--logy", action="store_true", help="Log-y on the bump-hunt histogram")
+    p.add_argument("--soft-mass-topk", type=int, default=0,
+                   help="If > 0, m_avg = probability-weighted mean over the top-K "
+                        "assignments instead of the argmax (default: 0 = argmax).")
     # Cut thresholds (the requested nominal working point).
     p.add_argument("--dphi-min", type=float, default=2.5)
     p.add_argument("--asym-max", type=float, default=0.4)
@@ -307,4 +430,5 @@ if __name__ == "__main__":
         onnx=args.onnx, checkpoint=args.checkpoint, config=args.config,
         num_jets=args.num_jets, input_norm=args.input_norm,
         cuts=_build_cuts(args), logy=args.logy,
+        soft_mass_topk=args.soft_mass_topk,
     )
