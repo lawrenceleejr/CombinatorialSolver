@@ -20,6 +20,52 @@ from .model import JetAssignmentTransformer, MassAsymmetryClassicalSolver
 from .utils import compute_invariant_mass, get_config, get_device
 
 
+def _tta_average_output(
+    model: torch.nn.Module, four_mom: torch.Tensor, n_rotations: int
+) -> dict[str, torch.Tensor]:
+    """Test-time augmentation: average softmax probabilities over exact symmetries.
+
+    Runs the model on ``n_rotations`` azimuthal rotations of the event, each
+    with and without an η flip (2 * n_rotations forward passes), and averages
+    the assignment probabilities.  φ rotation and η reflection are exact
+    symmetries of the physics, so every augmented copy is an equally valid view
+    of the same event; averaging reduces the variance of the prediction at
+    zero training cost.  The returned ``logits`` are log-mean-probabilities
+    (same argmax semantics as raw logits).  Event logits are averaged too.
+    """
+    batch_size = four_mom.shape[0]
+    device = four_mom.device
+    probs_sum = None
+    event_logit_sum = None
+    aux_output = None
+    n_views = 0
+
+    for k in range(n_rotations):
+        theta = torch.full((batch_size,), 2.0 * torch.pi * k / n_rotations, device=device)
+        cos_t, sin_t = theta.cos().view(-1, 1), theta.sin().view(-1, 1)
+        for flip in (1.0, -1.0):
+            fm = four_mom.clone()
+            px, py = fm[:, :, 1].clone(), fm[:, :, 2].clone()
+            fm[:, :, 1] = px * cos_t - py * sin_t
+            fm[:, :, 2] = px * sin_t + py * cos_t
+            fm[:, :, 3] = fm[:, :, 3] * flip
+            out = model(fm)
+            probs = out["logits"].softmax(dim=-1)
+            probs_sum = probs if probs_sum is None else probs_sum + probs
+            if "event_logit" in out:
+                el = out["event_logit"]
+                event_logit_sum = el if event_logit_sum is None else event_logit_sum + el
+            if aux_output is None:
+                aux_output = out  # mass_asym/mass_sum are rotation/flip invariant
+            n_views += 1
+
+    result = dict(aux_output)
+    result["logits"] = torch.log(probs_sum / n_views + 1e-12)
+    if event_logit_sum is not None:
+        result["event_logit"] = event_logit_sum / n_views
+    return result
+
+
 def evaluate(
     checkpoint_path: str,
     data_path: str,
@@ -27,6 +73,7 @@ def evaluate(
     config_path: str | None = None,
     include_classical: bool = True,
     physics_blend_alpha: float = 0.0,
+    tta_rotations: int = 0,
 ):
     """Evaluate model and reconstruct masses.
 
@@ -51,6 +98,12 @@ def evaluate(
             push without retraining; for a training-time equivalent use the
             ``lambda_entropy_asym`` / ``lambda_entropy_mass`` config options.
             Typical values: 0.5–2.0.  Set to 0 (default) to disable.
+        tta_rotations: When > 0, apply test-time augmentation with this many
+            azimuthal rotations, each with and without an η flip
+            (2 * tta_rotations forward passes per event), and average the
+            assignment probabilities.  Exact symmetries of the physics, so
+            this is a pure variance reduction — typically a free accuracy
+            gain at the cost of inference time.  4–8 is a good range.
     """
     device = get_device()
     print(f"Using device: {device}")
@@ -69,6 +122,8 @@ def evaluate(
         dim_feedforward=mc["dim_feedforward"],
         dropout=mc.get("dropout", 0.1),
         num_jets=dc["num_jets"],
+        input_dim=dc.get("input_dim", 4),
+        group_num_layers=mc.get("group_num_layers", 1),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
@@ -106,14 +161,27 @@ def evaluate(
     all_preds = []
     all_labels = []
     all_logits = []
+    all_confidence = []
+    all_event_scores = []
+
+    if tta_rotations > 0:
+        print(f"Test-time augmentation: {tta_rotations} φ rotations × 2 η flips "
+              f"= {2 * tta_rotations} views per event")
 
     with torch.no_grad():
         for batch in loader_norm:
             four_mom = batch["four_momenta"].to(device)
             labels = batch["label"]
 
-            output = model(four_mom)
+            if tta_rotations > 0:
+                output = _tta_average_output(model, four_mom, tta_rotations)
+            else:
+                output = model(four_mom)
             logits = output["logits"]
+            if "event_logit" in output:
+                all_event_scores.append(
+                    torch.sigmoid(output["event_logit"].squeeze(-1)).cpu()
+                )
 
             # Optional inference-time confidence-weighted physics blending.
             # For events where the network is uncertain (low max-softmax
@@ -136,6 +204,10 @@ def evaluate(
                 logits = logits + physics_blend_alpha * uncertainty.unsqueeze(-1) * physics_score
 
             preds = logits.argmax(dim=-1)
+            # Per-event assignment confidence: max softmax probability.  Cutting
+            # on this trades efficiency for combinatorial purity — a per-event
+            # quality handle for the analysis (see the table printed below).
+            all_confidence.append(logits.softmax(dim=-1).max(dim=-1).values.cpu())
 
             all_preds.append(preds.cpu())
             all_labels.append(labels)
@@ -144,6 +216,8 @@ def evaluate(
     all_preds = torch.cat(all_preds)
     all_labels = torch.cat(all_labels)
     all_logits = torch.cat(all_logits)
+    all_confidence = torch.cat(all_confidence)
+    all_event_scores = torch.cat(all_event_scores) if all_event_scores else None
 
     n_events = len(all_preds)
 
@@ -157,6 +231,23 @@ def evaluate(
     print(f"Num assignments: {num_assignments} ({dc['num_jets']} jets)")
     print(f"[ML]      Top-1 accuracy: {accuracy:.4f} ({correct}/{n_events})")
     print(f"[ML]      Top-{topk} accuracy: {acc5:.4f}")
+
+    # Purity vs efficiency of a confidence cut: keep the top X% most-confident
+    # events (by max softmax probability) and report the assignment accuracy in
+    # the kept subset.  A real analysis can spend a little signal efficiency to
+    # buy a much purer combinatorial reconstruction (sharper mass peak).
+    is_correct = (all_preds == all_labels).numpy()
+    conf_np = all_confidence.numpy()
+    order = np.argsort(-conf_np)  # most confident first
+    print("\nAssignment purity vs efficiency (confidence = max softmax prob):")
+    print(f"  {'keep':>6} {'conf cut':>9} {'accuracy':>9}")
+    for keep_frac in (1.00, 0.90, 0.75, 0.50, 0.25):
+        n_keep = max(1, int(round(keep_frac * n_events)))
+        kept = order[:n_keep]
+        print(
+            f"  {keep_frac:6.0%} {conf_np[kept].min():9.3f} "
+            f"{is_correct[kept].mean():9.4f}"
+        )
 
     # --- Staged classical solver ---
     all_classical_preds = None
@@ -255,9 +346,12 @@ def evaluate(
         writer = csv.writer(f)
         header = [
             "event_idx", "pred_assignment", "truth_assignment", "correct",
+            "confidence",
             "mass1_pred", "mass2_pred", "mass_avg_pred",
             "mass1_truth", "mass2_truth", "mass_avg_truth",
         ]
+        if all_event_scores is not None:
+            header += ["event_qcd_score"]
         if has_classical:
             header += [
                 "classical_assignment", "classical_correct",
@@ -268,9 +362,12 @@ def evaluate(
             row = [
                 i, all_preds[i].item(), all_labels[i].item(),
                 int(all_preds[i].item() == all_labels[i].item()),
+                f"{all_confidence[i].item():.4f}",
                 f"{mass1_pred[i]:.2f}", f"{mass2_pred[i]:.2f}", f"{mass_avg_pred[i]:.2f}",
                 f"{mass1_truth[i]:.2f}", f"{mass2_truth[i]:.2f}", f"{mass_avg_truth[i]:.2f}",
             ]
+            if all_event_scores is not None:
+                row += [f"{all_event_scores[i].item():.4f}"]
             if has_classical:
                 row += [
                     all_classical_preds[i].item(),
@@ -288,7 +385,10 @@ def evaluate(
         mass1_pred=np.array(mass1_pred),
         mass2_pred=np.array(mass2_pred),
         correct=np.array([all_preds[i].item() == all_labels[i].item() for i in range(n_events)]),
+        confidence=conf_np,
     )
+    if all_event_scores is not None:
+        npz_kwargs["event_qcd_score"] = all_event_scores.numpy()
     if has_classical:
         npz_kwargs["mass_avg_classical"] = np.array(mass_avg_classical)
         npz_kwargs["mass1_classical"] = np.array(mass1_classical)
@@ -358,9 +458,20 @@ if __name__ == "__main__":
             "low-mass assignments without retraining. Typical values: 0.5–2.0."
         ),
     )
+    parser.add_argument(
+        "--tta",
+        type=int,
+        default=0,
+        help=(
+            "Test-time augmentation: number of azimuthal rotations, each also "
+            "η-flipped (2N forward passes per event). Exact symmetries, so this "
+            "is a free variance reduction. 4-8 recommended; 0 disables (default)."
+        ),
+    )
     args = parser.parse_args()
     evaluate(
         args.checkpoint, args.data, args.output, args.config,
         not args.no_classical,
         physics_blend_alpha=args.physics_blend_alpha,
+        tta_rotations=args.tta,
     )

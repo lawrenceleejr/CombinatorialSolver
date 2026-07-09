@@ -53,6 +53,92 @@ class GradientReversalLayer(nn.Module):
         return GradientReversalFunction.apply(x, self.lambda_)
 
 
+class PairwiseInteractionBias(nn.Module):
+    """Learned per-head attention bias from pairwise jet physics (ParT-style).
+
+    For every jet pair (i, j) a small MLP maps IRC-motivated pairwise features
+    to one bias value per attention head, which is added to the attention
+    logits of every encoder layer.  This is the interaction-matrix idea from
+    the Particle Transformer (Qu, Li, Qian 2022): the strongest known
+    architectural gain for jet-level transformers, because it hands the
+    attention mechanism the QCD splitting variables (ln ΔR, ln kT, ln z,
+    ln m²_ij) it would otherwise have to rediscover from raw four-vectors.
+
+    Features per pair (all logs clamped to finite ranges):
+      0. ln ΔR_ij            — angular separation
+      1. ln kT_ij            — Lund-plane transverse momentum of the splitting
+      2. ln z_ij             — soft momentum fraction min(pT)/(pT_i+pT_j)
+      3. ln m²_ij            — pairwise invariant mass squared
+      4. ln pT_i/pT_j        — pT hierarchy (antisymmetric; generalises the
+                               previous scalar pt_bias_weight)
+
+    The final linear layer is zero-initialised so training starts from an
+    unbiased (vanilla-attention) model, exactly like the old pt_bias_weight.
+    """
+
+    N_FEATURES = 5
+
+    def __init__(self, nhead: int, hidden: int = 32):
+        super().__init__()
+        self.nhead = nhead
+        self.mlp = nn.Sequential(
+            nn.Linear(self.N_FEATURES, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, nhead),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    @staticmethod
+    def compute_features(four_momenta: torch.Tensor) -> torch.Tensor:
+        """Pairwise features from (batch, J, 4) four-momenta → (batch, J, J, 5)."""
+        E = four_momenta[..., 0]
+        px, py, pz = four_momenta[..., 1], four_momenta[..., 2], four_momenta[..., 3]
+        pt = torch.sqrt(px**2 + py**2).clamp(min=1e-8)
+        eta = torch.asinh(pz / pt)
+        phi = torch.atan2(py, px)
+        log_pt = torch.log(pt)
+
+        deta = eta.unsqueeze(-1) - eta.unsqueeze(-2)
+        dphi = JetAssignmentTransformer.wrap_dphi(phi.unsqueeze(-1) - phi.unsqueeze(-2))
+        dr = torch.sqrt(deta**2 + dphi**2 + 1e-8)
+
+        pt_i = pt.unsqueeze(-1)
+        pt_j = pt.unsqueeze(-2)
+        pt_min = torch.minimum(pt_i, pt_j)
+        z = pt_min / (pt_i + pt_j).clamp(min=1e-8)
+        kt = pt_min * dr
+
+        # Pairwise invariant mass squared m²_ij = (p_i + p_j)²
+        e_sum = E.unsqueeze(-1) + E.unsqueeze(-2)
+        px_sum = px.unsqueeze(-1) + px.unsqueeze(-2)
+        py_sum = py.unsqueeze(-1) + py.unsqueeze(-2)
+        pz_sum = pz.unsqueeze(-1) + pz.unsqueeze(-2)
+        m2 = e_sum**2 - px_sum**2 - py_sum**2 - pz_sum**2
+
+        # Clamp all logs so the diagonal (i == j → ΔR = 0, m² = 0) stays finite;
+        # the diagonal bias is zeroed by the caller anyway.
+        ln_dr = torch.log(dr.clamp(min=1e-4))
+        ln_kt = torch.log(kt.clamp(min=1e-8))
+        ln_z = torch.log(z.clamp(min=1e-8))
+        ln_m2 = torch.log(m2.clamp(min=1e-8))
+        ln_pt_ratio = log_pt.unsqueeze(-1) - log_pt.unsqueeze(-2)
+
+        return torch.stack([ln_dr, ln_kt, ln_z, ln_m2, ln_pt_ratio], dim=-1)
+
+    def forward(self, four_momenta: torch.Tensor) -> torch.Tensor:
+        """Return additive attention bias of shape (batch * nhead, J, J)."""
+        feats = self.compute_features(four_momenta)          # (B, J, J, 5)
+        bias = self.mlp(feats).permute(0, 3, 1, 2)           # (B, nhead, J, J)
+        # Zero the diagonal: self-attention logits should not be biased by the
+        # (clamped, unphysical) i == j features.
+        num_jets = four_momenta.shape[1]
+        eye = torch.eye(num_jets, device=four_momenta.device, dtype=bias.dtype)
+        bias = bias * (1.0 - eye)
+        batch_size = four_momenta.shape[0]
+        return bias.reshape(batch_size * self.nhead, num_jets, num_jets)
+
+
 class GroupTransformer(nn.Module):
     """Mini Transformer to pool a fixed-size set of jet embeddings.
 
@@ -128,9 +214,18 @@ class JetAssignmentTransformer(nn.Module):
         self.num_jets = num_jets
         self.has_isr = num_jets >= 7
 
-        self.input_proj = nn.Linear(input_dim, d_model)
-        # Per-head learnable weight for pT hierarchy attention bias; init to 0 (no effect at start)
-        self.pt_bias_weight = nn.Parameter(torch.zeros(nhead))
+        # Raw model input stays (E, px, py, pz); four derived per-jet features
+        # (log pT, log E, η, log m) are appended inside encode_jets so the
+        # projection sees both the linear four-vector (exact for sums/masses)
+        # and the log/angular parametrisation the physics actually lives in.
+        self.raw_input_dim = input_dim
+        self.n_token_features = input_dim + 4
+        self.input_proj = nn.Linear(self.n_token_features, d_model)
+        # Learned pairwise-interaction attention bias (ln ΔR, ln kT, ln z,
+        # ln m²_ij, ln pT_i/pT_j → per-head bias); zero-initialised so it is a
+        # no-op at the start of training.  Supersedes the old scalar
+        # pt_bias_weight (ln pT_i/pT_j is feature 4 of the new bias).
+        self.pairwise_bias = PairwiseInteractionBias(nhead)
         self.pos_embedding = nn.Embedding(num_jets, d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -236,12 +331,19 @@ class JetAssignmentTransformer(nn.Module):
             nn.Linear(d_model // 2, 1),
         )
 
-    def _compute_pt_bias(self, four_momenta: torch.Tensor) -> torch.Tensor:
-        """Log pT ratio matrix: log(pT_i/pT_j). Returns (batch, J, J)."""
-        px, py = four_momenta[..., 1], four_momenta[..., 2]
-        pt = torch.sqrt(px**2 + py**2).clamp(min=1e-8)
-        log_pt = torch.log(pt)
-        return log_pt.unsqueeze(-1) - log_pt.unsqueeze(-2)
+        # Event-level signal vs QCD discriminant head.  Trained with BCE when a
+        # QCD sample is provided (lambda_event), decorrelated from the
+        # reconstructed average mass with a DisCo penalty (lambda_disco) so the
+        # score can be cut on without sculpting the bump-hunt variable.
+        # Input: mean- and max-pooled jet embeddings (2 * d_model).
+        self.event_head = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 1),
+        )
 
     @staticmethod
     def wrap_dphi(dphi: torch.Tensor) -> torch.Tensor:
@@ -253,19 +355,38 @@ class JetAssignmentTransformer(nn.Module):
         """Backward-compatible alias for wrap_dphi."""
         return JetAssignmentTransformer.wrap_dphi(dphi)
 
+    @staticmethod
+    def _token_features(four_momenta: torch.Tensor) -> torch.Tensor:
+        """Append derived per-jet features to the raw four-vector.
+
+        Returns (..., 8): [E, px, py, pz, log pT, log E, η, log m].  The log
+        and angular features present the encoder with the parametrisation in
+        which jet physics is (approximately) linear — log-scale energies and
+        rapidity — while the raw four-vector is kept because group sums and
+        invariant masses are linear in it.
+        """
+        E = four_momenta[..., 0]
+        px, py, pz = four_momenta[..., 1], four_momenta[..., 2], four_momenta[..., 3]
+        pt = torch.sqrt(px**2 + py**2).clamp(min=1e-8)
+        eta = torch.asinh(pz / pt)
+        m2 = (E**2 - px**2 - py**2 - pz**2).clamp(min=1e-8)
+        derived = torch.stack(
+            [torch.log(pt), torch.log(E.clamp(min=1e-8)), eta, 0.5 * torch.log(m2)],
+            dim=-1,
+        )
+        return torch.cat([four_momenta, derived], dim=-1)
+
     def encode_jets(self, four_momenta: torch.Tensor) -> torch.Tensor:
-        x = self.input_proj(four_momenta)
+        x = self.input_proj(self._token_features(four_momenta))
         positions = torch.arange(self.num_jets, device=four_momenta.device)
         x = x + self.pos_embedding(positions).unsqueeze(0)
 
-        # pT hierarchy attention bias: scale log(pT_i/pT_j) per head, add to attention logits
-        batch_size = four_momenta.shape[0]
-        pt_bias = self._compute_pt_bias(four_momenta)  # (batch, J, J)
-        pt_bias_expanded = (
-            pt_bias.unsqueeze(1) * self.pt_bias_weight.view(1, self.nhead, 1, 1)
-        ).reshape(batch_size * self.nhead, self.num_jets, self.num_jets)
+        # Pairwise-interaction attention bias (ParT-style): learned per-head
+        # bias from ln ΔR, ln kT, ln z, ln m²_ij, ln pT_i/pT_j — added to the
+        # attention logits of every encoder layer.
+        pair_bias = self.pairwise_bias(four_momenta)  # (batch * nhead, J, J)
 
-        x = self.transformer_encoder(x, mask=pt_bias_expanded)
+        x = self.transformer_encoder(x, mask=pair_bias)
         return x
 
     def _isr_physics(self, four_momenta: torch.Tensor) -> torch.Tensor:
@@ -640,9 +761,17 @@ class JetAssignmentTransformer(nn.Module):
         reversed_pooled = self.gradient_reversal(pooled)
         return self.mass_adversary(reversed_pooled)
 
+    def predict_event_logit(self, jet_embeddings: torch.Tensor) -> torch.Tensor:
+        """Event-level signal-vs-QCD logit from pooled jet embeddings."""
+        pooled = torch.cat(
+            [jet_embeddings.mean(dim=1), jet_embeddings.max(dim=1).values], dim=-1
+        )
+        return self.event_head(pooled)
+
     def forward(self, four_momenta: torch.Tensor) -> dict[str, torch.Tensor]:
         jet_embeddings = self.encode_jets(four_momenta)
         mass_pred = self.predict_mass(jet_embeddings)
+        event_logit = self.predict_event_logit(jet_embeddings)
         if self.has_isr:
             # Compute groupings first so the ISR head can see grouping quality
             grouping_logits, mass_asym_flat, mass_sum_flat, grp_summary = (
@@ -659,6 +788,7 @@ class JetAssignmentTransformer(nn.Module):
                 "mass_asym_flat": mass_asym_flat,
                 "mass_sum_flat": mass_sum_flat,
                 "mass_pred": mass_pred,
+                "event_logit": event_logit,
             }
         else:
             logits, mass_asym_flat, mass_sum_flat = self._score_assignments_flat(
@@ -669,6 +799,7 @@ class JetAssignmentTransformer(nn.Module):
                 "mass_asym_flat": mass_asym_flat,
                 "mass_sum_flat": mass_sum_flat,
                 "mass_pred": mass_pred,
+                "event_logit": event_logit,
             }
 
 

@@ -32,6 +32,36 @@ from .model import JetAssignmentTransformer, MassAsymmetryClassicalSolver
 from .utils import get_config, get_device
 
 
+def register_legacy_symbolics() -> None:
+    """Register ONNX symbolics missing from the legacy (TorchScript) exporter.
+
+    The models are exported with ``dynamo=False``: the new torch.export-based
+    exporter cannot yet handle the per-head additive attention mask
+    ((batch * nhead, J, J)) with a dynamic batch axis, while the legacy
+    exporter traces it correctly (verified numerically to ~1e-7 against eager).
+    The legacy exporter lacks a symbolic for ``aten::asinh`` (used for η);
+    ONNX has had an ``Asinh`` op since opset 9, so the mapping is direct.
+    Idempotent.
+    """
+    from torch.onnx import register_custom_op_symbolic
+
+    register_custom_op_symbolic("aten::asinh", lambda g, x: g.op("Asinh", x), 9)
+
+
+def legacy_export_kwargs() -> dict:
+    """Extra kwargs that select the legacy exporter, if the torch version needs them.
+
+    torch >= 2.9 defaults to the dynamo exporter and accepts ``dynamo=False``;
+    older versions default to the legacy exporter and (some) do not accept the
+    ``dynamo`` keyword at all.
+    """
+    import inspect
+
+    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
+        return {"dynamo": False}
+    return {}
+
+
 class _LogitsOnly(torch.nn.Module):
     """Thin wrapper that extracts the ``logits`` tensor from a model's output dict."""
 
@@ -81,6 +111,7 @@ def export_ml_model(
 
     dummy = torch.zeros(1, num_jets, 4, device=device)
 
+    register_legacy_symbolics()
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
         wrapped,
@@ -90,6 +121,7 @@ def export_ml_model(
         output_names=["logits"],
         dynamic_axes={"four_momenta": {0: "batch"}, "logits": {0: "batch"}},
         opset_version=17,
+        **legacy_export_kwargs(),
     )
     print(f"ML model exported → {output_path}")
 
@@ -115,6 +147,7 @@ def export_classical_solver(
 
     dummy = torch.zeros(1, num_jets, 4)
 
+    register_legacy_symbolics()
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
         wrapped,
@@ -124,6 +157,7 @@ def export_classical_solver(
         output_names=["logits"],
         dynamic_axes={"four_momenta": {0: "batch"}, "logits": {0: "batch"}},
         opset_version=17,
+        **legacy_export_kwargs(),
     )
     print(f"Classical solver exported → {output_path}")
 

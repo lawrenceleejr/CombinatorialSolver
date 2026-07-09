@@ -258,7 +258,7 @@ def _export_phase1_snapshot(
 def export_onnx(model, num_jets, device, val_acc):
     """Export model to ONNX format."""
     model.eval()
-    input_dim = model.input_proj.in_features
+    input_dim = getattr(model, "raw_input_dim", 4)
     dummy = torch.randn(1, num_jets, input_dim, device=device)
     onnx_path = "checkpoints/best_model.onnx"
 
@@ -273,6 +273,10 @@ def export_onnx(model, num_jets, device, val_acc):
     wrapper = _Wrapper(model)
     wrapper.eval()
 
+    # Legacy exporter (dynamo=False): the torch.export-based exporter cannot
+    # yet trace the per-head attention bias with a dynamic batch axis.
+    from .export_onnx import legacy_export_kwargs, register_legacy_symbolics
+    register_legacy_symbolics()
     torch.onnx.export(
         wrapper,
         dummy,
@@ -283,9 +287,50 @@ def export_onnx(model, num_jets, device, val_acc):
             "four_momenta": {0: "batch_size"},
             "logits": {0: "batch_size"},
         },
-        opset_version=18,
+        opset_version=17,
+        **legacy_export_kwargs(),
     )
     print(f"  -> Exported ONNX model to {onnx_path} (val_acc={val_acc:.4f})")
+
+
+def _distance_correlation(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Distance correlation (DisCo) between two 1-D samples.
+
+    Kasieczka & Shih (arXiv:2001.05310): a differentiable, non-parametric
+    measure of *any* statistical dependence between two variables, zero iff
+    they are independent.  Used here to decorrelate the event-level QCD
+    discriminant from the reconstructed average mass on background events, so
+    that cutting on the score does not sculpt a bump into the QCD m_avg
+    spectrum.  Cheaper and far more stable than adversarial decorrelation
+    (no minimax game, no second optimizer).
+
+    Args:
+        x, y: (n,) tensors (n >= 2).
+
+    Returns:
+        Scalar tensor in [0, 1].
+    """
+    a = (x.unsqueeze(0) - x.unsqueeze(1)).abs()
+    b = (y.unsqueeze(0) - y.unsqueeze(1)).abs()
+    A = a - a.mean(dim=0, keepdim=True) - a.mean(dim=1, keepdim=True) + a.mean()
+    B = b - b.mean(dim=0, keepdim=True) - b.mean(dim=1, keepdim=True) + b.mean()
+    dcov2 = (A * B).mean().clamp(min=0.0)
+    dvar_x = (A * A).mean().clamp(min=1e-12)
+    dvar_y = (B * B).mean().clamp(min=1e-12)
+    return (dcov2 / torch.sqrt(dvar_x * dvar_y)).sqrt()
+
+
+def _binary_auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    """ROC AUC via the rank statistic (Mann-Whitney U).  labels: bool, True=positive."""
+    n_pos = int(labels.sum().item())
+    n_neg = int((~labels).sum().item())
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    order = scores.argsort()
+    ranks = torch.empty_like(order, dtype=torch.float64)
+    ranks[order] = torch.arange(1, len(scores) + 1, dtype=torch.float64)
+    sum_pos_ranks = ranks[labels].sum().item()
+    return (sum_pos_ranks - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
 
 
 def cosine_with_warmup(optimizer, epoch, num_epochs, warmup_epochs, restart_period=0):
@@ -517,6 +562,7 @@ def train(config_path: str | None = None, data_path: str | None = None,
             "val_avg_delta_phi", "val_std_delta_phi",
             "train_avg_democracy", "train_std_democracy",
             "val_avg_democracy", "val_std_democracy",
+            "train_event_auc", "val_event_auc",
         ])
 
     best_val_acc = 0.0
@@ -568,6 +614,21 @@ def train(config_path: str | None = None, data_path: str | None = None,
     beta_bg = tc.get("beta_bg", 0.5)
     bg_soft_weight = tc.get("bg_soft_weight", 2.0)
     bg_asym_cut = tc.get("bg_asym_cut", 0.0)
+    # Event-level signal-vs-QCD discriminant (requires a QCD sample).  The
+    # event_head is trained with class-balanced BCE (lambda_event) and
+    # decorrelated from the expected average mass with a DisCo penalty
+    # (lambda_disco) on background events, so the analysis can cut on the
+    # score without sculpting the QCD m_avg spectrum.  Both ramp up from the
+    # Phase 2 start like lambda_bg.
+    lambda_event_max = tc.get("lambda_event", 0.0)
+    lambda_event_rampup = tc.get("lambda_event_rampup", 10)
+    lambda_disco_max = tc.get("lambda_disco", 0.0)
+    lambda_disco_rampup = tc.get("lambda_disco_rampup", 10)
+    # z-boost augmentation: per-event random longitudinal boost with rapidity
+    # uniform in [-z_boost_aug, +z_boost_aug].  Exact symmetry of the physics
+    # (invariant masses unchanged, labels unchanged) that real events sample
+    # via the PDFs; teaches the encoder longitudinal-boost invariance.
+    z_boost_aug = dc.get("z_boost_aug", 1.0)
     # Handing the trainer a QCD sample turns on the background-rejection objective
     # automatically: if lambda_bg was left at its default 0, enable it so the QCD
     # events actually penalise high-average-mass interpretations.  Set
@@ -576,6 +637,27 @@ def train(config_path: str | None = None, data_path: str | None = None,
         lambda_bg_max = 2.0
         print("QCD sample provided -> auto-enabling background-rejection loss "
               "(lambda_bg=2.0; set training.lambda_bg to override).")
+    if qcd_present and lambda_event_max <= 0:
+        lambda_event_max = 1.0
+        print("QCD sample provided -> auto-enabling event-level discriminant "
+              "(lambda_event=1.0; set training.lambda_event to override).")
+    if qcd_present and lambda_disco_max <= 0:
+        lambda_disco_max = 2.0
+        print("QCD sample provided -> auto-enabling DisCo mass decorrelation "
+              "of the event score (lambda_disco=2.0; set training.lambda_disco "
+              "to override).")
+    if not qcd_present:
+        # Without background events the event head has a single class; skip it.
+        lambda_event_max = 0.0
+        lambda_disco_max = 0.0
+    if lambda_event_max > 0:
+        print(
+            f"Event-level QCD discriminant: lambda_event={lambda_event_max} "
+            f"(rampup={lambda_event_rampup}), lambda_disco={lambda_disco_max} "
+            f"(rampup={lambda_disco_rampup})"
+        )
+    if z_boost_aug > 0:
+        print(f"z-boost augmentation: rapidity ~ U(-{z_boost_aug}, {z_boost_aug})")
     if lambda_bg_max > 0:
         print(
             f"Background-rejection loss: lambda_bg={lambda_bg_max} "
@@ -693,6 +775,8 @@ def train(config_path: str | None = None, data_path: str | None = None,
                 lambda_entropy_asym = 0.0
                 lambda_entropy_mass = 0.0
                 lambda_bg = 0.0
+                lambda_event = 0.0
+                lambda_disco = 0.0
                 phase1_only_train = True
             else:
                 # Phase 2: teacher forcing, auxiliary losses, decaying distillation
@@ -741,6 +825,16 @@ def train(config_path: str | None = None, data_path: str | None = None,
                 else:
                     lambda_bg = lambda_bg_max
 
+                if lambda_event_rampup > 0:
+                    lambda_event = lambda_event_max * min(1.0, phase2_epoch / lambda_event_rampup)
+                else:
+                    lambda_event = lambda_event_max
+
+                if lambda_disco_rampup > 0:
+                    lambda_disco = lambda_disco_max * min(1.0, phase2_epoch / lambda_disco_rampup)
+                else:
+                    lambda_disco = lambda_disco_max
+
                 # Distillation decays from max to zero over lambda_distill_epochs
                 if lambda_distill_epochs > 0:
                     lambda_distill = lambda_distill_max * max(
@@ -763,8 +857,10 @@ def train(config_path: str | None = None, data_path: str | None = None,
                 lambda_entropy_mass=lambda_entropy_mass,
                 lambda_bg=lambda_bg, beta_bg=beta_bg,
                 bg_soft_weight=bg_soft_weight, bg_asym_cut=bg_asym_cut,
+                lambda_event=lambda_event, lambda_disco=lambda_disco,
                 phase1_only=phase1_only_train,
                 pt_smear_frac=dc.get("pt_smear_frac", 0.0),
+                z_boost_aug=z_boost_aug,
             )
 
             # Validation (no φ/η augmentation, no teacher forcing: tf_ratio=0 = pure
@@ -780,7 +876,9 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
                     lambda_bg=0.0, beta_bg=beta_bg,
                     bg_soft_weight=bg_soft_weight, bg_asym_cut=bg_asym_cut,
+                    lambda_event=0.0, lambda_disco=0.0,
                     pt_smear_frac=dc.get("pt_smear_frac", 0.0),
+                    z_boost_aug=0.0,
                 )
 
             # Accumulate per-event validation mass-asymmetry distribution for GIF
@@ -872,12 +970,18 @@ def train(config_path: str | None = None, data_path: str | None = None,
                 if "avg_mass_asym" in val_metrics
                 else ""
             )
+            evt_str = (
+                f" | EvtAUC={val_metrics['event_auc']:.3f}"
+                if "event_auc" in val_metrics
+                and val_metrics["event_auc"] == val_metrics["event_auc"]  # not NaN
+                else ""
+            )
 
             print(
                 f"Epoch {epoch+1:3d}/{tc['num_epochs']} {phase_tag} | "
                 f"Train loss={train_metrics['loss']:.4f} acc={train_metrics['acc']:.3f} | "
                 f"Val loss={val_metrics['loss']:.4f} acc={val_metrics['acc']:.3f}"
-                f"{isr_str}{adv_str}{asym_str} | "
+                f"{isr_str}{adv_str}{asym_str}{evt_str} | "
                 f"LR={current_lr:.2e}"
             )
 
@@ -914,6 +1018,8 @@ def train(config_path: str | None = None, data_path: str | None = None,
                     f"{train_metrics['std_democracy']:.6f}" if "std_democracy" in train_metrics else "",
                     f"{val_metrics['avg_democracy']:.6f}" if "avg_democracy" in val_metrics else "",
                     f"{val_metrics['std_democracy']:.6f}" if "std_democracy" in val_metrics else "",
+                    f"{train_metrics['event_auc']:.4f}" if "event_auc" in train_metrics else "",
+                    f"{val_metrics['event_auc']:.4f}" if "event_auc" in val_metrics else "",
                 ])
 
             # Per-epoch live-monitoring plots (overwrite fixed "latest" files so a
@@ -2041,8 +2147,10 @@ def _run_epoch(
     lambda_distill=0.0, distill_temperature=4.0,
     lambda_entropy_asym=0.0, lambda_entropy_mass=0.0,
     lambda_bg=0.0, beta_bg=1.0, bg_soft_weight=1.0, bg_asym_cut=0.0,
+    lambda_event=0.0, lambda_disco=0.0,
     phase1_only=False,
     pt_smear_frac=0.0,
+    z_boost_aug=0.0,
 ):
     """Run one epoch of training or validation.
 
@@ -2074,6 +2182,7 @@ def _run_epoch(
     all_mass_pred = []
     all_mass_true = []
     all_pred_is_bkg = []
+    all_event_scores = []   # event-level QCD-discriminant scores (sigmoid)
     all_pred_asym_max = []   # per-event achievable max asymmetry (over assignments)
     all_pred_mass_min = []   # per-event achievable min mass_sum (over assignments)
     total_sig_samples = 0
@@ -2120,6 +2229,22 @@ def _run_epoch(
 
             flip = (torch.rand(batch_size, device=device) > 0.5).float().view(-1, 1)
             four_mom[:, :, 3] = four_mom[:, :, 3] * (1.0 - 2.0 * flip)
+
+            # Longitudinal (z) boost augmentation: rapidity uniform in
+            # [-z_boost_aug, +z_boost_aug].  An exact symmetry of the physics —
+            # invariant masses and truth labels are unchanged, per-jet pT (and
+            # therefore HT normalisation) is unchanged — that real events
+            # sample through the parton momentum fractions.  Teaches the
+            # encoder longitudinal-boost invariance instead of hoping it
+            # learns it from the data.
+            if z_boost_aug > 0:
+                y_boost = (torch.rand(batch_size, device=device) * 2.0 - 1.0) * z_boost_aug
+                ch = torch.cosh(y_boost).view(-1, 1)
+                sh = torch.sinh(y_boost).view(-1, 1)
+                e_orig = four_mom[:, :, 0].clone()
+                pz_orig = four_mom[:, :, 3].clone()
+                four_mom[:, :, 0] = ch * e_orig - sh * pz_orig
+                four_mom[:, :, 3] = ch * pz_orig - sh * e_orig
 
         # Dynamic pT smearing: scale each jet's 4-vector by a random per-jet
         # factor (massless approximation — η preserved means all components
@@ -2418,6 +2543,41 @@ def _run_epoch(
 
                 loss_ce = loss_ce + lambda_bg * _masked_mean(loss_bg, is_bkg)
 
+            # Event-level signal-vs-QCD discriminant.  Class-balanced BCE on the
+            # event_head output; the gradient also flows into the encoder so the
+            # jet embeddings become QCD-aware (multi-task learning).  Only active
+            # when the batch contains both classes.
+            if (
+                lambda_event > 0
+                and "event_logit" in output
+                and is_bkg.any()
+                and sig_mask.any()
+            ):
+                event_logit = output["event_logit"].squeeze(-1)          # (batch,)
+                n_sig_b = sig_mask.sum().float()
+                n_bkg_b = is_bkg.sum().float()
+                # Balance the classes within the batch (QCD is the positive class).
+                pos_weight = (n_sig_b / n_bkg_b).clamp(0.2, 5.0)
+                loss_event = F.binary_cross_entropy_with_logits(
+                    event_logit, is_bkg.float(), pos_weight=pos_weight
+                )
+                loss_ce = loss_ce + lambda_event * loss_event
+
+                # DisCo decorrelation: penalise any statistical dependence
+                # between the event score and the expected average mass on
+                # BACKGROUND events, so cutting on the score keeps the QCD
+                # m_avg spectrum smooth (no artificial bump).  The mass side is
+                # detached — only the score is reshaped.
+                if lambda_disco > 0 and "mass_sum_flat" in output and n_bkg_b >= 8:
+                    score_b = torch.sigmoid(event_logit[is_bkg])
+                    probs_b = logits.softmax(dim=-1)[is_bkg]
+                    msum_b = (
+                        (probs_b * output["mass_sum_flat"][is_bkg]).sum(dim=-1).detach()
+                    )
+                    loss_ce = loss_ce + lambda_disco * _distance_correlation(
+                        score_b, msum_b
+                    )
+
             # Adversarial mass loss
             mass_mask = parent_mass > 0
             if mass_mask.any() and lambda_adv > 0:
@@ -2450,6 +2610,12 @@ def _run_epoch(
         # Per-event background flag, aligned with the per-event distribution
         # arrays below so downstream plotting can split signal vs QCD.
         all_pred_is_bkg.append(is_bkg.detach().cpu())
+
+        # Event-level QCD-discriminant scores (for the epoch AUC metric).
+        if "event_logit" in output:
+            all_event_scores.append(
+                torch.sigmoid(output["event_logit"].squeeze(-1)).detach().cpu()
+            )
 
         if "mass_asym_flat" in output:
             mass_asym_flat = output["mass_asym_flat"].detach()  # (batch, num_assignments)
@@ -2605,6 +2771,12 @@ def _run_epoch(
         result["pred_dalitz_y_values"] = torch.cat(all_pred_dalitz_y).numpy()  # (N, 2)
     if all_pred_is_bkg:
         result["pred_is_bkg_values"] = torch.cat(all_pred_is_bkg).numpy()
+    if all_event_scores and all_pred_is_bkg:
+        scores_cat = torch.cat(all_event_scores)
+        bkg_cat = torch.cat(all_pred_is_bkg)
+        if bkg_cat.any() and (~bkg_cat).any():
+            result["event_auc"] = _binary_auc(scores_cat, bkg_cat)
+            result["event_scores"] = scores_cat.numpy()
     if factored:
         result["isr_acc"] = total_isr_correct / max(total_sig_samples, 1)
         result["grp_acc"] = total_grp_correct / max(total_sig_samples, 1)

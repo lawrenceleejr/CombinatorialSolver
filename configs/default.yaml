@@ -98,6 +98,19 @@ training:
   beta_bg: 0.5
   bg_soft_weight: 2.0
   bg_asym_cut: 0.0
+  # --- Event-level QCD discriminant (requires a QCD sample) --------------------
+  # A dedicated event_head (BCE, class-balanced per batch) learns P(QCD|event)
+  # from the shared encoder embeddings, giving the analysis an explicit
+  # signal-vs-background score to cut on IN ADDITION to the combinatorial
+  # self-selection above.  The score is decorrelated from the reconstructed
+  # average mass with a DisCo penalty (Kasieczka & Shih, arXiv:2001.05310) on
+  # background events, so cutting on it does not sculpt a bump into the QCD
+  # m_avg spectrum.  Both auto-enable when a QCD sample is provided; raise
+  # lambda_disco (e.g. 5-10) if the post-cut QCD m_avg shows residual shaping.
+  lambda_event: 1.0
+  lambda_event_rampup: 10
+  lambda_disco: 2.0
+  lambda_disco_rampup: 10
   # Distillation from the classical mass-asymmetry solver.
   # At Phase 2 epoch 0 this loss pulls the NN logits toward the assignment with
   # the smallest |m1-m2|/(m1+m2).  It decays linearly to zero over
@@ -145,6 +158,12 @@ data:
   normalize_by_ht: true
   num_jets: 7
   pt_smear_frac: 0.20
+  # Longitudinal-boost augmentation: each training event is boosted along z by
+  # a random rapidity uniform in [-z_boost_aug, +z_boost_aug].  An exact
+  # symmetry of the physics (masses and labels unchanged, per-jet pT and hence
+  # HT normalisation unchanged) that real events sample via the parton
+  # momentum fractions.  Set to 0 to disable.
+  z_boost_aug: 1.0
   # Signal sample glob.  Overridden by the --data CLI flag when provided.
   data_path: "data/*.h5"
   # Optional QCD/background sample glob.  When set (and files match), these
