@@ -31,34 +31,35 @@ background, without sculpting the m_avg spectrum.
 7. **ONNX export fixed on modern PyTorch** (legacy exporter + `Asinh`
    symbolic; verified to reproduce eager logits to ~1e-7 with a dynamic
    batch axis).
+8. **Rest-frame decay features per assignment** (`n_group_physics` 24 → 29):
+   |cos θ*| = |tanh(Δy/2)| of the parent-candidate pair (pair production is
+   central; QCD is forward-peaked), and the rest-frame Dalitz energy
+   fractions x_i = 2(P·p_i)/m² per triplet, computed Lorentz-invariantly
+   (a real 3-body decay shares energy democratically; a fake triplet
+   collapses onto the Dalitz boundary).
+9. **Event-shape features for the event head**: transverse sphericity
+   (closed-form 2×2 eigenvalues), leading-pT fraction, pT hierarchy,
+   rapidity span, min/mean ΔR — kinematics-only global-topology handles,
+   LayerNormed and concatenated with the pooled embeddings.
+
+## A note on the label definition
+
+Training labels are argmin |m1−m2| computed on the *unsmeared* four-momenta
+at load time, while Phase 1's pseudolabels are recomputed per batch on the
+smeared, augmented inputs.  So the two phases target different things by
+construction: Phase 1 teaches the network to mimic the classical heuristic
+as applied to realistic (smeared) inputs; Phase 2 then trains toward the
+clean-kinematics answer, i.e. the network learns to *undo* detector
+smearing — which is exactly where it can outperform the classical solver
+run on realistic data.  (`use_mass_asymmetry_labels: false` with
+parton-matched TARGETS remains available as a cross-check of the label
+definition on samples where it is trustworthy.)
 
 ## Highest-impact next steps
 
-### 1. Train on generator-truth labels, not argmin |m1−m2|
+(All kinematics-only — no jet-substructure or quark/gluon-tagging inputs.)
 
-With `use_mass_asymmetry_labels: true` the training target is *defined* as
-the assignment the classical solver picks on unsmeared kinematics.  The
-network can then at best learn to denoise smearing back to the classical
-answer — it can never learn that the classical answer itself is sometimes
-wrong (wrong-ISR configurations where a lucky pairing gives smaller |m1−m2|
-than the true one).  For a real analysis, produce parton-matched TARGETS in
-the MadGraphMLProducer samples (ΔR matching of jets to the six daughter
-quarks) and train with `use_mass_asymmetry_labels: false`.  This is the one
-change that raises the *ceiling* rather than the approach to it, and it is
-exactly where an ML solver can beat any mass-based heuristic.
-
-### 2. Per-jet substructure / quark-gluon inputs
-
-The strongest QCD-rejection information in a real detector is inside the
-jets, not between them: charged-track multiplicity, jet width /
-n-subjettiness ratios (τ21, τ32), energy fractions, b-tag scores.  Signal
-jets are quarks from a colour-singlet decay; QCD multijet events are
-gluon-enriched.  Extend the HDF5 format with these columns and append them
-to the jet tokens (the token pathway already supports extra features).
-Expected gain on event-level QCD rejection is large — quark/gluon
-discrimination alone is worth more than any kinematic reshuffling.
-
-### 3. Variable jet multiplicity
+### 1. Variable jet multiplicity
 
 Real events do not have exactly 7 jets.  Support 6–10 jets with padding
 masks in the encoder (masked attention), enumerate assignments over the
@@ -67,7 +68,7 @@ partition).  Restricting to exactly-7 events costs signal efficiency and
 biases toward cleaner topologies; the QCD control regions also need the
 higher multiplicities.
 
-### 4. Symmetry-aware target and partial credit
+### 2. Symmetry-aware target and partial credit
 
 The 70-way cross-entropy treats "swapped one jet between groups" the same as
 "completely wrong".  Options: (a) supervise a per-jet-pair "same parent"
@@ -76,7 +77,7 @@ and derive the assignment from it; (b) soft labels that give partial credit
 proportional to the number of correctly grouped jets.  Both densify the
 gradient signal and are known to help at high combinatorial multiplicity.
 
-### 5. Systematics-aware training
+### 3. Systematics-aware training
 
 Before unblinding, the JES/JER story matters: augment with correlated
 jet-energy-scale shifts (not just uncorrelated smearing), and consider a
@@ -84,7 +85,7 @@ small domain-adversarial term between nominal and shifted copies so the
 assignment is JES-stable.  Cheap insurance against the dominant experimental
 systematic of an all-hadronic analysis.
 
-### 6. Ensembling and calibration
+### 4. Ensembling and calibration
 
 - Snapshot ensembles fall out of the existing warm-restart schedule for
   free: keep the best checkpoint per restart cycle and average
@@ -93,7 +94,7 @@ systematic of an all-hadronic analysis.
   purity-efficiency cut is stable across mass points and data-taking
   conditions.
 
-### 7. ABCD with two decorrelated discriminants
+### 5. ABCD with two decorrelated discriminants
 
 The event QCD score + the mass asymmetry of the chosen assignment form a
 natural pair for a data-driven ABCD background estimate; adding a second
@@ -101,7 +102,7 @@ DisCo term between the two scores themselves (the ABCDisCo construction,
 arXiv:2007.14400) would let the analysis estimate the QCD background from
 data instead of relying on multijet MC.
 
-### 8. Significance-aware working point
+### 6. Significance-aware working point
 
 Once shapes are stable, choose the confidence / event-score working points
 by maximising expected bump-hunt significance (e.g. asymptotic AMS on the

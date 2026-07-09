@@ -17,10 +17,15 @@ Architecture:
   6. GroupTransformer: intra-group mini-Transformer replaces sum-pooling to capture
      multi-particle angular correlations within each candidate 3-jet group
   7. Extended physics features per assignment:
-     - 6 inter-group features (mass sum/asymmetry/ratio, deltaR, individual masses)
-     - 9 intra-group features per group (pT hierarchy, Lund-plane kT, ECF₂/ECF₃/D₂,
-       Dalitz pairwise masses) × 2 groups = 18 additional features
-     Total n_group_physics = 24
+     - 7 inter-group features (mass sum/asymmetry/ratio, deltaR, individual
+       masses, |cos θ*| production angle)
+     - 11 intra-group features per group (pT hierarchy, Lund-plane kT,
+       ECF₂/ECF₃/D₂, Dalitz pairwise masses, rest-frame Dalitz energy
+       fractions) × 2 groups = 22 additional features
+     Total n_group_physics = 29
+  8. Pairwise-interaction attention bias (ln ΔR, ln kT, ln z, ln m²_ij,
+     ln pT_i/pT_j → learned per-head bias on every encoder layer)
+  9. Event-level signal-vs-QCD head on pooled embeddings + event shapes
 """
 
 import torch
@@ -193,8 +198,8 @@ class JetAssignmentTransformer(nn.Module):
     Group pooling uses a shared GroupTransformer (mini-Transformer) rather than
     sum-pooling to preserve intra-group angular structure.
 
-    Physics features per assignment include 6 inter-group features plus 9
-    intra-group features per group (18 total), giving n_group_physics=24.
+    Physics features per assignment include 7 inter-group features plus 11
+    intra-group features per group (22 total), giving n_group_physics=29.
     """
 
     def __init__(
@@ -254,8 +259,8 @@ class JetAssignmentTransformer(nn.Module):
             dropout=dropout,
         )
 
-        # 6 inter-group features + 9 intra-group features per group × 2 groups = 24
-        self.n_group_physics = 24
+        # 7 inter-group features + 11 intra-group features per group × 2 groups = 29
+        self.n_group_physics = 29
 
         # Normalize physics features before feeding to scorer MLPs.
         # The 24 features span very different scales (ratios ∈ [0,1] vs masses
@@ -335,9 +340,14 @@ class JetAssignmentTransformer(nn.Module):
         # QCD sample is provided (lambda_event), decorrelated from the
         # reconstructed average mass with a DisCo penalty (lambda_disco) so the
         # score can be cut on without sculpting the bump-hunt variable.
-        # Input: mean- and max-pooled jet embeddings (2 * d_model).
+        # Input: mean- and max-pooled jet embeddings (2 * d_model) plus 6
+        # dimensionless kinematics-only event shapes (LayerNormed): pair
+        # production is back-to-back and per-hemisphere isotropic, QCD
+        # multijet is planar and hierarchical.
+        self.n_event_shapes = 6
+        self.event_shape_norm = nn.LayerNorm(self.n_event_shapes)
         self.event_head = nn.Sequential(
-            nn.Linear(2 * d_model, d_model),
+            nn.Linear(2 * d_model + self.n_event_shapes, d_model),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_model, d_model // 2),
@@ -454,20 +464,28 @@ class JetAssignmentTransformer(nn.Module):
 
     @staticmethod
     def intra_group_features(jets_4vec: torch.Tensor) -> torch.Tensor:
-        """Compute 9 QCD-discriminating features from a 3-jet candidate group.
+        """Compute 11 QCD-discriminating features from a 3-jet candidate group.
 
         Features capture pT hierarchy, Lund-plane splittings, energy correlation
-        functions (ECF₂, ECF₃, D₂), and Dalitz pairwise invariant masses —
-        all of which distinguish QCD-like (hierarchical, collinear) topologies
-        from isotropic high-mass signal decays.
+        functions (ECF₂, ECF₃, D₂), Dalitz pairwise invariant masses, and
+        rest-frame Dalitz energy fractions — all of which distinguish QCD-like
+        (hierarchical, collinear) topologies from isotropic high-mass signal
+        decays.
+
+        The rest-frame energy fractions x_i = 2 E*_i / m_group are computed
+        Lorentz-invariantly as x_i = 2 (P·p_i) / m², where P is the group
+        four-momentum — no explicit boost needed.  A genuine 3-body decay
+        shares energy democratically (x_i cluster near 2/3); a fake triplet
+        built from QCD radiation collapses onto the Dalitz boundary (one jet
+        carries x → 1).
 
         Args:
             jets_4vec: (..., 3, 4) individual jet 4-vectors (E, px, py, pz)
 
         Returns:
-            (..., 9) per-group features:
+            (..., 11) per-group features:
               [max_pt_ratio, pt_cv, min_z, max_kt, ecf2, ecf3, d2,
-               dalitz_max_ratio, dalitz_min_ratio]
+               dalitz_max_ratio, dalitz_min_ratio, x_rest_max, x_rest_min]
         """
         E = jets_4vec[..., 0].clamp(min=1e-8)   # (..., 3) energy
         px = jets_4vec[..., 1]
@@ -551,10 +569,24 @@ class JetAssignmentTransformer(nn.Module):
         dalitz_max = dalitz_t.max(dim=-1).values
         dalitz_min = dalitz_t.min(dim=-1).values
 
+        # --- Rest-frame Dalitz energy fractions x_i = 2 E*_i / m_group ---
+        # Lorentz-invariant form: E*_i = (P · p_i) / m_group with P the group
+        # four-momentum, so x_i = 2 (P · p_i) / m².  Σ x_i = 2 exactly.
+        dot = (
+            p_group[..., 0:1] * E
+            - p_group[..., 1:2] * px
+            - p_group[..., 2:3] * py
+            - p_group[..., 3:4] * pz
+        )                                                               # (..., 3)
+        x_rest = 2.0 * dot / m2_group.clamp(min=1e-8).unsqueeze(-1)    # (..., 3)
+        x_rest_max = x_rest.max(dim=-1).values
+        x_rest_min = x_rest.min(dim=-1).values
+
         return torch.stack(
-            [max_pt_ratio, pt_cv, min_z, max_kt, ecf2, ecf3, d2, dalitz_max, dalitz_min],
+            [max_pt_ratio, pt_cv, min_z, max_kt, ecf2, ecf3, d2, dalitz_max, dalitz_min,
+             x_rest_max, x_rest_min],
             dim=-1,
-        )                                                               # (..., 9)
+        )                                                               # (..., 11)
 
     @staticmethod
     def _intra_group_features(jets_4vec: torch.Tensor) -> torch.Tensor:
@@ -570,12 +602,20 @@ class JetAssignmentTransformer(nn.Module):
     ) -> torch.Tensor:
         """Compute physics features from two group four-vectors.
 
-        Returns (..., 24) when individual jet 4-vectors are provided:
-          - 6 inter-group features: mass_sum, mass_asym, mass_ratio, m1, m2, deltaR
-          - 9 intra-group features for group 1 (pT hierarchy, Lund, ECFs, Dalitz)
-          - 9 intra-group features for group 2
+        Returns (..., 29) when individual jet 4-vectors are provided:
+          - 7 inter-group features: mass_sum, mass_asym, mass_ratio, m1, m2,
+            deltaR, |cos θ*|
+          - 11 intra-group features for group 1 (pT hierarchy, Lund, ECFs,
+            Dalitz, rest-frame energy fractions)
+          - 11 intra-group features for group 2
 
-        Returns (..., 6) when g1_jets / g2_jets are omitted (fallback).
+        Returns (..., 7) when g1_jets / g2_jets are omitted (fallback).
+
+        |cos θ*| = |tanh(Δy/2)| is the production angle of the parent
+        candidates in their partonic centre-of-mass frame: pair production of
+        heavy states is central (flat-ish in cos θ*), while QCD dijet-like
+        configurations are forward-peaked (t-channel gluon exchange) — a
+        classic resonance-search discriminant that costs one tanh.
         """
 
         def inv_mass(p):
@@ -598,14 +638,26 @@ class JetAssignmentTransformer(nn.Module):
         dphi = JetAssignmentTransformer.wrap_dphi(phi1 - phi2)
         delta_r = torch.sqrt((eta1 - eta2) ** 2 + dphi**2)
 
-        inter = torch.stack([mass_sum, mass_asym, mass_ratio, m1, m2, delta_r], dim=-1)
+        # |cos θ*| from the rapidity difference of the two parent candidates
+        # (longitudinal-boost invariant by construction).
+        def rapidity(p):
+            E, pz = p[..., 0], p[..., 3]
+            return 0.5 * torch.log(
+                (E + pz).clamp(min=1e-8) / (E - pz).clamp(min=1e-8)
+            )
+
+        cos_theta_star = torch.tanh(0.5 * (rapidity(g1_4vec) - rapidity(g2_4vec))).abs()
+
+        inter = torch.stack(
+            [mass_sum, mass_asym, mass_ratio, m1, m2, delta_r, cos_theta_star], dim=-1
+        )
 
         if g1_jets is not None and g2_jets is not None:
             intra1 = JetAssignmentTransformer.intra_group_features(g1_jets)
             intra2 = JetAssignmentTransformer.intra_group_features(g2_jets)
-            return torch.cat([inter, intra1, intra2], dim=-1)   # (..., 24)
+            return torch.cat([inter, intra1, intra2], dim=-1)   # (..., 29)
 
-        return inter                                             # (..., 6)
+        return inter                                             # (..., 7)
 
     def _compute_grouping_logits(
         self, jet_embeddings: torch.Tensor, four_momenta: torch.Tensor
@@ -761,17 +813,70 @@ class JetAssignmentTransformer(nn.Module):
         reversed_pooled = self.gradient_reversal(pooled)
         return self.mass_adversary(reversed_pooled)
 
-    def predict_event_logit(self, jet_embeddings: torch.Tensor) -> torch.Tensor:
-        """Event-level signal-vs-QCD logit from pooled jet embeddings."""
+    @staticmethod
+    def event_shape_features(four_momenta: torch.Tensor) -> torch.Tensor:
+        """Six dimensionless, HT-scale-invariant event shapes from (B, J, 4).
+
+        [transverse sphericity, leading-jet pT fraction, pT hierarchy
+        log(pT_max/pT_min), rapidity span, min ΔR, mean ΔR].  All are pure
+        four-vector kinematics (no jet-internal information) and carry the
+        global-topology signal that separates back-to-back pair production
+        from planar, hierarchical QCD multijet events.  The transverse
+        sphericity uses the closed-form eigenvalues of the 2×2 transverse
+        momentum tensor (ONNX-friendly; no eigensolver).
+        """
+        E = four_momenta[..., 0]
+        px, py, pz = four_momenta[..., 1], four_momenta[..., 2], four_momenta[..., 3]
+        pt = torch.sqrt(px**2 + py**2).clamp(min=1e-8)
+        ht = pt.sum(dim=-1).clamp(min=1e-8)
+
+        # Transverse sphericity S_T = 2 λ2 / (λ1 + λ2) of Σ p_i p_i^T (2×2).
+        sxx = (px * px).sum(dim=-1)
+        syy = (py * py).sum(dim=-1)
+        sxy = (px * py).sum(dim=-1)
+        trace = (sxx + syy).clamp(min=1e-8)
+        disc = torch.sqrt(((sxx - syy) ** 2 + 4.0 * sxy**2).clamp(min=0.0))
+        s_t = (trace - disc) / trace   # = 2 λ2 / (λ1 + λ2) ∈ [0, 1]
+
+        f_lead = pt.max(dim=-1).values / ht
+        hierarchy = torch.log(
+            pt.max(dim=-1).values / pt.min(dim=-1).values.clamp(min=1e-8)
+        ).clamp(max=10.0)
+
+        # Rapidity span (longitudinal-boost invariant).
+        y = 0.5 * torch.log((E + pz).clamp(min=1e-8) / (E - pz).clamp(min=1e-8))
+        y_span = y.max(dim=-1).values - y.min(dim=-1).values
+
+        eta = torch.asinh(pz / pt)
+        phi = torch.atan2(py, px)
+        deta = eta.unsqueeze(-1) - eta.unsqueeze(-2)
+        dphi = JetAssignmentTransformer.wrap_dphi(phi.unsqueeze(-1) - phi.unsqueeze(-2))
+        dr = torch.sqrt(deta**2 + dphi**2 + 1e-8)
+        num_jets = four_momenta.shape[1]
+        eye = torch.eye(num_jets, device=four_momenta.device) * 100.0
+        min_dr = (dr + eye).min(dim=-1).values.min(dim=-1).values
+        n_pairs = num_jets * (num_jets - 1)
+        mean_dr = (dr * (1.0 - torch.eye(num_jets, device=four_momenta.device))).sum(
+            dim=(-1, -2)
+        ) / n_pairs
+
+        return torch.stack([s_t, f_lead, hierarchy, y_span, min_dr, mean_dr], dim=-1)
+
+    def predict_event_logit(
+        self, jet_embeddings: torch.Tensor, four_momenta: torch.Tensor
+    ) -> torch.Tensor:
+        """Event-level signal-vs-QCD logit from pooled embeddings + event shapes."""
+        shapes = self.event_shape_norm(self.event_shape_features(four_momenta))
         pooled = torch.cat(
-            [jet_embeddings.mean(dim=1), jet_embeddings.max(dim=1).values], dim=-1
+            [jet_embeddings.mean(dim=1), jet_embeddings.max(dim=1).values, shapes],
+            dim=-1,
         )
         return self.event_head(pooled)
 
     def forward(self, four_momenta: torch.Tensor) -> dict[str, torch.Tensor]:
         jet_embeddings = self.encode_jets(four_momenta)
         mass_pred = self.predict_mass(jet_embeddings)
-        event_logit = self.predict_event_logit(jet_embeddings)
+        event_logit = self.predict_event_logit(jet_embeddings, four_momenta)
         if self.has_isr:
             # Compute groupings first so the ISR head can see grouping quality
             grouping_logits, mass_asym_flat, mass_sum_flat, grp_summary = (
@@ -832,7 +937,8 @@ class MassAsymmetryClassicalSolver(nn.Module):
     # Small ΔR contribution to angular penalty (secondary to Δφ back-to-backness).
     DELTA_R_WEIGHT = 0.1
     # Indices match intra_group_features return order:
-    # [max_pt_ratio, pt_cv, min_z, max_kt, ecf2, ecf3, d2, dalitz_max_ratio, dalitz_min_ratio]
+    # [max_pt_ratio, pt_cv, min_z, max_kt, ecf2, ecf3, d2,
+    #  dalitz_max_ratio, dalitz_min_ratio, x_rest_max, x_rest_min]
     MAX_PT_RATIO_IDX = 0
     PT_CV_IDX = 1
     DALITZ_MAX_RATIO_IDX = 7
