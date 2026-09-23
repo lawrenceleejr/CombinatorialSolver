@@ -37,9 +37,14 @@ them.
 
 ## Running
 
+The reference machine is a Mac Studio; training uses the MPS backend
+automatically. Set `PYTORCH_ENABLE_MPS_FALLBACK=1` in the shell. For
+unattended loops the user creates `.claude/settings.json` from the block in
+`docs/DESIGN_LOOP.md` section 2.5 before starting.
+
 ```bash
 pip install -r requirements.txt
-python -m src.train --config configs/default.yaml --data "data/*.h5"
+PYTORCH_ENABLE_MPS_FALLBACK=1 python -m src.train --config configs/default.yaml --data "data/*.h5"
 python -m src.evaluate --checkpoint checkpoints/best_model.pt --data "data/test*.h5" --output results
 ```
 
