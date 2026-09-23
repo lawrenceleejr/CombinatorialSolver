@@ -13,7 +13,9 @@ venv/
 env/
 
 # Data files
-data/
+data/*
+!data/MANIFEST.md
+!data/splits/
 *.h5
 *.hdf5
 
