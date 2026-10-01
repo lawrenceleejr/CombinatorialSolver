@@ -1,0 +1,131 @@
+% Network architecture of JetAssignmentTransformer (src/model.py), 7-jet / ISR mode.
+% Build: xelatex architecture.tex  (from docs/figures/; uses the bundled EB Garamond)
+\documentclass[border=6pt]{standalone}
+\usepackage{fontspec}
+\setmainfont{EBGaramond12}[
+  Path=../../assets/fonts/ebgaramond/,
+  Extension=.otf,
+  UprightFont=*-Regular, ItalicFont=*-Italic, BoldFont=*-Bold,
+  Numbers=Lining]
+\usepackage[italic]{mathastext}
+\usepackage{amsmath}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc}
+
+\definecolor{ink}{gray}{0.10}
+\definecolor{quiet}{gray}{0.48}
+\definecolor{rule}{gray}{0.62}
+\definecolor{accent}{RGB}{166,54,3}
+
+\tikzset{
+  >={Stealth[length=4pt,width=3pt]},
+  every node/.style={text=ink, font=\small},
+  blk/.style={align=center, inner sep=2pt},
+  dim/.style={font=\scriptsize, text=quiet, align=center, inner sep=1pt},
+  flow/.style={->, draw=rule, line width=0.45pt},
+  aux/.style={->, draw=rule, line width=0.45pt, dash pattern=on 2pt off 1.5pt},
+  lane/.style={font=\scriptsize\itshape, text=quiet, anchor=west, inner sep=0pt},
+  tick/.style={draw=rule, line width=0.35pt},
+}
+
+\newcommand{\h}{\mathbf{h}}
+\newcommand{\g}{\mathbf{g}}
+
+\begin{document}
+\begin{tikzpicture}[x=1cm,y=1cm]
+
+% ---------------- encoder ----------------
+\node[blk] (in) at (0,0) {7 jets\\[-1pt]$(E,p_x,p_y,p_z)/H_T$};
+\node[dim, below=1pt of in] {$7\times4$};
+
+\node[blk] (emb) at (2.9,0) {linear\\[-1pt]+ position embedding};
+\node[dim, below=1pt of emb] {$7\times d$};
+
+\node[blk] (enc) at (6.0,0) {Transformer encoder\\[-1pt]$L$ layers, $n_h$ heads};
+\node[dim, below=1pt of enc] (encdim) {pre-norm, FFN $d_{\mathrm{ff}}$};
+
+\node[blk] (h) at (8.7,0) {$\h_1,\dots,\h_7$};
+\node[dim, below=1pt of h] {$7\times d$};
+
+\draw[flow] (in) -- (emb);
+\draw[flow] (emb) -- (enc);
+\draw[flow] (enc) -- (h);
+
+% pT-hierarchy attention bias
+\node[blk, font=\footnotesize] (bias) at (6.0,-1.55)
+  {attention bias $w_{h}\,\log(p_{T,i}/p_{T,j})$};
+\node[dim, below=0pt of bias] {one learnable $w_h$ per head, $w_h{=}0$ at init};
+\draw[flow] (bias) -- (encdim);
+\draw[aux] (in.south) |- (bias.west);
+
+% ---------------- adversary lane ----------------
+\node[lane] at (9.75,2.55) {adversary (training only)};
+\node[blk] (pool) at (10.6,1.8) {mean$_j\,\h_j$};
+\node[blk] (grl)  at (12.6,1.8) {gradient\\[-1pt]reversal};
+\node[blk] (amlp) at (14.6,1.8) {MLP};
+\node[dim, below=1pt of amlp] {$d\to d/2\to1$};
+\node[blk] (mhat) at (16.4,1.8) {$\hat m_{\text{parent}}$};
+\draw[aux] (h.north) |- (pool.west);
+\draw[aux] (pool) -- (grl);
+\draw[aux] (grl) -- (amlp);
+\draw[aux] (amlp) -- (mhat);
+
+% ---------------- grouping lane ----------------
+\node[lane] at (9.75,0.75) {grouping head, for every ISR choice $j$ and grouping $k$ ($7\times10=70$)};
+\node[blk] (gather) at (10.75,0) {gather\\[-1pt]$G_1,G_2$};
+\node[dim, below=1pt of gather] {$2\times(3\times d)$};
+
+\node[blk] (gt) at (13.0,0) {GroupTransformer\\[-1pt](shared), mean};
+\node[dim, below=1pt of gt] (gtdim) {$\g_1,\g_2\in\mathbb{R}^{d}$};
+
+\node[blk] (pair) at (16.1,0)
+  {$\big[\g_1{+}\g_2,\ \g_1{\odot}\g_2,\ |\g_1{-}\g_2|,\ \mathrm{LN}(\boldsymbol\phi)\big]$};
+\node[dim, below=1pt of pair] (pairdim) {$3d+24$, symmetric in $G_1\leftrightarrow G_2$};
+
+\node[blk] (gmlp) at (19.2,0) {MLP};
+\node[dim, below=1pt of gmlp] {$\to2d\to d\to1$};
+\node[blk] (sgrp) at (20.9,0) {$s^{\text{grp}}_{jk}$};
+\node[dim, below=1pt of sgrp] (sgrpdim) {$7\times10$};
+
+\draw[flow] (h) -- (gather);
+\draw[flow] (gather) -- (gt);
+\draw[flow] (gt) -- (pair);
+\draw[flow] (pair) -- (gmlp);
+\draw[flow] (gmlp) -- (sgrp);
+
+% physics features (side note)
+\node[dim, align=left, anchor=north west, text width=4.9cm] (phys) at (13.55,-1.25)
+  {$\boldsymbol\phi$: 24 features from the jet four-vectors\\
+   6 between groups: $m_1{+}m_2$, $\frac{|m_1-m_2|}{m_1+m_2}$, $\frac{\min m}{\max m}$, $m_1$, $m_2$, $\Delta R_{12}$\\
+   $9\times2$ within groups: $p_T$ max-ratio, $p_T$ c.v., Lund $z_{\min}$, $k_{T,\max}$, ECF$_2$, ECF$_3$, $D_2$, Dalitz $\max$/$\min$};
+\draw[aux] (phys.north west) ++(0.0,0) -- ($(pair.south west)+(0.25,-0.3)$);
+
+% ---------------- ISR lane ----------------
+\node[lane] at (9.75,-3.05) {ISR head, for every jet $j$};
+\node[blk] (summ) at (19.2,-2.25) {$\mathbf{c}_j=\mathrm{GELU}\big(W\sum_k \mathrm{softmax}_k(s^{\text{grp}}_{jk})\,\mathbf{x}_{jk}\big)$};
+\draw[flow] (sgrpdim.south) |- (summ.east);
+\draw[flow] ($(pairdim.south)+(1.2,0)$) |- ($(summ.north west)+(0.35,0)$) -- ($(summ.north west)+(0.35,-0.05)$);
+
+\node[blk] (isrin) at (13.0,-3.75)
+  {$\big[\h_j,\ \tfrac16\textstyle\sum_{i\ne j}\h_i,\ \boldsymbol\phi^{\text{ISR}}_j,\ \mathbf{c}_j\big]$};
+\node[dim, below=1pt of isrin] {$3d+3$; $\boldsymbol\phi^{\text{ISR}}$: $p_T/H_T$, $|\eta|$, $\min_i\Delta R_{ij}$};
+\node[blk] (imlp) at (16.6,-3.75) {MLP};
+\node[dim, below=1pt of imlp] {$\to2d\to d\to1$};
+\node[blk] (sisr) at (19.2,-3.75) {$s^{\text{ISR}}_{j}$};
+\node[dim, below=1pt of sisr] (sisrdim) {7};
+
+\draw[flow] (h.south) |- (isrin.west);
+\draw[flow] (summ.south -| isrin.north) -- (isrin.north);
+\draw[flow] (summ.west) -| (isrin.north);
+\draw[flow] (isrin) -- (imlp);
+\draw[flow] (imlp) -- (sisr);
+
+% ---------------- combination ----------------
+\node[blk, text=accent] (comb) at (23.3,-1.9)
+  {$\ell_{jk}=\alpha\,s^{\text{ISR}}_{j}+s^{\text{grp}}_{jk}$};
+\node[dim, below=1pt of comb] (combdim) {70 logits, softmax $\to$ assignment\\ $\alpha$ learnable, init 1};
+\draw[flow] (sgrp.east) -| (comb.north);
+\draw[flow] (sisr.east) -| (comb.south |- combdim.south);
+
+\end{tikzpicture}
+\end{document}
