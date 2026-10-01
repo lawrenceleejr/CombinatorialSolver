@@ -1,163 +1,100 @@
 % Network architecture of JetAssignmentTransformer (src/model.py), 7-jet / ISR mode.
-% Build: xelatex architecture.tex  (from docs/figures/; uses the bundled EB Garamond)
+% Build: pdflatex architecture.tex
 \documentclass[border=8pt]{standalone}
-\usepackage{fontspec}
-\setmainfont{EBGaramond12}[
-  Path=../../assets/fonts/ebgaramond/,
-  Extension=.otf,
-  UprightFont=*-Regular, ItalicFont=*-Italic, BoldFont=*-Bold,
-  Numbers=Lining]
-\usepackage[italic]{mathastext}
-\usepackage{amsmath,amssymb}
+\usepackage{amsmath}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta,positioning,calc,decorations.pathreplacing,backgrounds}
+\usetikzlibrary{arrows.meta,calc,decorations.pathreplacing}
 
-\definecolor{ink}{gray}{0.12}
-\definecolor{quiet}{gray}{0.45}
-\definecolor{rule}{gray}{0.55}
-\definecolor{boxline}{RGB}{92,108,128}
-\definecolor{boxfill}{RGB}{238,241,245}
-\definecolor{jetfill}{gray}{0.92}
-\definecolor{embfill}{RGB}{205,214,226}
-\definecolor{gonefill}{RGB}{196,214,234}
-\definecolor{gtwofill}{RGB}{214,228,200}
-\definecolor{accent}{RGB}{166,54,3}
-\definecolor{isrfill}{RGB}{244,214,196}
-
-% one size for every repeated thing
-\newcommand{\tokw}{0.30}  % token width
-\newcommand{\tokh}{0.62}  % token height
-\newcommand{\pitch}{0.42} % token spacing
+\definecolor{cIn}{RGB}{242,115,44}
+\definecolor{cEnc}{RGB}{247,148,29}
+\definecolor{cComb}{RGB}{250,198,77}
+\definecolor{cGrp}{RGB}{250,198,77}
+\definecolor{cHead}{RGB}{66,170,139}
+\definecolor{cOut}{RGB}{86,112,143}
 
 \tikzset{
   >={Stealth[length=4pt,width=3pt]},
-  every node/.style={text=ink, font=\small},
-  tok/.style={draw=boxline, line width=0.45pt, minimum width=\tokw cm,
-    minimum height=\tokh cm, inner sep=0pt},
-  layer/.style={draw=boxline, fill=boxfill, line width=0.5pt, rounded corners=2pt,
-    minimum height=0.7cm, align=center, inner sep=2pt},
-  mlp/.style={layer, minimum width=2.1cm},
-  gtbox/.style={layer, minimum width=2.1cm},
-  vec/.style={draw=boxline, line width=0.45pt, minimum width=\tokw cm,
-    minimum height=\tokh cm, inner sep=0pt},
-  score/.style={draw=boxline, fill=white, line width=0.45pt, minimum size=0.42cm,
-    inner sep=0pt},
-  lbl/.style={font=\footnotesize, text=quiet},
-  flow/.style={->, draw=rule, line width=0.5pt},
-  aux/.style={->, draw=rule, line width=0.5pt, dash pattern=on 2pt off 1.5pt},
-}
-
-% a row of tokens:  \tokrow{x}{y}{fill}{name}{lab1}{lab2}{lab3}{lab7}
-% draws  [1][2][3] ... [7]  with identical boxes
-\newcommand{\tokrow}[8]{%
-  \foreach \k/\lab in {0/#5,1/#6,2/#7} {
-    \node[tok, fill=#3] (#4\k) at ({#1+\k*\pitch},#2) {};
-    \node[lbl, font=\scriptsize, below=1pt of #4\k] {\lab};
-  }
-  \node[text=quiet] at ({#1+3*\pitch+0.05},#2) {$\cdots$};
-  \node[tok, fill=#3] (#4n) at ({#1+4.25*\pitch},#2) {};
-  \node[lbl, font=\scriptsize, below=1pt of #4n] {#8};
+  bar/.style={draw=black, line width=0.5pt, rounded corners=1.5pt,
+    minimum width=0.5cm, minimum height=1.25cm, inner sep=0pt},
+  unit/.style={circle, draw=black, line width=0.5pt, minimum size=0.5cm, inner sep=0pt},
+  e/.style={->, line width=0.4pt},
+  stage/.style={anchor=west, align=left},
+  dots/.style={font=\Large},
 }
 
 \begin{document}
 \begin{tikzpicture}[x=1cm,y=1cm]
 
 % ---------------- input jets ----------------
-\tokrow{-0.89}{6.75}{jetfill}{j}{1}{2}{3}{7}
-\node[lbl, anchor=east] at (-1.35,6.75) {jets $(E,\vec p\,)$};
-
-% ---------------- embedding + encoder ----------------
-\node[layer, minimum width=3.4cm] (emb) at (0,5.55) {embed};
-\foreach \s in {2,1} {
-  \node[layer, minimum width=3.4cm, minimum height=1.0cm, fill=boxfill!60!white,
-        draw=boxline!55] at ({0.09*\s},{4.35+0.09*\s}) {};
+\foreach \i in {1,...,7} {
+  \node[bar, fill=cIn] (p\i) at ({\i-4},0) {};
+  \draw[e] ({\i-4},1.25) -- (p\i.north);
+  \node[anchor=east] at ({\i-4-0.08},0.98) {$p_{\i}$};
 }
-\node[layer, minimum width=3.4cm, minimum height=1.0cm] (enc) at (0,4.35)
-  {Transformer encoder};
-\node[lbl, anchor=west] at (1.95,4.62) {$\times 6$};
-\node[lbl, anchor=west, align=left] at (1.95,4.15) {attention biased\\[-2pt]by $p_T$ ordering};
 
-\draw[flow] (0.37,6.3) -- (0.37,5.9);
-\draw[flow] (0.37,5.2) -- (0.37,4.85);
+% ---------------- transformer encoder ----------------
+\foreach \i in {1,...,7} {
+  \node[bar, fill=cEnc] (h\i) at ({\i-4},-2.1) {};
+}
+% self-attention: every jet sees every jet (one fan drawn, plus the straight paths)
+\foreach \i in {1,...,7} { \draw[e] (p\i.south) -- (h\i.north); }
+\foreach \i in {2,...,7} { \draw[e] (p1.south east) -- (h\i.north); }
 
-% ---------------- jet embeddings ----------------
-\tokrow{-0.89}{2.95}{embfill}{h}{$\mathbf h_1$}{$\mathbf h_2$}{$\mathbf h_3$}{$\mathbf h_7$}
-\draw[flow] (0.37,3.85) -- (0.37,3.3);
+% ---------------- assignments (70) ----------------
+\foreach \k/\x in {1/-2.5, 2/-1.3, 3/-0.1, 70/2.5} {
+  \node[bar, fill=cComb] (a\k) at (\x,-4.2) {};
+}
+\node[dots] at (1.2,-4.2) {$\cdots$};
+% one assignment gathers six jets (the seventh is its ISR candidate)
+\foreach \i in {2,...,7} { \draw[e] (h\i.south) -- (a1.north); }
+\foreach \i in {1,...,6} { \draw[e] (h\i.south) -- (a70.north); }
 
-% ---------------- one assignment (of 70), right of the encoder ----------------
-\begin{scope}[on background layer]
-  \foreach \s in {2,1} {
-    \draw[draw=boxline!45, fill=white, line width=0.4pt, rounded corners=2pt]
-      ({4.15+0.1*\s},{2.4+0.1*\s}) rectangle ({11.05+0.1*\s},{3.55+0.1*\s});
+% ---------------- group transformer: two groups per assignment ----------------
+\foreach \k/\x in {1/-2.5, 2/-1.3, 3/-0.1, 70/2.5} {
+  \node[unit, fill=cGrp] (ga\k) at ({\x-0.28},-5.85) {};
+  \node[unit, fill=cGrp] (gb\k) at ({\x+0.28},-5.85) {};
+  \draw[e] (a\k.south) -- (ga\k.north);
+  \draw[e] (a\k.south) -- (gb\k.north);
+}
+\node[dots] at (1.2,-5.85) {$\cdots$};
+
+% ---------------- head ----------------
+\foreach \r/\y in {1/-7.0, 2/-7.95, 3/-8.9} {
+  \foreach \c/\x in {1/-2.0, 2/-1.0, 3/1.0, 4/2.0} {
+    \node[unit, fill=cHead] (m\r\c) at (\x,\y) {};
   }
-\end{scope}
-\draw[draw=boxline!70, fill=white, line width=0.45pt, rounded corners=2pt]
-  (4.15,2.4) rectangle (11.05,3.55);
-\node[lbl, anchor=south west] at (4.1,3.85) {one of 70 ways to pick the ISR jet and split the rest};
-
-\node[tok, fill=isrfill, draw=accent] (isr) at (5.0,2.95) {};
-\foreach \k in {0,1,2} {
-  \node[tok, fill=gonefill] (a\k) at ({7.08+\k*\pitch},2.95) {};
-  \node[tok, fill=gtwofill] (b\k) at ({9.58+\k*\pitch},2.95) {};
+  \node[dots] at (0,\y) {$\cdots$};
 }
-\node[lbl, right=2pt of isr] {ISR};
-\node[lbl, left=3pt of a0] {$G_1$};
-\node[lbl, left=3pt of b0] {$G_2$};
+\foreach \c in {1,2,3,4} { \draw[e] (ga1.south) -- (m1\c.north); }
+\foreach \c in {1,2,3,4} { \draw[e] (gb1.south) -- (m1\c.north); }
+\foreach \r/\n in {1/2, 2/3} {
+  \foreach \c in {1,2,3,4} { \draw[e] (m\r1.south) -- (m\n\c.north); }
+}
 
-\draw[flow] (1.3,2.95) -- (4.1,2.95);
+% ---------------- output ----------------
+\foreach \c/\x/\lab in {1/-3.1/I_1, 2/-2.3/I_2, 7/-0.7/I_7,
+                        8/0.7/C_1, 9/1.5/C_2, 10/3.1/C_{70}} {
+  \node[unit, fill=cOut] (o\c) at (\x,-10.15) {};
+  \draw[e] (o\c.south) -- ++(0,-0.7);
+  \node[anchor=east] at ({\x-0.02},-10.75) {$\lab$};
+}
+\node[dots] at (-1.5,-10.15) {$\cdots$};
+\node[dots] at ( 2.3,-10.15) {$\cdots$};
+\foreach \c in {1,2,7,8,9,10} { \draw[e] (m31.south) -- (o\c.north); }
 
-% ---------------- group pooling (shared) ----------------
-\node[gtbox, minimum width=1.95cm] (gt1) at (7.5,1.3) {Group-\\[-2pt]Transformer};
-\node[gtbox, minimum width=1.95cm] (gt2) at (10.0,1.3) {Group-\\[-2pt]Transformer};
-\draw[draw=rule, line width=0.45pt, dash pattern=on 1pt off 1.5pt] (gt1.east) -- (gt2.west)
-  node[midway, below=12pt, lbl, font=\scriptsize] {shared};
-\draw[flow] (a1.south) -- (gt1.north);
-\draw[flow] (b1.south) -- (gt2.north);
+\draw[decorate, decoration={brace, mirror, amplitude=6pt}]
+  (-3.4,-11.35) -- (-0.4,-11.35) node[midway, below=8pt] {ISR Score};
+\draw[decorate, decoration={brace, mirror, amplitude=6pt}]
+  (0.4,-11.35) -- (3.4,-11.35) node[midway, below=8pt] {Comb.\ Score};
 
-\node[vec, fill=gonefill] (g1) at (7.5,0.05) {};
-\node[vec, fill=gtwofill] (g2) at (10.0,0.05) {};
-\node[lbl, left=2pt of g1] {$\mathbf g_1$};
-\node[lbl, right=2pt of g2] {$\mathbf g_2$};
-\draw[flow] (gt1) -- (g1);
-\draw[flow] (gt2) -- (g2);
-
-\node[mlp, minimum width=4.4cm] (pair) at (8.75,-1.2)
-  {$\mathbf g_1{+}\mathbf g_2,\ \mathbf g_1{\odot}\mathbf g_2,\ |\mathbf g_1{-}\mathbf g_2|$, \ masses};
-\draw[flow] (g1) -- (g1 |- pair.north);
-\draw[flow] (g2) -- (g2 |- pair.north);
-
-\node[mlp] (gmlp) at (8.75,-2.4) {MLP};
-\draw[flow] (pair) -- (gmlp);
-\node[score] (sg) at (8.75,-3.45) {};
-\node[lbl, right=3pt of sg] {grouping score};
-\draw[flow] (gmlp) -- (sg);
-
-% ---------------- ISR head ----------------
-\node[mlp] (imlp) at (5.0,-2.4) {MLP};
-\node[score] (si) at (5.0,-3.45) {};
-\node[lbl, left=3pt of si] {ISR score};
-\draw[flow] (isr.south) -- (imlp.north);
-\draw[flow] (imlp) -- (si);
-\draw[flow] (gmlp.west) -- (imlp.east)
-  node[midway, above=1pt, lbl, font=\scriptsize] {split quality};
-
-% ---------------- combine ----------------
-\node[circle, draw=accent, line width=0.6pt, inner sep=0.5pt, minimum size=0.5cm,
-      text=accent] (plus) at (6.875,-4.45) {$+$};
-\draw[flow] (si.south) |- (plus.west);
-\draw[flow] (sg.south) |- (plus.east);
-\node[draw=accent, fill=isrfill!45, line width=0.6pt, rounded corners=2pt,
-      minimum height=0.7cm, minimum width=3.4cm, align=center] (out) at (6.875,-5.5)
-  {softmax over all 70 $\rightarrow$ assignment};
-\draw[flow, draw=accent] (plus) -- (out);
-
-% ---------------- adversary (training only), under the encoder ----------------
-\node[mlp, draw=boxline!60, fill=white] (amlp) at (0.37,-0.9) {mass adversary};
-\node[score] (am) at (0.37,-2.0) {};
-\node[lbl, right=3pt of am] {$\hat m$};
-\draw[aux] (0.37,2.6) -- (amlp.north) node[midway, right=1pt, lbl, font=\scriptsize] {reversed gradient};
-\draw[aux] (amlp) -- (am);
-\node[lbl, font=\scriptsize\itshape, below=3pt of am] {training only};
+% ---------------- stage labels ----------------
+\node[stage] at (4.6,0)     {Input jets};
+\node[stage] at (4.6,-2.1)  {Transformer\\Encoder ($\times6$)};
+\node[stage] at (4.6,-4.2)  {Assignments\\($\times 70$)};
+\node[stage] at (4.6,-5.85)  {Group\\Transformer};
+\draw[decorate, decoration={brace, amplitude=6pt}] (3.0,-6.7) -- (3.0,-9.2);
+\node[stage] at (4.6,-7.95)  {Head};
+\node[stage] at (4.6,-10.15) {Output};
 
 \end{tikzpicture}
 \end{document}
