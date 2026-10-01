@@ -1,5 +1,6 @@
 % Network architecture of JetAssignmentTransformer (src/model.py), 7-jet / ISR mode.
 % Build: xelatex architecture.tex  (from docs/figures/; uses the bundled EB Garamond)
+% Shape code: rounded box = learned module, ellipse = tensor, plain box = fixed operation.
 \documentclass[border=6pt]{standalone}
 \usepackage{fontspec}
 \setmainfont{EBGaramond12}[
@@ -10,107 +11,169 @@
 \usepackage[italic]{mathastext}
 \usepackage{amsmath,amssymb}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta,positioning,calc}
+\usetikzlibrary{arrows.meta,positioning,calc,shapes.geometric,fit,backgrounds}
 
 \definecolor{ink}{gray}{0.10}
-\definecolor{quiet}{gray}{0.48}
-\definecolor{rule}{gray}{0.62}
+\definecolor{quiet}{gray}{0.45}
+\definecolor{rule}{gray}{0.58}
+\definecolor{panel}{gray}{0.80}
+\definecolor{modfill}{RGB}{233,238,245}
+\definecolor{modline}{RGB}{88,110,140}
 \definecolor{accent}{RGB}{166,54,3}
 
 \tikzset{
   >={Stealth[length=4pt,width=3pt]},
   every node/.style={text=ink, font=\small},
-  blk/.style={align=center, inner sep=2pt},
-  note/.style={align=center, inner sep=2pt, font=\scriptsize, text=quiet},
-  dim/.style={font=\scriptsize, text=quiet, align=center, inner sep=1pt},
-  flow/.style={->, draw=rule, line width=0.45pt},
-  aux/.style={->, draw=rule, line width=0.45pt, dash pattern=on 2pt off 1.5pt},
-  lane/.style={font=\scriptsize\itshape, text=quiet, anchor=west, inner sep=0pt},
-  tick/.style={draw=rule, line width=0.35pt},
+  module/.style={rectangle, rounded corners=3pt, draw=modline, fill=modfill,
+    line width=0.5pt, align=center, inner xsep=5pt, inner ysep=4pt, minimum height=0.85cm},
+  stack/.style={module, fill=modfill!70!white, draw=modline!60},
+  tensor/.style={ellipse, draw=ink!55, fill=white, line width=0.45pt,
+    align=center, inner xsep=1pt, inner ysep=1pt, minimum width=1.35cm},
+  op/.style={rectangle, draw=rule, fill=white, line width=0.45pt,
+    align=center, inner xsep=4pt, inner ysep=3pt, minimum height=0.7cm},
+  combine/.style={circle, draw=accent, line width=0.6pt, fill=white, inner sep=1pt,
+    font=\large, text=accent},
+  outp/.style={tensor, draw=accent, fill=accent!7, line width=0.6pt},
+  token/.style={rectangle, draw=ink!55, fill=white, minimum size=0.27cm, inner sep=0pt,
+    line width=0.4pt},
+  hpanel/.style={rectangle, rounded corners=5pt, draw=panel, line width=0.5pt, inner sep=7pt},
+  ptitle/.style={font=\scriptsize\itshape, text=quiet, anchor=south west, inner sep=2pt},
+  flow/.style={->, draw=rule, line width=0.5pt},
+  aux/.style={->, draw=rule, line width=0.5pt, dash pattern=on 2pt off 1.5pt},
 }
 
 \newcommand{\h}{\mathbf{h}}
 \newcommand{\g}{\mathbf{g}}
+\newcommand{\sub}[1]{\\[1pt]{\scriptsize\color{quiet}#1}}
 
 \begin{document}
 \begin{tikzpicture}[x=1cm,y=1cm]
-% Each block: name in ink, shape / settings in grey directly beneath.
-\newcommand{\sub}[1]{\\[1pt]{\scriptsize\color{quiet}#1}}
 
-% ---------------- encoder (left column) ----------------
-\node[blk] (in)  at (0, 1.5) {7 leading jets $(E,p_x,p_y,p_z)/H_T$\sub{$7\times4$}};
-\node[blk] (emb) at (0, 0.2) {linear $4\to d$ + position embedding\sub{$7\times d$,\ $d=256$}};
-\node[blk] (enc) at (0,-1.25) {Transformer encoder\sub{6 layers, 8 heads, FFN 1024, pre-norm}%
+% =============== encoder (top) ===============
+\foreach \i in {1,...,7} {
+  \node[token, shape=circle, minimum size=0.3cm] (j\i) at ({(\i-4)*0.42}, 2.45) {};
+}
+\node[font=\scriptsize, text=quiet, above=1pt of j4] (inlab)
+  {7 leading jets, $(E,p_x,p_y,p_z)/H_T$};
+\node[fit=(j1)(j7), inner sep=1pt] (in) {};
+
+\node[module] (emb) at (0,1.3) {linear $4\to d$ + position embedding\sub{$d=256$}};
+
+\node[stack] at (0.12,0.06) {\phantom{attention logits $+\,w_h\log(p_{T,i}/p_{T,j})$, one $w_h$ per head}\\[1pt]\phantom{X}\\[1pt]\phantom{X}};
+\node[stack] at (0.06,0.0) {\phantom{attention logits $+\,w_h\log(p_{T,i}/p_{T,j})$, one $w_h$ per head}\\[1pt]\phantom{X}\\[1pt]\phantom{X}};
+\node[module] (enc) at (0,-0.06) {Transformer encoder \ $\times6$%
+  \sub{8 heads, FFN 1024, pre-norm}%
   \sub{attention logits $+\,w_h\log(p_{T,i}/p_{T,j})$, one $w_h$ per head}};
-\node[blk] (h)   at (0,-3.35) {jet embeddings $\h_1,\dots,\h_7$\sub{$7\times d$}};
+
+\foreach \i in {1,...,7} {
+  \node[token, fill=modfill] (t\i) at ({(\i-4)*0.42}, -1.55) {};
+}
+\node[font=\scriptsize, text=quiet, right=4pt of t7] (hlab) {jet embeddings $\h_1,\dots,\h_7$, \ $7\times d$};
+\node[fit=(t1)(t7), inner sep=1pt] (h) {};
+
 \draw[flow] (in) -- (emb);
-\draw[flow] (emb) -- (enc);
-\draw[flow] (enc) -- (h);
+\draw[flow] (emb) -- ++(0,-0.6);
+\draw[flow] ($(enc.south)+(0,-0.06)$) -- (h.north);
+
+\begin{scope}[on background layer]
+  \node[hpanel, fit=(inlab)(enc)(h)(hlab)] (encpanel) {};
+\end{scope}
+\node[ptitle] at (encpanel.north west) {encoder};
 
 % bus from h to the three heads
-\coordinate (bus) at (3.15,-3.35);
-\draw[draw=rule, line width=0.45pt] (h.east) -- (bus);
-\draw[draw=rule, line width=0.45pt] (bus) -- (3.15,0);
-\draw[draw=rule, line width=0.45pt, dash pattern=on 2pt off 1.5pt] (3.15,0) -- (3.15,1.5);
+\coordinate (busL) at (-7.0,-2.4);
+\coordinate (busR) at (5.6,-2.4);
+\draw[draw=rule, line width=0.5pt] (h.south) -- (0,-2.4);
+\draw[draw=rule, line width=0.5pt] (busL) -- (0,-2.4);
+\draw[draw=rule, line width=0.5pt, dash pattern=on 2pt off 1.5pt] (0,-2.4) -- (busR);
 
-% ---------------- adversary lane ----------------
-\node[lane] at (3.45,2.15) {adversary \textendash{} training only};
-\node[blk] (pool) at (4.6,1.5) {mean$_j\,\h_j$};
-\node[blk] (grl)  at (6.85,1.5) {gradient reversal\sub{$\times(-\lambda)$}};
-\node[blk] (amlp) at (9.2,1.5) {MLP\sub{$d\to d/2\to1$}};
-\node[blk] (mhat) at (11.1,1.5) {$\hat m_{\text{parent}}$\sub{MSE}};
-\draw[aux] (3.15,1.5) -- (pool.west);
+% =============== adversary (right column) ===============
+\node[op]     (pool) at (5.6,-3.75) {mean over jets};
+\node[op]     (grl)  at (5.6,-4.9) {gradient reversal\sub{$\times(-\lambda)$}};
+\node[module] (amlp) at (5.6,-6.15) {MLP\sub{$d\to d/2\to1$}};
+\node[tensor] (mhat) at (5.6,-7.4) {$\hat m_{\text{parent}}$\sub{MSE loss}};
+\draw[aux] (busR) -- (pool);
 \draw[aux] (pool) -- (grl);
 \draw[aux] (grl) -- (amlp);
 \draw[aux] (amlp) -- (mhat);
+\begin{scope}[on background layer]
+  \node[hpanel, fit=(pool)(grl)(amlp)(mhat)] (advpanel) {};
+\end{scope}
+\node[ptitle, align=left] at (advpanel.north west) {adversary\\training only};
 
-% ---------------- grouping lane ----------------
-\node[lane] at (3.45,0.62) {grouping head \textendash{} each ISR choice $j$ and split $k$ of the other six, $7\times10$};
-\node[blk] (gather) at (4.75,0) {gather\sub{$G_1,G_2$: $3\times d$ each}};
-\node[blk] (gt) at (7.55,0) {GroupTransformer\sub{shared, 2 layers, 4 heads, mean}};
-\node[blk] (pair) at (12.35,0)
-  {$\mathbf{x}_{jk}=\big[\g_1{+}\g_2,\ \g_1{\odot}\g_2,\ |\g_1{-}\g_2|,\ \mathrm{LN}(\boldsymbol\phi)\big]$%
-   \sub{$3d+24$, symmetric under $G_1\leftrightarrow G_2$}};
-\node[blk] (gmlp) at (16.45,0) {MLP\sub{$\to2d\to d\to1$}};
-\node[blk] (sgrp) at (17.95,0) {$s^{\text{grp}}_{jk}$\sub{$7\times10$}};
-\draw[flow] (3.15,0) -- (gather.west);
+% =============== grouping head (centre + left) ===============
+\node[op]     (gather) at (0,-3.75) {gather $G_1, G_2$\sub{$3\times d$ each}};
+\node[stack] at (0.07,-4.94) {\phantom{shared, 2 layers, 4 heads}\\[1pt]\phantom{X}};
+\node[module] (gt) at (0,-5.0) {GroupTransformer\sub{shared, 2 layers, 4 heads}};
+\node[tensor] (g12) at (0,-6.2) {$\g_1,\ \g_2$\sub{mean-pooled}};
+\node[tensor] (pair) at (0,-7.65)
+  {$\mathbf{x}_{jk}=\big[\g_1{+}\g_2,\ \g_1{\odot}\g_2,$\\$|\g_1{-}\g_2|,\ \mathrm{LN}(\boldsymbol\phi)\big]$%
+   \sub{$3d+24$, symmetric in $G_1\leftrightarrow G_2$}};
+\node[module] (gmlp) at (0,-9.15) {MLP\sub{$\to2d\to d\to1$}};
+\node[tensor] (sgrp) at (0,-10.3) {$s^{\text{grp}}_{jk}$\sub{$7\times10$}};
+
+\node[op] (phys) at (-4.3,-6.2) {physics features $\boldsymbol\phi$\sub{24 per $(j,k)$, from four-vectors}};
+\node[module] (summ) at (-4.3,-10.3)
+  {grouping summary $\mathbf{c}_j$\sub{$\mathrm{softmax}_k(s^{\text{grp}}_{jk})$-weighted}\sub{mean of $\mathbf{x}_{jk}$; linear + GELU}};
+
+\draw[flow] (0,-2.4) -- (gather);
 \draw[flow] (gather) -- (gt);
-\draw[flow] (gt) -- (pair);
+\draw[flow] (gt) -- (g12);
+\draw[flow] (g12) -- (pair);
 \draw[flow] (pair) -- (gmlp);
 \draw[flow] (gmlp) -- (sgrp);
+\draw[flow] (phys.south) |- (pair.165);
+\draw[flow] (pair.195) -| (summ.north);
+\draw[flow] (sgrp) -- (summ);
 
-% grouping-quality summary feeding the ISR head
-\node[blk] (summ) at (14.9,-1.7) {$\mathbf{c}_j$\sub{mean of $\mathbf{x}_{jk}$ over $k$, weights $\mathrm{softmax}_k\,s^{\text{grp}}_{jk}$}\sub{then linear + GELU $\to d$}};
-\draw[flow] (sgrp.south) -- ++(0,-0.3) -| ($(summ.north)+(1.6,0)$);
-\path (summ.north) ++(-0.9,0) coordinate (sn);
-\draw[flow] (pair.south -| sn) -- (sn);
+\begin{scope}[on background layer]
+  \node[hpanel, fit=(gather)(gt)(pair)(sgrp)(phys)(summ)] (grppanel) {};
+\end{scope}
+\node[ptitle, align=left] at (grppanel.north west)
+  {grouping head \textendash{} each ISR jet $j$ $\times$ split $k$ of the other six, 70 in all};
 
-% ---------------- ISR lane ----------------
-\node[lane] at (3.45,-2.75) {ISR head \textendash{} each jet $j$};
-\node[blk] (isrin) at (6.6,-3.35)
-  {$\big[\h_j,\ \tfrac16\textstyle\sum_{i\ne j}\h_i,\ \boldsymbol\phi^{\text{ISR}}_j,\ \mathbf{c}_j\big]$%
-   \sub{$3d+3$}};
-\node[blk] (imlp) at (12.35,-3.35) {MLP\sub{$\to2d\to d\to1$}};
-\node[blk] (sisr) at (17.95,-3.35) {$s^{\text{ISR}}_{j}$\sub{7}};
-\draw[flow] (bus) -- (isrin.west);
-\draw[flow, shorten >=2pt] (summ.south) -- ++(0,-0.35) -| ($(isrin.north)+(1.4,0)$);
+% =============== ISR head (bottom row) ===============
+\node[tensor] (isrin) at (-4.3,-12.6)
+  {$\big[\h_j,\ \tfrac16\textstyle\sum_{i\ne j}\h_i,\ \boldsymbol\phi^{\text{ISR}}_j,\ \mathbf{c}_j\big]$\sub{$3d+3$}};
+\node[module] (imlp) at (-0.4,-12.6) {MLP\sub{$\to2d\to d\to1$}};
+\node[tensor] (sisr) at (1.75,-12.6) {$s^{\text{ISR}}_{j}$\sub{7}};
+\draw[flow] (busL) |- (isrin.west);
+\draw[flow] (summ) -- (isrin);
 \draw[flow] (isrin) -- (imlp);
 \draw[flow] (imlp) -- (sisr);
+\begin{scope}[on background layer]
+  \node[hpanel, fit=(isrin)(imlp)(sisr)] (isrpanel) {};
+\end{scope}
+\node[ptitle] at (isrpanel.north west) {ISR head \textendash{} each jet $j$};
 
-% ---------------- combination ----------------
-\node[blk] (comb) at (20.85,-1.45)
-  {{\color{accent}$\ell_{jk}=\alpha\,s^{\text{ISR}}_{j}+s^{\text{grp}}_{jk}$}%
-   \sub{70 logits, softmax over all (ISR, $G_1$, $G_2$)}\sub{$\alpha$ learnable, 1 at init}};
-\draw[flow] (sgrp.east) -| (comb.north);
-\draw[flow] (sisr.east) -| (comb.south);
+% =============== combination ===============
+\node[combine] (plus) at (3.9,-12.6) {$+$};
+\node[font=\scriptsize, text=accent, above=3pt of plus] {$\alpha\,s^{\text{ISR}}_j+s^{\text{grp}}_{jk}$};
+\node[font=\scriptsize, text=quiet, below=2pt of plus] {$\alpha$ learnable};
+\node[outp] (logits) at (6.45,-12.6) {{\color{accent}70 logits $\ell_{jk}$}\sub{softmax $\to$ assignment}};
+\draw[flow] (sgrp.east) -| (plus.north);
+\draw[flow] (sisr) -- (plus);
+\draw[flow, draw=accent] (plus) -- (logits);
 
-% ---------------- feature definitions (margin note) ----------------
-\node[note, align=left, anchor=north west] at (3.45,-4.0)
-  {$\boldsymbol\phi$ (24, from four-vectors): \ 
-   between groups \textendash{} $m_1{+}m_2$,\ $|m_1{-}m_2|/(m_1{+}m_2)$,\ $\min m/\max m$,\ $m_1$,\ $m_2$,\ $\Delta R_{12}$;\\
-   within each group ($\times2$) \textendash{} max $p_T$ ratio,\ $p_T$ coeff.\ of variation,\ Lund $z_{\min}$,\ Lund $k_{T,\max}$,\
-   ECF$_2$,\ ECF$_3$,\ $D_2$,\ Dalitz max and min.\\
-   $\boldsymbol\phi^{\text{ISR}}_j$ (3): \ $p_{T,j}/H_T$,\ $|\eta_j|$,\ $\min_{i}\Delta R_{ij}$.};
+% =============== legend (right, under adversary) ===============
+\begin{scope}[shift={(4.55,-8.9)}, every node/.style={font=\scriptsize, text=quiet}]
+  \node[module, minimum height=0.4cm, minimum width=0.7cm, inner sep=0pt] at (0,0) {};
+  \node[anchor=west] at (0.45,0) {learned module};
+  \node[tensor, minimum height=0.4cm, minimum width=0.7cm] at (0,-0.55) {};
+  \node[anchor=west] at (0.45,-0.55) {tensor};
+  \node[op, minimum height=0.4cm, minimum width=0.7cm, inner sep=0pt] at (0,-1.1) {};
+  \node[anchor=west] at (0.45,-1.1) {fixed operation};
+  \draw[aux] (-0.35,-1.6) -- (0.35,-1.6);
+  \node[anchor=west] at (0.45,-1.6) {training only};
+\end{scope}
+
+% =============== footnote ===============
+\node[font=\scriptsize, text=quiet, align=left, anchor=north west, text width=13.6cm]
+  at ($(isrpanel.south west)+(-1.5,-0.35)$)
+  {$\boldsymbol\phi$ between groups: $m_1{+}m_2$,\ $|m_1{-}m_2|/(m_1{+}m_2)$,\ $\min m/\max m$,\ $m_1$,\ $m_2$,\ $\Delta R_{12}$.
+   Within each group ($\times2$): max $p_T$ ratio,\ $p_T$ coeff.\ of variation,\ Lund $z_{\min}$,\ Lund $k_{T,\max}$,\
+   ECF$_2$,\ ECF$_3$,\ $D_2$,\ Dalitz max and min.\ \
+   $\boldsymbol\phi^{\text{ISR}}_j$: $p_{T,j}/H_T$,\ $|\eta_j|$,\ $\min_{i}\Delta R_{ij}$.};
 
 \end{tikzpicture}
 \end{document}
