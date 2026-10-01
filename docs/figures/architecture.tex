@@ -54,7 +54,7 @@
   \fill[gray, fill opacity=0.22] (\x,11.8) -- ++(\dx,\dy) -- ++(0.12,0) -- ++(-\dx,-\dy) -- cycle;
   \fill[gray, fill opacity=0.6] (\x,10.0) rectangle ++(0.12,1.8);
 }
-\node[capt, anchor=north] at (5.03,\ycap) {encoder, 6 layers};
+\node[capt, anchor=north] at (5.03,\ycap) {Transformer encoder, 6 layers};
 
 % embeddings
 \foreach \i in {1,...,7} { \node[tok, fill=tint] (h\i) at ({7.9+(\i-1)*0.36},\yc) {}; }
@@ -88,8 +88,8 @@
 \draw[flow] (b1 |- 0,9.05) -- (b1.north);
 \node[capt, anchor=west] at (3.2,8.5) {one cell $(j,k)$, enlarged};
 
-\node[block] (gt1) at (a1 |- 0,6.75) {GroupTransformer};
-\node[block] (gt2) at (b1 |- 0,6.75) {GroupTransformer};
+\node[block] (gt1) at (a1 |- 0,6.75) {group Transformer};
+\node[block] (gt2) at (b1 |- 0,6.75) {group Transformer};
 \node[capt] at ($(gt1)!0.5!(gt2)+(0,-0.52)$) {same weights};
 \foreach \k in {0,1,2} {
   \draw[flow] (a\k.south) -- (a\k.south |- gt1.north);
