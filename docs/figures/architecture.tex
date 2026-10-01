@@ -7,9 +7,9 @@
 
 \definecolor{cIn}{RGB}{242,115,44}
 \definecolor{cEnc}{RGB}{247,148,29}
-\definecolor{cComb}{RGB}{250,198,77}
 \definecolor{cGrp}{RGB}{250,198,77}
 \definecolor{cHead}{RGB}{66,170,139}
+\definecolor{cScore}{RGB}{140,165,195}
 \definecolor{cOut}{RGB}{86,112,143}
 
 \tikzset{
@@ -18,83 +18,112 @@
     minimum width=0.5cm, minimum height=1.25cm, inner sep=0pt},
   unit/.style={circle, draw=black, line width=0.5pt, minimum size=0.5cm, inner sep=0pt},
   e/.style={->, line width=0.4pt},
+  ctx/.style={->, line width=0.4pt, dash pattern=on 2pt off 1.5pt},
   stage/.style={anchor=west, align=left},
   dots/.style={font=\Large},
+  lab/.style={font=\small},
 }
 
 \begin{document}
 \begin{tikzpicture}[x=1cm,y=1cm]
 
-% ---------------- input jets ----------------
+% ================= input jets =================
 \foreach \i in {1,...,7} {
   \node[bar, fill=cIn] (p\i) at ({\i-4},0) {};
   \draw[e] ({\i-4},1.25) -- (p\i.north);
   \node[anchor=east] at ({\i-4-0.08},0.98) {$p_{\i}$};
 }
 
-% ---------------- transformer encoder ----------------
-\foreach \i in {1,...,7} {
-  \node[bar, fill=cEnc] (h\i) at ({\i-4},-2.1) {};
-}
-% self-attention: every jet sees every jet (one fan drawn, plus the straight paths)
+% ================= embedding + transformer encoder =================
+\foreach \i in {1,...,7} { \node[bar, fill=cEnc] (h\i) at ({\i-4},-2.1) {}; }
 \foreach \i in {1,...,7} { \draw[e] (p\i.south) -- (h\i.north); }
-\foreach \i in {2,...,7} { \draw[e] (p1.south east) -- (h\i.north); }
+\foreach \i in {2,...,7} { \draw[e] (p1.south east) -- (h\i.north); }   % self-attention
 
-% ---------------- assignments (70) ----------------
-\foreach \k/\x in {1/-2.5, 2/-1.3, 3/-0.1, 70/2.5} {
-  \node[bar, fill=cComb] (a\k) at (\x,-4.2) {};
-}
-\node[dots] at (1.2,-4.2) {$\cdots$};
-% one assignment gathers six jets (the seventh is its ISR candidate)
-\foreach \i in {2,...,7} { \draw[e] (h\i.south) -- (a1.north); }
-\foreach \i in {1,...,6} { \draw[e] (h\i.south) -- (a70.north); }
+% column x-positions
+%   ISR head: one column per jet         I_1, I_2, ..., I_7
+%   grouping head: one column per assignment (ISR jet j, split k), 70 in all
+\def\xIa{-4.6} \def\xIb{-3.6} \def\xIdots{-2.5} \def\xIg{-1.6}
+\def\xCa{0.35} \def\xCb{1.75} \def\xCdots{3.05} \def\xCz{4.0}
 
-% ---------------- group transformer: two groups per assignment ----------------
-\foreach \k/\x in {1/-2.5, 2/-1.3, 3/-0.1, 70/2.5} {
-  \node[unit, fill=cGrp] (ga\k) at ({\x-0.28},-5.85) {};
-  \node[unit, fill=cGrp] (gb\k) at ({\x+0.28},-5.85) {};
-  \draw[e] (a\k.south) -- (ga\k.north);
-  \draw[e] (a\k.south) -- (gb\k.north);
+% ================= group transformer (shared): two groups per assignment =================
+\foreach \k/\x in {a/\xCa, b/\xCb, z/\xCz} {
+  \node[unit, fill=cGrp] (g1\k) at ({\x-0.3},-4.1) {};
+  \node[unit, fill=cGrp] (g2\k) at ({\x+0.3},-4.1) {};
 }
-\node[dots] at (1.2,-5.85) {$\cdots$};
+\node[dots] at (\xCdots,-4.1) {$\cdots$};
+% assignment 1: ISR = jet 1,  G1 = {2,3,4},  G2 = {5,6,7}
+\foreach \i in {2,3,4} { \draw[e] (h\i.south) -- (g1a.north); }
+\foreach \i in {5,6,7} { \draw[e] (h\i.south) -- (g2a.north); }
+% assignment 70: ISR = jet 7,  G1 = {1,5,6},  G2 = {2,3,4}
+\foreach \i in {1,5,6} { \draw[e] (h\i.south) -- (g1z.north); }
+\foreach \i in {2,3,4} { \draw[e] (h\i.south) -- (g2z.north); }
 
-% ---------------- head ----------------
-\foreach \r/\y in {1/-7.0, 2/-7.95, 3/-8.9} {
-  \foreach \c/\x in {1/-2.0, 2/-1.0, 3/1.0, 4/2.0} {
-    \node[unit, fill=cHead] (m\r\c) at (\x,\y) {};
-  }
-  \node[dots] at (0,\y) {$\cdots$};
+% ================= heads: two separate MLPs, each shared across its columns =================
+\foreach \r/\y in {1/-5.4, 2/-6.4} {
+  \foreach \c/\x in {a/\xCa, b/\xCb, z/\xCz} { \node[unit, fill=cHead] (cm\r\c) at (\x,\y) {}; }
+  \foreach \c/\x in {a/\xIa, b/\xIb, g/\xIg}  { \node[unit, fill=cHead] (im\r\c) at (\x,\y) {}; }
+  \node[dots] at (\xCdots,\y) {$\cdots$};
+  \node[dots] at (\xIdots,\y) {$\cdots$};
 }
-\foreach \c in {1,2,3,4} { \draw[e] (ga1.south) -- (m1\c.north); }
-\foreach \c in {1,2,3,4} { \draw[e] (gb1.south) -- (m1\c.north); }
-\foreach \r/\n in {1/2, 2/3} {
-  \foreach \c in {1,2,3,4} { \draw[e] (m\r1.south) -- (m\n\c.north); }
+% grouping MLP input: symmetric combination of g1, g2 (+ group physics)
+\foreach \c in {a,b,z} {
+  \draw[e] (g1\c.south) -- (cm1\c.north);
+  \draw[e] (g2\c.south) -- (cm1\c.north);
+  \draw[e] (cm1\c) -- (cm2\c);
+}
+% ISR MLP input: h_j (with the mean of the other jets)
+\foreach \c/\j in {a/1, b/2, g/7} {
+  \draw[e] (h\j.south) -- (im1\c.north);
+  \draw[e] (im1\c) -- (im2\c);
 }
 
-% ---------------- output ----------------
-\foreach \c/\x/\lab in {1/-3.1/I_1, 2/-2.3/I_2, 7/-0.7/I_7,
-                        8/0.7/C_1, 9/1.5/C_2, 10/3.1/C_{70}} {
-  \node[unit, fill=cOut] (o\c) at (\x,-10.15) {};
-  \draw[e] (o\c.south) -- ++(0,-0.7);
-  \node[anchor=east] at ({\x-0.02},-10.75) {$\lab$};
+% ================= scores =================
+\foreach \c/\x/\lab in {a/\xCa/C_{1}, b/\xCb/C_{2}, z/\xCz/C_{70}} {
+  \node[unit, fill=cScore] (C\c) at (\x,-7.5) {};
+  \draw[e] (cm2\c) -- (C\c);
+  \node[anchor=west, lab] at ({\x+0.27},-7.5) {$\lab$};
 }
-\node[dots] at (-1.5,-10.15) {$\cdots$};
-\node[dots] at ( 2.3,-10.15) {$\cdots$};
-\foreach \c in {1,2,7,8,9,10} { \draw[e] (m31.south) -- (o\c.north); }
+\foreach \c/\x/\lab in {a/\xIa/I_{1}, b/\xIb/I_{2}, g/\xIg/I_{7}} {
+  \node[unit, fill=cScore] (I\c) at (\x,-7.5) {};
+  \draw[e] (im2\c) -- (I\c);
+  \node[anchor=west, lab] at ({\x+0.27},-7.5) {$\lab$};
+}
+\node[dots] at (\xCdots,-7.5) {$\cdots$};
+\node[dots] at (\xIdots,-7.5) {$\cdots$};
 
+% c_j: softmax-weighted summary of the grouping scores feeds back into the ISR head
+\draw[ctx] (Ca.north west) -- ++(-0.75,0.0) |- (\xIdots,-4.85) -- (\xIdots,-5.2);
+\node[lab, anchor=west] at ($(Ca.north west)+(-0.72,1.0)$) {$c_j$};
+
+% ================= combined assignment logits =================
+\def\yL{-9.0}
+\node[unit, fill=cOut] (L1)  at (-1.2,\yL) {};
+\node[unit, fill=cOut] (L2)  at (-0.2,\yL) {};
+\node[dots]                  at ( 0.8,\yL) {$\cdots$};
+\node[unit, fill=cOut] (L70) at ( 1.8,\yL) {};
+\draw[e] (Ia.south) -- (L1.north);  \draw[e] (Ca.south) -- (L1.north);   % (ISR 1, split 1)
+\draw[e] (Ia.south) -- (L2.north);  \draw[e] (Cb.south) -- (L2.north);   % (ISR 1, split 2)
+\draw[e] (Ig.south) -- (L70.north); \draw[e] (Cz.south) -- (L70.north);  % (ISR 7, split 10)
+\foreach \n/\lab in {L1/\ell_{1}, L2/\ell_{2}, L70/\ell_{70}} {
+  \draw[e] (\n.south) -- ++(0,-0.7);
+  \node[anchor=east, lab] at ($(\n.south)+(-0.02,-0.4)$) {$\lab$};
+}
 \draw[decorate, decoration={brace, mirror, amplitude=6pt}]
-  (-3.4,-11.35) -- (-0.4,-11.35) node[midway, below=8pt] {ISR Score};
-\draw[decorate, decoration={brace, mirror, amplitude=6pt}]
-  (0.4,-11.35) -- (3.4,-11.35) node[midway, below=8pt] {Comb.\ Score};
+  (-1.6,-10.05) -- (2.2,-10.05) node[midway, below=8pt] {softmax $\rightarrow$ assignment};
 
-% ---------------- stage labels ----------------
-\node[stage] at (4.6,0)     {Input jets};
-\node[stage] at (4.6,-2.1)  {Transformer\\Encoder ($\times6$)};
-\node[stage] at (4.6,-4.2)  {Assignments\\($\times 70$)};
-\node[stage] at (4.6,-5.85)  {Group\\Transformer};
-\draw[decorate, decoration={brace, amplitude=6pt}] (3.0,-6.7) -- (3.0,-9.2);
-\node[stage] at (4.6,-7.95)  {Head};
-\node[stage] at (4.6,-10.15) {Output};
+% ================= stage labels =================
+\def\xS{5.35}
+\node[stage] at (\xS,0)    {Input jets};
+\node[stage] at (\xS,-2.1) {Embedding +\\Transformer\\Encoder ($\times6$)};
+\node[stage] at (\xS,-4.1) {Group\\Transformer};
+\draw[decorate, decoration={brace, amplitude=6pt}] (4.75,-5.1) -- (4.75,-6.7);
+\node[stage] at (\xS,-5.9) {MLP heads};
+\node[stage] at (\xS,-7.5) {Scores};
+\node[stage] at (\xS,-9.0) {Output\\$\ell_{jk}=\alpha I_j + C_{jk}$};
+
+% column headings
+\node[lab, anchor=east] at (-4.65,-4.75) {ISR head};
+\node[lab, anchor=west] at (4.15,-3.35) {};
 
 \end{tikzpicture}
 \end{document}
