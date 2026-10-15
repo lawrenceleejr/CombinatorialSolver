@@ -25,6 +25,11 @@ python scripts/produce_samples.py --outdir data/prod \
   - jets: anti-kT R = 0.4, pT > 30 GeV, |η| < 3, calorimeter-like smearing;
   - signal: g̃ → uds, width 1% of the mass;
   - QCD: p̂T > 200 GeV with a p̂T² bias (weights stored).
+- Truth matching: every signal file stores the decay quarks both before and
+  after their own shower (`truth/quarks_before_fsr`, `truth/quarks_after_fsr`).
+  `--truth-quarks` picks the one used for `TARGETS` and `truth/quarks`; the
+  default is `before_fsr`, which gives cleaner labels (docs/REVIEW.md). The
+  testbed files in `data/pythia` used `after_fsr`.
 
 Measured throughput per core:
 - signal: ~55 events/s, about 5 core-hours per million events;
@@ -52,6 +57,10 @@ python scripts/train_pairnet.py --gated --proxy --n-jets 7 \
 - `--amp` turns on bfloat16 autocast (CUDA only).
 - `--cache-dir` stores the parsed arrays, so later runs skip the h5 parsing.
 - `--resume` continues from `<out>/last.pt`, which is written every epoch.
+- `--truth-key truth/quarks_before_fsr` (or `_after_fsr`) picks the truth
+  definition at training time, whatever the file was matched with.
+- `--gate-interp --mass-head` lets the gate see the pairing summary and adds a
+  learned resonance mass (`m_est` in the ONNX export).
 - `--select sig_at_bkg --select-bkg-pass 0.05` (the default) keeps the epoch
   with the most signal in the mass window at 5% weighted QCD pass of the
   asymmetry cut. That puts every run at the same operating point.
