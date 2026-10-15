@@ -122,8 +122,9 @@ def load_events(paths, n_jets=8, k=3, is_signal=True, max_events=None, sizes=Non
     if max_jets is not None:
         keep &= res["njall"] <= max_jets
     res = {k_: v[keep] for k_, v in res.items()}
-    if max_events:
-        res = {k_: v[:max_events] for k_, v in res.items()}
+    if max_events and max_events < len(res["pt"]):
+        pick = np.sort(np.random.default_rng(12345).choice(len(res["pt"]), max_events, replace=False))
+        res = {k_: v[pick] for k_, v in res.items()}
     res["is_signal"] = np.full(len(res["pt"]), is_signal)
     return res
 
