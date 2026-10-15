@@ -14,8 +14,10 @@ Closure is then judged by comparing network outputs on mixed events with real
 halves of an event (absent in mixed events by construction) shows up as
 non-closure.
 
-Defaults (compatibility variables, transverse thrust) are guesses at the real
-analysis and are easy to change.
+mix_replace() follows the analysis as described: keep the real 3-jet hemisphere
+of a 5-jet event and replace its 2-jet hemisphere by a compatible 3-jet one that
+balances it along the thrust axis (axis preserved) at the same hemisphere eta.
+mix() is the simpler "pair two random hemispheres" variant, kept for comparison.
 """
 
 import numpy as np
@@ -127,3 +129,84 @@ def mix(lib, n_out=None, k_neighbours=4, seed=0, random_eta_flip=True):
     w = np.sqrt(lib["w"][a_idx] * lib["w"][b_idx])
     return {"pt": t(pt), "eta": t(eta), "phi": t(phi), "m": t(m),
             "mask": np.ones_like(pt, dtype=bool), "w": w}
+
+
+def _hemi_summary(pt, eta, phi, m, sel, phi_ax):
+    """Per-event 4-momentum of the jets in `sel`, in the frame with thrust axis at phi=0.
+
+    Returns (p_par, p_perp, eta_hemi, mass)."""
+    dphi = phi - phi_ax[:, None]
+    w = sel.astype(float)
+    px = (pt * np.cos(dphi) * w).sum(1)
+    py = (pt * np.sin(dphi) * w).sum(1)
+    pz = (pt * np.sinh(eta) * w).sum(1)
+    e = (np.sqrt((pt * np.cosh(eta)) ** 2 + m**2) * w).sum(1)
+    ptot = np.hypot(px, py)
+    eta_h = np.arcsinh(pz / np.maximum(ptot, 1e-9))
+    mass = np.sqrt(np.maximum(e**2 - px**2 - py**2 - pz**2, 0))
+    return px, py, eta_h, mass
+
+
+def mix_replace(pt, eta, phi, m, mask, w, k_neighbours=4, seed=0,
+                match=("p_par", "p_perp", "eta")):
+    """Hemisphere replacement (the analysis' method, as described):
+
+    For each 5-jet event splitting 3+2 about its transverse thrust axis, keep the
+    3-jet hemisphere A and replace the 2-jet hemisphere B with a 3-jet hemisphere C
+    taken from a different event.  C is the nearest neighbour to B in
+      p_par  : momentum along the thrust axis (so C balances A as B did and the
+               thrust axis of the fake event is preserved),
+      p_perp : |momentum perpendicular to the axis|,
+      eta    : hemisphere pseudorapidity (C must sit where B sat),
+    with C rotated onto B's side of the axis and mirrored in eta to match B's sign.
+    Returns 6-jet events, pT-sorted.
+    """
+    rng = np.random.default_rng(seed)
+    phi_ax, side = split_hemispheres(pt, eta, phi, m, mask)
+    n_plus, n_minus = (side == 1).sum(1), (side == -1).sum(1)
+    three_side = np.where(n_plus == 3, 1, np.where(n_minus == 3, -1, 0))
+    ok = (mask.sum(1) == 5) & (((n_plus == 3) & (n_minus == 2)) | ((n_plus == 2) & (n_minus == 3)))
+    ev = np.where(ok)[0]
+
+    # library of 3-jet hemispheres in their own thrust frame (+x side, Pz >= 0)
+    lib = build_library(pt, eta, phi, m, mask, w, n_hemi_jets=3)
+    lpx, lpy, leta, lmass = _hemi_summary(lib["pt"], lib["eta"], lib["phi"], lib["m"],
+                                          np.ones_like(lib["pt"], bool), np.zeros(len(lib["pt"])))
+    lib_feat = {"p_par": lpx, "p_perp": np.abs(lpy), "eta": np.abs(leta), "mass": lmass}
+
+    # the 2-jet hemisphere B of each event, expressed so B is on the +x side
+    sideB = -three_side[ev]
+    axB = phi_ax[ev] + np.where(sideB == 1, 0.0, np.pi)
+    selB = side[ev] == sideB[:, None]
+    bpx, bpy, beta, bmass = _hemi_summary(pt[ev], eta[ev], phi[ev], m[ev], selB, axB)
+    b_feat = {"p_par": bpx, "p_perp": np.abs(bpy), "eta": np.abs(beta), "mass": bmass}
+
+    L = np.stack([lib_feat[k] for k in match], 1)
+    Q = np.stack([b_feat[k] for k in match], 1)
+    mu, sd = L.mean(0), L.std(0).clip(min=1e-9)
+    tree = cKDTree((L - mu) / sd)
+    _, nn = tree.query((Q - mu) / sd, k=k_neighbours + 1)
+    choice = rng.integers(0, k_neighbours + 1, len(ev))
+    pick = nn[np.arange(len(ev)), choice]
+    for j in range(k_neighbours + 1):  # never reuse the event's own hemisphere
+        same = lib["ev"][pick] == ev
+        if not same.any():
+            break
+        pick[same] = nn[same, (choice[same] + j + 1) % (k_neighbours + 1)]
+
+    # place C: rotate its frame onto B's axis, mirror eta to B's sign
+    cphi = (lib["phi"][pick] + axB[:, None] + np.pi) % (2 * np.pi) - np.pi
+    ceta = lib["eta"][pick] * np.where(beta < 0, -1.0, 1.0)[:, None]
+    cpt, cm = lib["pt"][pick], lib["m"][pick]
+    selA = side[ev] == three_side[ev][:, None]
+    oA = np.argsort(~selA, 1, kind="stable")[:, :3]
+    g = lambda a: np.take_along_axis(a[ev], oA, 1)
+    out_pt = np.concatenate([g(pt), cpt], 1)
+    out_eta = np.concatenate([g(eta), ceta], 1)
+    out_phi = np.concatenate([g(phi), cphi], 1)
+    out_m = np.concatenate([g(m), cm], 1)
+    order = np.argsort(-out_pt, 1)
+    t = lambda a: np.take_along_axis(a, order, 1)
+    return {"pt": t(out_pt), "eta": t(out_eta), "phi": t(out_phi), "m": t(out_m),
+            "mask": np.ones_like(out_pt, dtype=bool), "w": w[ev] * 1.0,
+            "phi_axis_orig": phi_ax[ev]}

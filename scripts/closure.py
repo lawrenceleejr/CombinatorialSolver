@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from src.hemimix import build_library, mix  # noqa: E402
+from src.hemimix import build_library, mix, mix_replace  # noqa: E402
 from src.pairdata import load_events, to_tensors  # noqa: E402
 from src.pairnet import PairNet  # noqa: E402
 
@@ -87,6 +87,9 @@ def main():
     ap.add_argument("--psig-cut", type=float, default=None,
                     help="cut on P(sig); default: value keeping 10%% of real 6-jet QCD")
     ap.add_argument("--unweighted", action="store_true")
+    ap.add_argument("--mix-mode", choices=["replace", "pair"], default="replace",
+                    help="replace: swap the 2-jet hemisphere of a 5-jet event for a compatible "
+                         "3-jet one (analysis method); pair: two random compatible 3-jet hemispheres")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -95,7 +98,10 @@ def main():
     sr6 = load_events(args.qcd, 6, 3, False, None, min_jets=6, max_jets=6)
     srall = load_events(args.qcd, a["n_jets"], 3, False, None, min_jets=6)
     lib = build_library(cr["pt"], cr["eta"], cr["phi"], cr["m"], cr["mask"], cr["w"])
-    mx = mix(lib, seed=1)
+    if args.mix_mode == "replace":
+        mx = mix_replace(cr["pt"], cr["eta"], cr["phi"], cr["m"], cr["mask"], cr["w"], seed=1)
+    else:
+        mx = mix(lib, seed=1)
     for d in (cr, sr6, srall, mx):
         if args.unweighted:
             d["w"] = np.ones(len(d["pt"]))
