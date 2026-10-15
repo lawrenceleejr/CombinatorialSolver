@@ -271,7 +271,7 @@ def main():
                   " ".join(f"{m}:{ft[m]['fom']:6.1f}     " for m in masses), flush=True)
     os.makedirs(a.out, exist_ok=True)
     json.dump(res, open(os.path.join(a.out, "fom.json"), "w"), indent=1)
-    np.savez_compressed(os.path.join(a.out, "per_event.npz"), is_signal=s, pmass=pm, w=w, ht=ht,
+    np.savez_compressed(os.path.join(a.out, "per_event.npz"), is_signal=s, pmass=pm, w=w, ht=ht, njall=d["njall"],
                         **{f"score::{k}": v[0] for k, v in methods.items() if len(v) == 2},
                         **{f"mavg::{k}": v[1] for k, v in methods.items() if len(v) == 2})
     print("(numbers in brackets: effective QCD MC events in the chosen window)")
