@@ -193,7 +193,7 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", required=True)
     ap.add_argument("--ptmin", type=float, default=30.0)
-    ap.add_argument("--etamax", type=float, default=2.5)
+    ap.add_argument("--etamax", type=float, default=3.0)  # CMS Run 3 scouting jets: |eta|<3
     ap.add_argument("--min-jets", type=int, default=6)
     ap.add_argument("--max-jets", type=int, default=20)
     ap.add_argument("--min-ht", type=float, default=0.0)
