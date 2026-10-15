@@ -241,12 +241,50 @@ def massvar_fom(vars_path, out, asym_cut=0.1):
     save(fig, out, "massvar_fom")
 
 
+def strategy_fom(path, out, methods=None, name="strategy_fom"):
+    """S/sqrt(B) (best cut and window) vs mass for search strategies, log scale."""
+    r = json.load(open(path))
+    default = [("argmin |Δm|, asym cut", "argmin |Δm| + asym cut", MUTED),
+               ("current network, asym cut", "current network + asym cut", "#b9b3a3"),
+               ("expert BDT, argmin pairing", "expert-feature BDT", BLUE),
+               ("gated PairNet, gate cut", "gated PairNet, gate cut", ACCENT),
+               ("gated PairNet, gate cut, TRUTH pairing (bound)", "same, true pairing (bound)", INK)]
+    methods = methods or default
+    fig, ax = plt.subplots(figsize=(4.6, 3.3))
+    ends, ally, allm = [], [], []
+    for key, lab, c in methods:
+        if key not in r:
+            continue
+        ms = sorted(int(k) for k in r[key] if k.isdigit())
+        y = [r[key][str(m)]["fom"] for m in ms]
+        ls = (0, (2, 2)) if "bound" in lab else "-"
+        ax.plot(ms, y, marker="o", color=c, ms=3, lw=1.1, ls=ls)
+        ends.append((np.log10(y[-1]), lab, c))
+        ally += y
+        allm += ms
+    ax.set_yscale("log")
+    # direct labels in log space, nudged apart
+    items = sorted(ends)
+    ys = [v for v, _, _ in items]
+    for i in range(1, len(ys)):
+        ys[i] = max(ys[i], ys[i - 1] + 0.09)
+    for (_, t, c), yv in zip(items, ys):
+        ax.text(max(allm) * 1.03, 10**yv, t, color=c, va="center", fontsize=7.5)
+    ax.set_xlabel("gluino mass [GeV]")
+    ax.set_ylabel(r"$S/\sqrt{B}$ (best cut and mass window)")
+    ax.set_xticks(sorted(set(allm)))
+    ax.set_xlim(min(allm) * 0.9, max(allm) * 1.75)
+    ax.spines["bottom"].set_bounds(min(allm), max(allm))
+    save(fig, out, name)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", nargs="*", default=[])
     ap.add_argument("--matching", default="results/matching.json")
     ap.add_argument("--out", default="plots/report")
     ap.add_argument("--massvars", default=None)
+    ap.add_argument("--fom", default=None, help="search_study fom.json")
     a = ap.parse_args()
     runs = {}
     for r in a.runs:
@@ -256,6 +294,8 @@ def main():
         matching_breakdown(a.matching, a.out)
     if a.massvars:
         massvar_fom(a.massvars, a.out)
+    if a.fom:
+        strategy_fom(a.fom, a.out)
     if runs:
         eff_vs_mass(runs, a.out)
         preselection_curve(runs, a.out)
