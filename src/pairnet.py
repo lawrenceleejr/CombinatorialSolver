@@ -401,3 +401,20 @@ def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0):
         weight=torch.where(is_sig, 1.0, bkg_weight) * torch.ones(B, device=logp.device),
     )
     return lmix + w_gate * lgate
+
+
+def load_checkpoint(path):
+    """Rebuild a PairNet from a train_pairnet.py checkpoint."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    a = ck["args"]
+    sizes = tuple((int(x[0]), int(x[1])) for x in a["sizes"].split(",")) if a.get("sizes") else None
+    net = PairNet(
+        n_jets=a["n_jets"], k=a["k"], d_model=a["d_model"], nhead=a["heads"],
+        num_layers=a["layers"], dim_ff=2 * a["d_model"], dropout=0.0,
+        use_pair_bias=not a["no_pair_bias"], use_group_kin=not a["no_group_kin"],
+        use_null=not a["no_null"], sizes=sizes, gated=a.get("gated", False),
+        bg_beta=a.get("bg_beta", 1.0),
+    )
+    net.load_state_dict(ck["state"])
+    net.eval()
+    return net, a
