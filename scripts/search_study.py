@@ -45,24 +45,34 @@ def mavg_asym(d, g1, g2):
 
 
 @torch.no_grad()
-def pairnet_outputs(path, d, bs=2048):
+def pairnet_all(path, d, bs=2048):
+    """Signal-scorer and mixture choices (as jet triplets), P(signal) and, for
+    mass-head checkpoints, the learned mass m_est."""
     net, _ = load_checkpoint(path)
     n = net.n_jets
     t = {k: torch.from_numpy(np.ascontiguousarray(d[k][:, :n])) for k in ("pt", "eta", "phi", "m", "mask")}
     t = {k: (v.float() if v.dtype != torch.bool else v) for k, v in t.items()}
-    sig_best, mix_best, gate = [], [], []
+    sig_best, mix_best, gate, mest = [], [], [], []
     for i in range(0, len(t["pt"]), bs):
         o = net(*(t[k][i: i + bs] for k in ("pt", "eta", "phi", "m", "mask")))
         A = net.n_assign
         sig_best.append(o["assign_logits"].argmax(1))
         mix_best.append(o["logits"][:, :A].argmax(1))
         gate.append(torch.sigmoid(o["gate_logit"]) if "gate_logit" in o else 1 - o["logits"].softmax(1)[:, -1])
+        if "log_m_over_ht" in o:
+            mest.append(torch.exp(o["log_m_over_ht"]) * o["ht"])
     # map interpretation indices to jet-index triplets with THIS network's table
     table = enumerate_interpretations(net.n_assign_jets, net.sizes)
     g1 = np.array([a for a, _ in table])
     g2 = np.array([b for _, b in table])
     sb, mb = torch.cat(sig_best).numpy(), torch.cat(mix_best).numpy()
-    return (g1[sb], g2[sb]), (g1[mb], g2[mb]), torch.cat(gate).numpy(), sb
+    return {"sig": (g1[sb], g2[sb]), "mix": (g1[mb], g2[mb]), "gate": torch.cat(gate).numpy(), "sb": sb,
+            "m_est": torch.cat(mest).numpy() if mest else None}
+
+
+def pairnet_outputs(path, d, bs=2048):
+    o = pairnet_all(path, d, bs)
+    return o["sig"], o["mix"], o["gate"], o["sb"]
 
 
 def shortest(v, frac):
@@ -191,11 +201,14 @@ def main():
     ckpts = {"gated PairNet": a.gated}
     ckpts.update(dict(x.split("=", 1) for x in a.extra))
     for name, path in ckpts.items():
-        (sg1, sg2), (mg1, mg2), gate, sb = pairnet_outputs(path, d)
+        po = pairnet_all(path, d)
+        (sg1, sg2), (mg1, mg2), gate, sb = po["sig"], po["mix"], po["gate"], po["sb"]
         m_mix, as_mix = mavg_asym(d, mg1, mg2)
         m_sig, _ = mavg_asym(d, sg1, sg2)
         methods[f"{name}, asym cut"] = (-as_mix, m_mix)
         methods[f"{name}, gate cut"] = (gate, m_sig)
+        if po["m_est"] is not None:
+            methods[f"{name}, gate cut, its learned mass"] = (gate, po["m_est"])
         if name == "gated PairNet" and os.path.exists(a.stack):
             from train_stack import stack_features
             st = pickle.load(open(a.stack, "rb"))
@@ -237,8 +250,8 @@ def main():
 
     from sklearn.metrics import roc_auc_score
     res = {}
-    floor_variants = [k for k in methods if k.startswith(("gated PairNet, gate cut", "stacked", "v2", "ensemble"))
-                      and "TRUTH" not in k]
+    floor_variants = [k for k in methods if (k.startswith(("gated PairNet, gate cut", "stacked", "v2", "ensemble"))
+                                             or k.endswith("its learned mass")) and "TRUTH" not in k]
     for name in floor_variants:
         methods[name + " + HT floor"] = methods[name] + ("htfloor",)
     for name, spec in methods.items():
