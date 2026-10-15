@@ -85,3 +85,10 @@ the new network before adopting it. `src/hemimix.py` (`mix_replace`) and
 ## Figures
 
 `docs/figures/*.pdf`: one panel per file, Tufte style, EB Garamond.
+
+## Data scaling
+
+Training on 3× the signal statistics (180k events, with QCD weighted 3× to keep
+the balance) does not improve signal-in-window at matched QCD pass rates. That
+holds within ±2 points at 2–8% QCD pass. At this model size the network is not
+limited by training statistics.
