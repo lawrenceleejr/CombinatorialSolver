@@ -359,9 +359,10 @@ def truth_definition_plot(h5path, mass, out, name="truth_definition"):
         hist = hist / hist.sum() / np.diff(bins)
         ax.step(bins[:-1], hist, where="post", color=col, lw=1.1)
         lo, hi = np.quantile(v, [0.16, 0.84])
-        ends.append((hist.max(), f"{lab}: 16–84% in {lo:.2f}–{hi:.2f} M", col))
-    for k, (ymax, t, c) in enumerate(sorted(ends, reverse=True)):
-        ax.text(0.42, ymax * (1.0 - 0.13 * k), t, color=c, fontsize=7.5, va="top")
+        ends.append((hist.max(), f"{lab}\n16–84% within {lo:.2f}–{hi:.2f} M", col))
+    top = max(e[0] for e in ends)
+    for k, (_, t, c) in enumerate(sorted(ends, reverse=True)):
+        ax.text(0.42, top * (1.0 - 0.24 * k), t, color=c, fontsize=7.5, va="top", linespacing=1.3)
     ax.set_xlabel(f"mass of the three truth-matched jets / M   (M = {mass:.0f} GeV)")
     ax.set_ylabel("density")
     ax.set_yticks([])
