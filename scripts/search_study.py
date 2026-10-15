@@ -72,24 +72,47 @@ def _neff(x):
     return x.sum() ** 2 / max((x**2).sum(), 1e-30) if len(x) else 0.0
 
 
-def fom_table(score, mavg, is_sig, pmass, w, ht):
+def fom_fixed_threshold(score, mavg, is_sig, pmass, w, ht, qcd_effs=(0.1, 0.03, 0.01, 0.003, 0.001, 3e-4)):
+    """One score threshold for ALL masses (set by the weighted QCD efficiency);
+    returns the per-mass FOM at the threshold that maximises the geometric mean."""
+    wq, sq = w[~is_sig], score[~is_sig]
+    order = np.argsort(-sq)
+    cw = np.cumsum(wq[order]) / wq.sum()
+    best = None
+    for e in qcd_effs:
+        thr = sq[order][min(np.searchsorted(cw, e), len(cw) - 1)]
+        r = fom_table(score, mavg, is_sig, pmass, w, ht, keeps=(1.0,), presel=score >= thr)
+        gm = np.exp(np.mean([np.log(max(v["fom"], 1e-6)) for v in r.values()]))
+        if best is None or gm > best[0]:
+            best = (gm, e, r)
+    return {"qcd_eff": best[1], "geo_mean_fom": float(best[0]), **best[2]}
+
+
+def fom_table(score, mavg, is_sig, pmass, w, ht, ht_floor_q=None,
+              keeps=(1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1), presel=None):
+    """presel: optional fixed event selection applied before everything else
+    (signal efficiencies stay relative to ALL signal events)."""
     out = {}
     s_all = is_sig
+    if presel is None:
+        presel = np.ones(len(score), bool)
     wq, mq, sq, hq = w[~s_all], mavg[~s_all], score[~s_all], ht[~s_all]
+    pq = presel[~s_all]
     wtot = wq.sum()
     for M in np.unique(pmass[s_all]):
         sm = s_all & (pmass == M)
-        ss, ms = score[sm], mavg[sm]
+        ss, ms, ps = score[sm], mavg[sm], presel[sm]
         lo, hi = np.quantile(ht[sm], [0.1, 0.9])
         reg = (hq > lo) & (hq < hi)
         floor = 3 * (wq[reg].mean() if reg.any() else wq.mean()) / wtot
+        hfloor = np.quantile(ht[sm], ht_floor_q) if ht_floor_q else -np.inf
         best = {"fom": 0.0}
-        for keep in (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1):
-            thr = -np.inf if keep >= 1 else np.quantile(ss, 1 - keep)
-            sel_s = ss >= thr
+        for keep in keeps:
+            thr = -np.inf if keep >= 1 else np.quantile(ss[ht[sm] >= hfloor], 1 - keep)
+            sel_s = (ss >= thr) & (ht[sm] >= hfloor) & ps
             if sel_s.sum() < 30:
                 continue
-            sel_q = sq >= thr
+            sel_q = (sq >= thr) & (hq >= hfloor) & pq
             for q in (0.5, 0.68, 0.8, 0.9):
                 a, b = shortest(ms[sel_s], q)
                 S = (sel_s & (ms >= a) & (ms <= b)).sum() / sm.sum()
@@ -113,6 +136,7 @@ def main():
     ap.add_argument("--legacy", default="runs/legacy_asis/model.pt")
     ap.add_argument("--bdt", default="runs/bdt/bdt.pkl")
     ap.add_argument("--stack", default="runs/stack/stack.pkl")
+    ap.add_argument("--reg", default="results/mass_estimators/reg.pkl")
     ap.add_argument("--out", default="results/search_study")
     a = ap.parse_args()
     torch.set_num_threads(4)
@@ -179,21 +203,46 @@ def main():
             m_tr, _ = mavg_asym(d, G1[tb], G2[tb])
             methods["gated PairNet, gate cut, TRUTH pairing (bound)"] = (gate, m_tr)
 
+    if os.path.exists(a.reg):
+        import pickle as _pk
+        from mass_estimators import interp_masses, net_probs, reg_features
+        rg = _pk.load(open(a.reg, "rb"))
+        net_r, _ = load_checkpoint(rg["pairnet"])
+        Pr, gr = net_probs(net_r, d)
+        mar, asr = interp_masses(d)
+        Xr, _, _ = reg_features(d, Pr, mar, asr, gr)
+        m_reg = ht * np.exp(rg["model"].predict(Xr))
+        methods["gated PairNet, gate cut, learned mass"] = (gr, m_reg)
+        if "stacked (expert + PairNet), PairNet pairing" in methods:
+            methods["stacked, learned mass"] = (methods["stacked (expert + PairNet), PairNet pairing"][0], m_reg)
+
     from sklearn.metrics import roc_auc_score
     res = {}
-    for name, (score, mavg) in methods.items():
-        r = fom_table(score, mavg, s, pm, w, ht)
+    floor_variants = [k for k in methods if k.startswith(("gated PairNet, gate cut", "stacked", "v2"))
+                      and "TRUTH" not in k]
+    for name in floor_variants:
+        methods[name + " + HT floor"] = methods[name] + ("htfloor",)
+    for name, spec in methods.items():
+        score, mavg = spec[0], spec[1]
+        hq = 0.1 if len(spec) > 2 else None
+        r = fom_table(score, mavg, s, pm, w, ht, ht_floor_q=hq)
+        r["fixed_threshold"] = fom_fixed_threshold(score, mavg, s, pm, w, ht) if hq is None else None
         r["auc"] = float(roc_auc_score(s, score, sample_weight=np.where(s, 1.0 / s.sum(), w / w[~s].sum())))
+        r = {k: v for k, v in r.items()}
         res[name] = r
-        print(f"{name:52s} AUC {r['auc']:.4f} | FOM " +
-              " ".join(f"{m}:{r[m]['fom']:7.1f}{'*' if r[m].get('B_floored') else ' '}"
-                       for m in sorted(k for k in r if k != "auc")), flush=True)
+        masses = sorted(k for k in r if isinstance(k, int))
+        print(f"{name:56s} AUC {r['auc']:.4f} | FOM " +
+              " ".join(f"{m}:{r[m]['fom']:6.1f}({r[m].get('n_eff_qcd', 0):3.0f})" for m in masses), flush=True)
+        if r["fixed_threshold"]:
+            ft = r["fixed_threshold"]
+            print(f"{'   one cut for all masses (QCD eff %g)' % ft['qcd_eff']:56s}            | FOM " +
+                  " ".join(f"{m}:{ft[m]['fom']:6.1f}     " for m in masses), flush=True)
     os.makedirs(a.out, exist_ok=True)
     json.dump(res, open(os.path.join(a.out, "fom.json"), "w"), indent=1)
     np.savez_compressed(os.path.join(a.out, "per_event.npz"), is_signal=s, pmass=pm, w=w, ht=ht,
-                        **{f"score::{k}": v[0] for k, v in methods.items()},
-                        **{f"mavg::{k}": v[1] for k, v in methods.items()})
-    print("(* = background at the floor: QCD MC statistics limit that point)")
+                        **{f"score::{k}": v[0] for k, v in methods.items() if len(v) == 2},
+                        **{f"mavg::{k}": v[1] for k, v in methods.items() if len(v) == 2})
+    print("(numbers in brackets: effective QCD MC events in the chosen window)")
 
 
 if __name__ == "__main__":

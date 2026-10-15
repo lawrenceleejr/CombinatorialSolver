@@ -112,6 +112,9 @@ def main():
                                         max_leaf_nodes=63, early_stopping=True, random_state=0)
     reg.fit(Xtr, ytr)
     print(f"regressor: {len(ytr)} training events, {reg.n_iter_} iterations", flush=True)
+    os.makedirs(a.out, exist_ok=True)
+    import pickle
+    pickle.dump({"model": reg, "pairnet": a.model}, open(os.path.join(a.out, "reg.pkl"), "wb"))
 
     # --- evaluate
     d = concat(load_events(a.sig, 20, 3, True, None, min_jets=6),
