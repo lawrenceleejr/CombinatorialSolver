@@ -11,6 +11,7 @@ eval_legacy.py output (correct).  Writes PDF + SVG for every figure.
 import argparse
 import json
 import os
+import sys
 
 import matplotlib
 
@@ -70,8 +71,10 @@ def eff_vs_mass(runs, out):
     ax.set_ylabel("true interpretation chosen\n(fraction of all signal events)")
     ax.set_xticks(sorted(set(allm)))
     ax.set_xlim(min(allm) * 0.9, max(allm) * 1.25)
-    ax.set_ylim(0, max(ally) * 1.1)
-    range_frame(ax, x=allm, y=[0, max(ally)])
+    top = np.ceil(max(ally) * 50) / 50
+    ax.set_ylim(0, top * 1.05)
+    ax.set_yticks(np.arange(0, top + 1e-9, 0.02))
+    range_frame(ax, x=allm, y=[0, top])
     save(fig, out, "eff_vs_mass")
 
 
@@ -100,7 +103,8 @@ def preselection_curve(runs, out, window=(0.85, 1.1)):
     ax.set_xlabel("QCD passing asymmetry cut (weighted fraction)")
     ax.set_ylabel("signal passing cut with\n$m_{avg}$ in [0.85, 1.1] M")
     ax.text(0.02, 0.98, r"dots: $A<0.1$", transform=ax.transAxes, fontsize=7, color=MUTED, va="top")
-    range_frame(ax, y=[0, max(ys)])
+    ax.set_ylim(0, max(ys) * 1.08)
+    range_frame(ax, x=[min(xs), max(xs)], y=[0, max(ys)])
     save(fig, out, "preselection_curve")
 
 
@@ -131,7 +135,8 @@ def mavg_hist(runs, out, cut=0.1):
         ax.set_xlabel(r"$m_{avg}$ of chosen interpretation, $A<%.2g$ [GeV]" % cut)
         ax.set_ylabel("fraction of all events per 50 GeV")
         range_frame(ax, x=[0, 2500], y=[0, ymax])
-        save(fig, out, f"mavg_{name}")
+        slug = "".join(ch if ch.isalnum() else "_" for ch in name).strip("_")
+        save(fig, out, f"mavg_{slug}")
 
 
 def matching_breakdown(path, out):
@@ -168,11 +173,62 @@ def matching_breakdown(path, out):
     save(fig, out, "truth_ceiling")
 
 
+def massvar_fom(vars_path, out, asym_cut=0.1):
+    """S/sqrt(B) in the shortest 68% signal window, relative to m_avg alone."""
+    sys.path.insert(0, HERE)
+    from mass_variables_fom import shortest
+
+    d = np.load(vars_path)
+    s = d["is_signal"].astype(bool)
+    pre = d["asym"] < asym_cut
+    w = d["w"]
+    wq = w[~s].sum()
+    floor = 3 * w[~s].mean() / wq
+    ms = np.unique(d["pmass"][s])
+
+    def fom(v, extra=None):
+        out_ = []
+        for m in ms:
+            sm = s & (d["pmass"] == m)
+            base = pre.copy()
+            if extra == "ht90":
+                base &= d["HT"] >= np.quantile(d["HT"][sm & pre], 0.10)
+            lo, hi = shortest(d[v][sm & base])
+            sel = base & (d[v] >= lo) & (d[v] <= hi)
+            S = (sm & sel).sum() / sm.sum()
+            B = (w * (~s & sel)).sum() / wq
+            out_.append(S / np.sqrt(max(B, floor)))
+        return np.array(out_)
+
+    ref = fom("m3")
+    curves = [("m3", None, r"$m_{avg}$ of chosen 3+3", INK),
+              ("dressed0.8", None, r"dressed, $\Delta R<0.8$", BLUE),
+              ("thrust", None, "thrust hemispheres", MUTED),
+              ("HT", None, r"$H_T$ window", "#55a868"),
+              ("m3", "ht90", r"$m_{avg}$ window + loose $H_T$ floor", ACCENT)]
+    fig, ax = plt.subplots(figsize=(4.6, 3.2))
+    sel = ms < 1900  # 2 TeV point is limited by QCD MC statistics
+    ys = []
+    for v, ex, lab, c in curves:
+        y = fom(v, ex) / ref
+        ax.plot(ms[sel], y[sel], "-o", color=c, ms=3, lw=1.1)
+        ax.text(ms[sel][-1] * 1.03, y[sel][-1], lab, color=c, va="center", fontsize=8)
+        ys += list(y[sel])
+    ax.axhline(1, color=MUTED, lw=0.5, ls=(0, (2, 2)))
+    ax.set_xlabel("gluino mass [GeV]")
+    ax.set_ylabel(r"$S/\sqrt{B}$ relative to $m_{avg}$ alone")
+    ax.set_xticks(ms[sel])
+    ax.set_xlim(ms[0] * 0.9, ms[sel][-1] * 1.9)
+    range_frame(ax, x=list(ms[sel]), y=[min(ys), max(ys)])
+    save(fig, out, "massvar_fom")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", nargs="*", default=[])
     ap.add_argument("--matching", default="results/matching.json")
     ap.add_argument("--out", default="plots/report")
+    ap.add_argument("--massvars", default=None)
     a = ap.parse_args()
     runs = {}
     for r in a.runs:
@@ -180,6 +236,8 @@ def main():
         runs[k] = load(p)
     if os.path.exists(a.matching):
         matching_breakdown(a.matching, a.out)
+    if a.massvars:
+        massvar_fom(a.massvars, a.out)
     if runs:
         eff_vs_mass(runs, a.out)
         preselection_curve(runs, a.out)
