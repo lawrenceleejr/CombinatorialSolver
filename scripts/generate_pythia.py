@@ -43,8 +43,17 @@ except ImportError:  # conda-forge / source build
 GLUINO = 1000021
 
 
-def write_slha(mass: float, width: float, path: str) -> None:
-    """Minimal SLHA: decouple everything except the gluino, force g~ -> u d s."""
+SQUARK_UR = 2000002
+SQUARKS = set(range(1000001, 1000007)) | set(range(2000001, 2000007))
+
+
+def write_slha(mass: float, width: float, path: str, decay: str = "direct",
+               squark_mass: float | None = None) -> None:
+    """Minimal SLHA: decouple everything except the gluino, force g~ -> u d s.
+
+    decay="chain": g~ -> ~u_R u~ (+ c.c.) with an on-shell ~u_R of squark_mass,
+    ~u_R -> d~ s~ (RPV UDD), so each gluino still gives three quarks but two of
+    them form a resonance."""
     heavy = 5.0e4
     sparticles = [
         1000001, 1000002, 1000003, 1000004, 1000005, 1000006,
@@ -95,13 +104,25 @@ def write_slha(mass: float, width: float, path: str) -> None:
         "  36  5.0e+04",
         "  37  5.0e+04",
     ]
-    lines += [f"  {pid}  {heavy:.6e}" for pid in sparticles]
-    lines += [
-        f"DECAY {GLUINO} {width:.6e}",
-        "   5.000000e-01   3    2    1    3",
-        "   5.000000e-01   3   -2   -1   -3",
-    ]
+    chain = decay == "chain"
+    lines += [f"  {pid}  {(squark_mass if chain and pid == SQUARK_UR else heavy):.6e}" for pid in sparticles]
+    if chain:
+        lines += [
+            f"DECAY {GLUINO} {width:.6e}",
+            f"   5.000000e-01   2    {SQUARK_UR}   -2",
+            f"   5.000000e-01   2   -{SQUARK_UR}    2",
+            f"DECAY {SQUARK_UR} {0.01 * squark_mass:.6e}",
+            "   1.000000e+00   2   -1   -3",
+        ]
+    else:
+        lines += [
+            f"DECAY {GLUINO} {width:.6e}",
+            "   5.000000e-01   3    2    1    3",
+            "   5.000000e-01   3   -2   -1   -3",
+        ]
     for pid in sparticles:
+        if chain and pid == SQUARK_UR:
+            continue
         lines.append(f"DECAY {pid} 1.0")
         lines.append("   1.000000e+00   2    1000021    1")
     with open(path, "w") as f:
@@ -122,7 +143,7 @@ def make_pythia(args) -> pythia8.Pythia:
     ]
     if args.process == "signal":
         slha = os.path.join(tempfile.mkdtemp(), "gluino.slha")
-        write_slha(args.mass, args.mass * args.width_frac, slha)
+        write_slha(args.mass, args.mass * args.width_frac, slha, args.decay, args.squark_mass)
         cmds += [
             "SUSY:all = off",
             "SUSY:gg2gluinogluino = on",
@@ -132,6 +153,8 @@ def make_pythia(args) -> pythia8.Pythia:
             "SLHA:allowUserOverride = on",
             f"{GLUINO}:mayDecay = on",
         ]
+        if args.decay == "chain":
+            cmds.append(f"{SQUARK_UR}:mayDecay = on")
     else:
         cmds += [
             "HardQCD:all = on",
@@ -140,6 +163,10 @@ def make_pythia(args) -> pythia8.Pythia:
             f"PhaseSpace:bias2SelectionPow = {args.bias_pow}",
             f"PhaseSpace:bias2SelectionRef = {args.pthat_min}",
         ]
+    if args.alphas_fsr is not None:
+        cmds.append(f"TimeShower:alphaSvalue = {args.alphas_fsr}")
+    if args.alphas_isr is not None:
+        cmds.append(f"SpaceShower:alphaSvalue = {args.alphas_isr}")
     if args.no_mpi:
         cmds.append("PartonLevel:MPI = off")
     if args.no_had:
@@ -152,8 +179,25 @@ def make_pythia(args) -> pythia8.Pythia:
     return p
 
 
+def _decay_quarks_from(event, idx) -> list[int]:
+    """Final (bottom-copy) decay quarks reached from entry idx, following squarks."""
+    prt = event[idx]
+    a = abs(prt.id())
+    if 1 <= a <= 6:
+        return [prt.iBotCopyId()]
+    if a in SQUARKS:
+        bot = event[prt.iBotCopyId()]
+        d1, d2 = bot.daughter1(), bot.daughter2()
+        out = []
+        for d in range(d1, max(d1, d2) + 1):
+            out += _decay_quarks_from(event, d)
+        return out
+    return []
+
+
 def decay_quarks(event) -> list[list[tuple[float, float, float]]] | None:
-    """Return [[(pt,eta,phi) x3] for each gluino] from the last gluino copies."""
+    """Return [[(pt,eta,phi) x3] for each gluino] from the last gluino copies
+    (directly, or through an intermediate squark)."""
     groups = []
     for i in range(event.size()):
         prt = event[i]
@@ -166,11 +210,10 @@ def decay_quarks(event) -> list[list[tuple[float, float, float]]] | None:
         dl = list(range(d1, max(d1, d2) + 1))
         if any(abs(event[d].id()) == GLUINO for d in dl):
             continue
-        qs = [event[d] for d in dl if 1 <= abs(event[d].id()) <= 6]
-        if len(qs) != 3:
+        qi = [q for d in dl for q in _decay_quarks_from(event, d)]
+        if len(qi) != 3:
             return None
-        qs = [event[q.iBotCopyId()] for q in qs]
-        groups.append([(q.pT(), q.eta(), q.phi()) for q in qs])
+        groups.append([(event[q].pT(), event[q].eta(), event[q].phi()) for q in qi])
     if len(groups) != 2:
         return None
     return groups
@@ -192,6 +235,11 @@ def main():
     ap.add_argument("--process", choices=["signal", "qcd"], required=True)
     ap.add_argument("--mass", type=float, default=1000.0)
     ap.add_argument("--width-frac", type=float, default=0.01)
+    ap.add_argument("--decay", choices=["direct", "chain"], default="direct",
+                    help="direct: g~ -> uds (3-body); chain: g~ -> ~u_R u~, ~u_R -> d~ s~")
+    ap.add_argument("--squark-mass", type=float, default=None, help="for --decay chain")
+    ap.add_argument("--alphas-fsr", type=float, default=None, help="TimeShower:alphaSvalue (Monash 0.1365)")
+    ap.add_argument("--alphas-isr", type=float, default=None, help="SpaceShower:alphaSvalue (Monash 0.1365)")
     ap.add_argument("--n", type=int, default=10000, help="events to WRITE")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", required=True)
