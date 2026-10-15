@@ -327,9 +327,54 @@ def robustness_plot(path, out, wp="0.01", name="robustness"):
     save(fig, out, name)
 
 
+def truth_definition_plot(h5path, mass, out, name="truth_definition"):
+    """Mass of the three jets matched to each gluino's decay quarks, with the
+    quarks taken before or after their own FSR (both stored by generate_pythia)."""
+    import h5py
+    sys.path.insert(0, os.path.join(HERE, ".."))
+    from src.pairdata import truth_sets_from_quarks
+    with h5py.File(h5path, "r") as f:
+        src = f["INPUTS/Source"]
+        pt, eta, phi, m, mask = (src[k][:] for k in ("pt", "eta", "phi", "mass", "MASK"))
+        mask = mask.astype(bool)
+        q = {lab: f[key][:] for lab, key in (("before its own FSR", "truth/quarks_before_fsr"),
+                                              ("after its own FSR (used so far)", "truth/quarks_after_fsr"))}
+    px, py, pz = pt * np.cos(phi), pt * np.sin(phi), pt * np.sinh(eta)
+    E = np.sqrt(px**2 + py**2 + pz**2 + m**2)
+    fig, ax = plt.subplots(figsize=(4.4, 2.9))
+    bins = np.linspace(0.4, 1.2, 65)
+    ends = []
+    for (lab, qq), col in zip(q.items(), (ACCENT, MUTED)):
+        tj = truth_sets_from_quarks(qq, eta, phi, mask)
+        vals = []
+        for i in range(len(tj)):
+            a, b = tj[i, :3], tj[i, 3:]
+            if (tj[i] < 0).any() or len(set(a)) < 3 or len(set(b)) < 3 or set(a) & set(b):
+                continue
+            for h in (a, b):
+                s = [E[i, h].sum(), px[i, h].sum(), py[i, h].sum(), pz[i, h].sum()]
+                vals.append(np.sqrt(max(s[0]**2 - s[1]**2 - s[2]**2 - s[3]**2, 0)) / mass)
+        v = np.array(vals)
+        hist, _ = np.histogram(v, bins)
+        hist = hist / hist.sum() / np.diff(bins)
+        ax.step(bins[:-1], hist, where="post", color=col, lw=1.1)
+        lo, hi = np.quantile(v, [0.16, 0.84])
+        ends.append((hist.max(), f"{lab}: 16–84% in {lo:.2f}–{hi:.2f} M", col))
+    for k, (ymax, t, c) in enumerate(sorted(ends, reverse=True)):
+        ax.text(0.42, ymax * (1.0 - 0.13 * k), t, color=c, fontsize=7.5, va="top")
+    ax.set_xlabel(f"mass of the three truth-matched jets / M   (M = {mass:.0f} GeV)")
+    ax.set_ylabel("density")
+    ax.set_yticks([])
+    ax.spines["left"].set_visible(False)
+    ax.spines["bottom"].set_bounds(0.4, 1.2)
+    save(fig, out, name)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--robustness", default=None, help="robustness.json")
+    ap.add_argument("--truth-def", default=None, help="h5 file with both truth-quark definitions")
+    ap.add_argument("--truth-def-mass", type=float, default=1000.0)
     ap.add_argument("--runs", nargs="*", default=[])
     ap.add_argument("--matching", default="results/matching.json")
     ap.add_argument("--out", default="plots/report")
@@ -348,6 +393,8 @@ def main():
         strategy_fom(a.fom, a.out)
     if a.robustness:
         robustness_plot(a.robustness, a.out)
+    if a.truth_def:
+        truth_definition_plot(a.truth_def, a.truth_def_mass, a.out)
     if runs:
         eff_vs_mass(runs, a.out)
         preselection_curve(runs, a.out)
