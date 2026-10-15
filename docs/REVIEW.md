@@ -100,3 +100,17 @@ the balance) does not improve signal-in-window at matched QCD pass rates:
 The 3× run is lower at 5% and 8%, probably because its saved checkpoint sits at
 a different operating point. Either way, more statistics alone does not help at
 this model size.
+
+## Model capacity
+
+A model 4.5× larger (d = 256, 6 layers, 3.3M parameters, 2× signal) matches
+the default at its last epoch on validation: 8.7% versus 8.3% exact pairing,
+42% versus 41% signal in window. It is no better on test at matched QCD rate.
+Neither more data nor more capacity helps, so on this testbed the 7-jet gated
+network appears close to what the four-vectors allow. The remaining losses are
+physical: merging, FSR, and decay jets outside the leading 7.
+
+Methodological note: checkpoints were selected on (exact pairing + QCD
+rejection), so each run settles at a slightly different operating point. For
+production, select the checkpoint at a fixed QCD pass rate, or choose the
+operating point afterwards with the gate threshold.
