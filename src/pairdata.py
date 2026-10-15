@@ -44,7 +44,7 @@ def truth_sets_from_quarks(quarks, eta, phi, mask, dr_max=0.4):
 
 
 def load_events(paths, n_jets=8, k=3, is_signal=True, max_events=None, sizes=None,
-                truth="auto"):
+                truth="auto", min_jets=None, max_jets=None):
     """truth: "quarks" (nearest-jet, merging allowed; needs truth/quarks),
     "targets" (TARGETS block, unique matching), or "auto" (quarks if present)."""
     sizes = tuple(tuple(x) for x in (sizes or ((k, k),)))
@@ -116,6 +116,12 @@ def load_events(paths, n_jets=8, k=3, is_signal=True, max_events=None, sizes=Non
             out["w"].append(w.astype(np.float64))
             out["njall"].append(njall)
     res = {k_: np.concatenate(v) for k_, v in out.items()}
+    keep = np.ones(len(res["pt"]), dtype=bool)
+    if min_jets is not None:
+        keep &= res["njall"] >= min_jets
+    if max_jets is not None:
+        keep &= res["njall"] <= max_jets
+    res = {k_: v[keep] for k_, v in res.items()}
     if max_events:
         res = {k_: v[:max_events] for k_, v in res.items()}
     res["is_signal"] = np.full(len(res["pt"]), is_signal)

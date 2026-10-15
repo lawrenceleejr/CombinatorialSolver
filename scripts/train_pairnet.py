@@ -107,6 +107,7 @@ def main():
     ap.add_argument("--bkg-weight", type=float, default=1.0)
     ap.add_argument("--max-sig", type=int, default=None)
     ap.add_argument("--max-bkg", type=int, default=None)
+    ap.add_argument("--min-jets", type=int, default=6, help="signal-region jet multiplicity")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", required=True)
@@ -117,10 +118,12 @@ def main():
     torch.set_num_threads(args.threads)
     os.makedirs(args.out, exist_ok=True)
 
-    sig = load_events(args.sig, args.n_jets, args.k, True, args.max_sig, sizes=sizes)
+    sig = load_events(args.sig, args.n_jets, args.k, True, args.max_sig, sizes=sizes,
+                      min_jets=args.min_jets)
     parts = [sig]
     if args.bkg:
-        bkg = load_events(args.bkg, args.n_jets, args.k, False, args.max_bkg, sizes=sizes)
+        bkg = load_events(args.bkg, args.n_jets, args.k, False, args.max_bkg, sizes=sizes,
+                          min_jets=args.min_jets)
         parts.append(bkg)
     data = concat(*parts) if len(parts) > 1 else sig
     tr, va, te = split(data, seed=args.seed)
