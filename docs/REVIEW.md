@@ -264,6 +264,17 @@ half-width of the shortest 68% window, all signal):
 
 `export_pairnet_onnx.py` adds the `m_est` output for such checkpoints.
 
+The recommended model was trained with (same events as `data/pythia`, before-FSR
+labels from `scripts/regen_truth_before_fsr.sh`):
+
+```bash
+python scripts/train_pairnet.py --gated --proxy --gate-interp --mass-head --n-jets 7 \
+    --sig data/pythia_bf/sig_m{500,750,1000,1250,1500,2000}_s1.h5 --bkg data/pythia/qcd_s{1..7}.h5 \
+    --test-sig data/pythia/sig_m*_s2.h5 --test-bkg data/pythia/qcd_s8.h5 \
+    --epochs 20 --threads 2 --select combined --out runs/g7_gi_mh_bf
+python scripts/export_pairnet_onnx.py --model runs/g7_gi_mh_bf/model.pt --out models/pairnet_gated_7jet_mass.onnx
+```
+
 With the new 7-jet network trained on before-FSR labels (exported as
 `models/pairnet_gated_7jet_mass.onnx`, now the recommended model), on the
 search study's held-out events (`scripts/search_study.py`, one P(signal) cut
