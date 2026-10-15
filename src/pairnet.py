@@ -150,6 +150,7 @@ class PairNet(nn.Module):
         bg_kappa: float = 30.0,
         n_assign: int | None = None,
         gate_interp: bool = False,
+        mass_head: bool = False,
     ):
         super().__init__()
         self.n_jets, self.k = n_jets, k
@@ -160,6 +161,7 @@ class PairNet(nn.Module):
         self.gated = gated
         self.bg_beta, self.bg_kappa = bg_beta, bg_kappa
         self.gate_interp = gate_interp
+        self.mass_head = mass_head
         use_null = self.use_null
         # interpretations use the leading n_assign jets; the encoder (context)
         # sees all n_jets
@@ -228,6 +230,13 @@ class PairNet(nn.Module):
             n_in = 2 * d_model + (d_model + 2 if gate_interp else 0)
             self.null_mlp = nn.Sequential(
                 nn.Linear(n_in, d_model), nn.GELU(), nn.Linear(d_model, 1)
+            )
+        if mass_head:
+            # scale-free mass estimate: log(M/HT) as a learned correction to the
+            # probability-weighted log m_avg/HT of the interpretations
+            self.mass_mlp = nn.Sequential(
+                nn.Linear(3 * d_model + 4, d_model), nn.GELU(),
+                nn.Linear(d_model, d_model // 2), nn.GELU(), nn.Linear(d_model // 2, 1)
             )
 
     # ------------------------------------------------------------------ features
@@ -316,13 +325,20 @@ class PairNet(nn.Module):
             pooled = torch.cat(
                 [(x.sum(1) / mask.sum(1, keepdim=True).clamp(min=1)), x.max(1).values], -1
             )
-            if self.gate_interp:
+            if self.gate_interp or self.mass_head:
                 wts = s.softmax(-1).unsqueeze(-1)
                 summ = (wts * hid).sum(1)
                 nvalid = valid.float().sum(-1, keepdim=True).clamp(min=1)
                 lse = torch.logsumexp(s, -1, keepdim=True) - torch.log(nvalid)
-                pooled = torch.cat([pooled, summ, s.max(-1, keepdim=True).values, lse], -1)
-            null = self.null_mlp(pooled)
+                smax = s.max(-1, keepdim=True).values
+            if self.mass_head:
+                lm = torch.log((0.5 * (m1 + m2)).clamp(min=1e-6))  # (B, A), HT units
+                lm_mean = (wts.squeeze(-1) * lm).sum(-1, keepdim=True)
+                lm_best = lm.gather(1, s.argmax(-1, keepdim=True))
+                corr = self.mass_mlp(torch.cat([pooled, summ, smax, lse, lm_mean, lm_best], -1))
+                out["log_m_over_ht"] = (lm_mean + corr).squeeze(-1)
+            gate_in = torch.cat([pooled, summ, smax, lse], -1) if self.gate_interp else pooled
+            null = self.null_mlp(gate_in)
             if self.gated:
                 # gate: P(signal) = sigmoid(-null).  Mixture of the learned signal
                 # scorer and a fixed anti-signal choice (high asymmetry, low mass).
@@ -412,7 +428,7 @@ def pairnet_loss(out, target, is_sig, sig_weight=1.0, bkg_weight=1.0):
     return (loss * w).sum() / w.sum().clamp(min=1e-6)
 
 
-def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0):
+def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pmass=None, w_mass=1.0):
     """Loss for the gated model.
 
     target: (B,) exact-truth index for reconstructable signal, or the
@@ -437,7 +453,12 @@ def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0):
         out["gate_logit"], is_sig.float(),
         weight=torch.where(is_sig, 1.0, bkg_weight) * torch.ones(B, device=logp.device),
     )
-    return lmix + w_gate * lgate
+    loss = lmix + w_gate * lgate
+    if "log_m_over_ht" in out and pmass is not None and is_sig.any():
+        # L1 (median) regression of log(M/HT) on signal events
+        tgt_m = torch.log(pmass.clamp(min=1.0) / out["ht"].clamp(min=1e-6))
+        loss = loss + w_mass * (out["log_m_over_ht"] - tgt_m).abs()[is_sig].mean()
+    return loss
 
 
 def load_checkpoint(path):
@@ -451,7 +472,7 @@ def load_checkpoint(path):
         use_pair_bias=not a["no_pair_bias"], use_group_kin=not a["no_group_kin"],
         use_null=not a["no_null"], sizes=sizes, gated=a.get("gated", False),
         bg_beta=a.get("bg_beta", 1.0), n_assign=a.get("n_assign"),
-        gate_interp=a.get("gate_interp", False),
+        gate_interp=a.get("gate_interp", False), mass_head=a.get("mass_head", False),
     )
     net.load_state_dict(ck["state"])
     net.eval()

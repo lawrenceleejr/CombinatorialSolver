@@ -51,7 +51,7 @@ def pick_device(name):
 @torch.no_grad()
 def predict(net, t, bs=4096, amp=False):
     net.eval()
-    keep = ("logits", "m1", "m2", "ht", "gate_logit")
+    keep = ("logits", "m1", "m2", "ht", "gate_logit", "log_m_over_ht")
     outs = {k: [] for k in keep}
     idx = torch.arange(len(t["pt"]), device=t["pt"].device)
     for b in batches(t, idx, bs):
@@ -84,7 +84,11 @@ def evaluate(net, t, A, bs=4096, amp=False):
     m1, m2 = o["m1"][ar, best], o["m2"][ar, best]
     mavg = 0.5 * (m1 + m2) * o["ht"]
     asym = (m1 - m2).abs() / (m1 + m2)
+    extra = {}
+    if "log_m_over_ht" in o:
+        extra["m_est"] = (torch.exp(o["log_m_over_ht"]) * o["ht"]).numpy()
     return {
+        **extra,
         "best": best.numpy(),
         "psig": psig.numpy(),
         "mavg": mavg.numpy(),
@@ -110,6 +114,13 @@ def summarize(ev):
         "eff_on_reconstructable": float((ev["best"][rec] == tgt[rec]).mean()) if rec.any() else 0.0,
     }
     r["eff_on_all_signal"] = r["eff_on_reconstructable"] * r["frac_reconstructable"]
+    if "m_est" in ev and s.any():
+        rel = ev["m_est"][s] / np.maximum(ev["pmass"][s], 1)
+        lo, hi = np.quantile(rel, [0.16, 0.84])
+        r["m_est_rel_halfwidth68"] = float((hi - lo) / (hi + lo))
+        relb = ev["mavg"][s] / np.maximum(ev["pmass"][s], 1)
+        lo, hi = np.quantile(relb, [0.16, 0.84])
+        r["mavg_rel_halfwidth68"] = float((hi - lo) / (hi + lo))
     pas = ev["asym"] < ASYM_CUT
     r["sig_pass_asym"] = float(pas[s].mean()) if s.any() else 0.0
     if s.any():
@@ -198,6 +209,9 @@ def main():
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--n-assign", type=int, default=None,
                     help="pairings use the leading N jets; --n-jets sets the context (encoder) size")
+    ap.add_argument("--mass-head", action="store_true",
+                    help="also learn a scale-free mass estimate log(M/HT) (output m_est)")
+    ap.add_argument("--w-mass", type=float, default=1.0)
     ap.add_argument("--gate-interp", action="store_true",
                     help="gate also sees the softmax-pooled interpretation summary and best scores")
     ap.add_argument("--sizes", default=None,
@@ -258,7 +272,7 @@ def main():
         num_layers=args.layers, dim_ff=2 * args.d_model, dropout=args.dropout,
         use_pair_bias=not args.no_pair_bias, use_group_kin=not args.no_group_kin,
         use_null=not args.no_null, sizes=sizes, gated=args.gated, bg_beta=args.bg_beta,
-        n_assign=args.n_assign, gate_interp=args.gate_interp,
+        n_assign=args.n_assign, gate_interp=args.gate_interp, mass_head=args.mass_head,
     ).to(dev)
     A = net.n_assign
     print(f"params {sum(p.numel() for p in net.parameters())/1e3:.0f}k  interpretations {A}")
@@ -295,7 +309,7 @@ def main():
                      for k, v in o.items()}
                 if args.gated:
                     loss = gated_loss(o, b["target"], b["is_signal"], w_proxy=args.w_proxy,
-                                      bkg_weight=args.bkg_weight)
+                                      bkg_weight=args.bkg_weight, pmass=b["pmass"], w_mass=args.w_mass)
                 else:
                     loss = pairnet_loss(o, b["target"].clamp(min=-1), b["is_signal"],
                                         bkg_weight=args.bkg_weight)
