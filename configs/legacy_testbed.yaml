@@ -10,7 +10,7 @@ training:
   learning_rate: 0.0003
   isr_lr_multiplier: 3.0
   weight_decay: 0.0001
-  num_epochs: 8
+  num_epochs: 6
   warmup_epochs: 1
   restart_period: 0
   patience: 4
@@ -39,7 +39,7 @@ training:
   distill_temperature: 4.0
   lambda_isr_direct: 2.0
   lambda_isr_direct_rampup: 3
-  phase1_patience: 2
+  phase1_patience: 0
   phase1_max_lr_fraction: 1.0
 data:
   normalize_by_ht: true
