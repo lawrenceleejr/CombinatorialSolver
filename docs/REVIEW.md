@@ -114,3 +114,41 @@ Methodological note: checkpoints were selected on (exact pairing + QCD
 rejection), so each run settles at a slightly different operating point. For
 production, select the checkpoint at a fixed QCD pass rate, or choose the
 operating point afterwards with the gate threshold.
+
+## How best to find the signal from four-vectors (follow-up study)
+
+`scripts/search_study.py` reduces every strategy to an event score and a mass,
+then takes S/√B with the best score cut and mass window at each mass. All are
+evaluated on the same held-out events: 60k signal and 18k QCD (relative units).
+
+| strategy | 500 | 750 | 1000 | 1250 | 1500 | 2000 GeV |
+|---|---|---|---|---|---|---|
+| argmin \|Δm\| + asym cut | 1.2 | 1.5 | 2.1 | 3.2 | 4.7 | 10 |
+| current network + asym cut | 1.2 | 1.4 | 2.2 | 3.3 | 4.6 | 9 |
+| gated PairNet + asym cut | 2.1 | 5.4 | 10 | 20 | 29 | 143 |
+| expert-feature BDT + argmin pairing | 3.1 | 7.7 | 17 | 36 | 58 | 129 |
+| **gated PairNet, cut on P(signal)** | **3.2** | **9.7** | **22** | **39** | **70** | **150** |
+| same, true pairing (bound) | 3.3 | 10 | 26 | 49 | 86 | 176 |
+
+- **Selection is the lever.** Cutting on the event-level P(signal) beats any
+  mass-asymmetry cut by 3× at 500 GeV, 7× at 750 GeV and 10–16× from 1 TeV.
+- **Pairing headroom is small.** The true pairing would add at most ~25%.
+- **The peak is broadened by pairing, not by the jets.** With the true pairing
+  the core half-width is 6.5–7.4%, against 17–25% with the chosen pairing. A
+  learned M/HT estimator (`scripts/mass_estimators.py`) narrows it by 13–22%.
+- **No sculpting.** The gate cut's QCD efficiency rises smoothly with mass
+  (`docs/figures/sculpting_gate_argmax.pdf`).
+- **Jet multiplicity.** The expert BDT's top feature is the jet count. The gate
+  keeps an AUC of 0.952–0.957 within fixed multiplicity bins (0.974 overall), so
+  most of its power is kinematic. Jet-multiplicity modelling should be checked
+  in data.
+- **Hemisphere mixing.** Mixed events have exactly 6 jets while the gate uses a
+  7th, so use a 6-jet network or mix within jet-multiplicity bins.
+- **Negative results:**
+  - A parton-level prefilter for QCD generation gives no speed-up.
+  - More signal statistics (3×) did not help at this scale.
+  - A 4.5× larger model did not help at this scale.
+
+The points at 1 TeV and above rest on few QCD MC events. More QCD, v2 (gate
+sees the pairing summary and encoder sees 12 jets) and a 6-jet variant are
+being added.
