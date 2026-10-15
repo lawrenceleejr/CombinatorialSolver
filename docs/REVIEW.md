@@ -152,3 +152,32 @@ evaluated on the same held-out events: 60k signal and 18k QCD (relative units).
 The points at 1 TeV and above rest on few QCD MC events. More QCD, v2 (gate
 sees the pairing summary and encoder sees 12 jets) and a 6-jet variant are
 being added.
+
+### Final comparison (30k held-out QCD) and the exported network
+
+`results/search_study_final`. AUC is signal vs weighted QCD; S/√B uses one
+P(signal) cut for all masses.
+
+| P(signal) from | AUC: 6 / 7 / ≥8 jets / all | S/√B: 500 / 750 / 1000 / 1250 / 1500 / 2000 GeV |
+|---|---|---|
+| **gated PairNet, 7 jets** | 0.951 / 0.956 / 0.956 / 0.974 | 2.9 / 8.3 / 18 / 42 / 59 / 149 |
+| v2: gate sees the pairings, 12-jet context | 0.948 / 0.954 / 0.968 / 0.977 | 3.4 / 12.5 / 21 / 39 / 55 / 161 |
+| ensemble of 4 networks | 0.951 / 0.956 / 0.962 / 0.976 | 3.0 / 8.9 / 23 / 52 / 61 / 151 |
+| stacked: expert features + PairNet | 0.952 / 0.958 / 0.967 / 0.978 | 3.4 / 9.7 / 21 / 44 / 66 / 167 |
+| gated PairNet, 6 jets | 0.945 / 0.946 / 0.949 / 0.962 | 2.5 / 7.5 / 17 / 46 / 63 / 125 |
+| current network, asymmetry cut | – / – / – / 0.697 | 0.6 / 0.9 / 1.2 / 2.1 / 3.1 / 7.1 |
+
+- **The extra gain comes from ≥ 8-jet events.** Beyond the 7-jet gated network,
+  v2, the ensemble and stacking gain only where there are 8 or more jets; within
+  6 and 7 jets all options are equal. That gain rides on extra-radiation jets,
+  which are QCD-modelling sensitive, so the 7-jet gated network is the
+  recommended, robust choice.
+- **ONNX export.** It is `models/pairnet_gated_7jet.onnx`, a drop-in for
+  `ml_model.onnx`: same input and same 70-assignment order, with `p_signal`,
+  `signal_logits` and `masses` added. See `models/README.md` for the interface
+  and working points.
+- **Pairing headroom.** With more QCD statistics, the true pairing adds only
+  ~10% below 2 TeV.
+- **Why exact pairing is low.** It is near the information limit
+  (`scripts/pairing_ambiguity.py`). An oracle that knows the gluino mass finds
+  the true pairing in only 27–34% of available events, the same as the network.
