@@ -182,7 +182,12 @@ class JetAssignmentDataset(Dataset):
             )
 
             # Read truth labels
-            if self.use_mass_asymmetry_labels:
+            # Background events never enter the supervised loss, but they need a
+            # valid (>= 0) label or they are filtered out below; QCD files also
+            # carry no TARGETS.  Give them the heuristic label as a placeholder
+            # so truth-label training (use_mass_asymmetry_labels: false) works
+            # with a QCD sample.
+            if self.use_mass_asymmetry_labels or self.is_background_flag:
                 # Primary path: compute labels as argmin |m1-m2| over all
                 # interpretations from the raw four-momenta.  This is the
                 # physically correct ground truth and is immune to incorrect
