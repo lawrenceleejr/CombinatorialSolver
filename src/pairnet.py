@@ -47,6 +47,25 @@ def enumerate_pairings(n_jets: int, k: int) -> tuple[torch.Tensor, torch.Tensor]
     return torch.tensor(g1, dtype=torch.long), torch.tensor(g2, dtype=torch.long)
 
 
+def enumerate_interpretations(n_jets: int, sizes=((3, 3),)) -> list[tuple[tuple, tuple]]:
+    """All unordered pairs of disjoint jet sets (G1, G2) with (|G1|, |G2|) in sizes.
+
+    Canonical order: the larger group first; equal sizes ordered lexicographically.
+    sizes=((3, 3),) reproduces enumerate_pairings(n, 3).  ((3, 3), (3, 2), (2, 2))
+    additionally allows a parent whose two decay quarks merged into one jet.
+    """
+    out = []
+    for sa, sb in sizes:
+        sa, sb = max(sa, sb), min(sa, sb)
+        for a in combinations(range(n_jets), sa):
+            rest = [j for j in range(n_jets) if j not in a]
+            for b in combinations(rest, sb):
+                if sa == sb and not a < b:
+                    continue
+                out.append((a, b))
+    return out
+
+
 def to_cartesian(pt, eta, phi, m):
     px, py, pz = pt * torch.cos(phi), pt * torch.sin(phi), pt * torch.sinh(eta)
     e = torch.sqrt(px**2 + py**2 + pz**2 + m**2)
@@ -105,6 +124,7 @@ class PairNet(nn.Module):
         use_pair_bias: bool = True,
         use_group_kin: bool = True,
         use_null: bool = True,
+        sizes=None,
     ):
         super().__init__()
         self.n_jets, self.k = n_jets, k
@@ -113,17 +133,28 @@ class PairNet(nn.Module):
         self.use_group_kin = use_group_kin
         self.use_null = use_null
 
-        g1, g2 = enumerate_pairings(n_jets, k)
-        self.register_buffer("g1", g1, persistent=False)
-        self.register_buffer("g2", g2, persistent=False)
-        self.n_assign = g1.shape[0]
-        # membership matrices (A, N): used to sum embeddings / 4-vectors by matmul
+        self.sizes = tuple(tuple(x) for x in (sizes or ((k, k),)))
+        interp = enumerate_interpretations(n_jets, self.sizes)
+        self.n_assign = len(interp)
         M1 = torch.zeros(self.n_assign, n_jets)
         M2 = torch.zeros(self.n_assign, n_jets)
-        M1.scatter_(1, g1, 1.0)
-        M2.scatter_(1, g2, 1.0)
-        self.register_buffer("M1", M1, persistent=False)
-        self.register_buffer("M2", M2, persistent=False)
+        kmax = max(max(x) for x in self.sizes)
+        npair = kmax * (kmax - 1) // 2
+        # intra-group jet pairs, padded with (0, 0) and masked
+        P1 = torch.zeros(self.n_assign, npair, 2, dtype=torch.long)
+        P2 = torch.zeros(self.n_assign, npair, 2, dtype=torch.long)
+        PM1 = torch.zeros(self.n_assign, npair)
+        PM2 = torch.zeros(self.n_assign, npair)
+        for i, (a, b) in enumerate(interp):
+            M1[i, list(a)] = 1.0
+            M2[i, list(b)] = 1.0
+            for P, PM, g in ((P1, PM1, a), (P2, PM2, b)):
+                prs = list(combinations(g, 2))
+                for j, (x, y) in enumerate(prs):
+                    P[i, j, 0], P[i, j, 1] = x, y
+                    PM[i, j] = 1.0
+        for name, t in (("M1", M1), ("M2", M2), ("P1", P1), ("P2", P2), ("PM1", PM1), ("PM2", PM2)):
+            self.register_buffer(name, t, persistent=False)
 
         n_jet_feat = 7
         self.embed = nn.Sequential(
@@ -140,8 +171,8 @@ class PairNet(nn.Module):
 
         # group kinematics: ln m/HT, ln(pT/m), eta, k sorted pairwise-mass
         # fractions (k=3: 3 values; k=2: 1 value), ln(m_max_pair/m)
-        n_pairs_in_group = k * (k - 1) // 2
-        self.n_gk = 3 + n_pairs_in_group if use_group_kin else 0
+        # + group size flag
+        self.n_gk = 4 + npair if use_group_kin else 0
         # inter-group: asym, ln((m1+m2)/HT), dR, |dphi|, |deta|, pT balance,
         # ln(m_sys/HT), rest pT fraction
         self.n_ik = 8 if use_group_kin else 0
@@ -227,11 +258,12 @@ class PairNet(nn.Module):
         m1 = torch.sqrt(minkowski_m2(P1).clamp(min=1e-8))
         m2 = torch.sqrt(minkowski_m2(P2).clamp(min=1e-8))
 
-        valid = (torch.einsum("an,bn->ba", M1 + M2, mask.float()) > 2 * self.k - 0.5)
+        need = (M1 + M2).sum(-1)
+        valid = torch.einsum("an,bn->ba", M1 + M2, mask.float()) > need - 0.5
 
         if self.use_group_kin:
-            gk1 = self._gkin(P1, m1, m2pair, self.g1)
-            gk2 = self._gkin(P2, m2, m2pair, self.g2)
+            gk1 = self._gkin(P1, m1, m2pair, self.P1, self.PM1, self.M1)
+            gk2 = self._gkin(P2, m2, m2pair, self.P2, self.PM2, self.M2)
             h1 = self.group_mlp(torch.cat([e1, gk1], -1))
             h2 = self.group_mlp(torch.cat([e2, gk2], -1))
             ik = self._ikin(P1, P2, Pr, m1, m2)
@@ -253,21 +285,18 @@ class PairNet(nn.Module):
             out["logits"] = s
         return out
 
-    def _gkin(self, P, mg, m2pair, gidx):
+    def _gkin(self, P, mg, m2pair, pidx, pmask, M):
         """Group kinematics from 4-vectors only."""
         pt = torch.sqrt(P[..., 1] ** 2 + P[..., 2] ** 2).clamp(min=1e-6)
         eta = torch.asinh(P[..., 3] / pt)
-        # pairwise masses inside the group, as fractions of the group mass^2
-        k = self.k
-        pairs = [(i, j) for i in range(k) for j in range(i + 1, k)]
-        fr = []
-        for i, j in pairs:
-            a, b = gidx[:, i], gidx[:, j]  # (A,)
-            fr.append(m2pair[:, a, b])  # (B, A)
-        fr = torch.stack(fr, -1) / (mg**2).unsqueeze(-1).clamp(min=1e-8)
+        # intra-group pairwise masses as fractions of the group mass^2 (sorted, padded)
+        fr = m2pair[:, pidx[..., 0], pidx[..., 1]] * pmask  # (B, A, npair)
+        fr = fr / (mg**2).unsqueeze(-1).clamp(min=1e-8)
         fr = fr.sort(-1, descending=True).values
+        size = M.sum(-1).expand(mg.shape) - 2.5
         return torch.cat(
-            [torch.log(mg).unsqueeze(-1), torch.log(pt / mg).unsqueeze(-1), eta.unsqueeze(-1), fr], -1
+            [torch.log(mg).unsqueeze(-1), torch.log(pt / mg).unsqueeze(-1), eta.unsqueeze(-1),
+             size.unsqueeze(-1), fr], -1
         )
 
     @staticmethod

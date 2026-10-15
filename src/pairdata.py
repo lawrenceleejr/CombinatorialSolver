@@ -16,19 +16,43 @@ import h5py
 import numpy as np
 import torch
 
-from .pairnet import enumerate_pairings
+from .pairnet import enumerate_interpretations
 
 
-def _pair_lookup(n_jets, k):
-    g1, g2 = enumerate_pairings(n_jets, k)
-    return {(tuple(a), tuple(b)): i for i, (a, b) in enumerate(zip(g1.tolist(), g2.tolist()))}
+def _lookup(n_jets, sizes):
+    return {(a, b): i for i, (a, b) in enumerate(enumerate_interpretations(n_jets, sizes))}
 
 
-def load_events(paths, n_jets=8, k=3, is_signal=True, max_events=None):
+def canonical(a, b):
+    a, b = tuple(sorted(a)), tuple(sorted(b))
+    if len(a) != len(b):
+        return (a, b) if len(a) > len(b) else (b, a)
+    return (min(a, b), max(a, b))
+
+
+def truth_sets_from_quarks(quarks, eta, phi, mask, dr_max=0.4):
+    """Each decay quark -> nearest jet within dr_max (several quarks may share a jet).
+
+    Returns (N, 6) jet indices in the given (sorted) jet order, -1 if unmatched.
+    """
+    qeta, qphi = quarks[..., 1][:, :, None], quarks[..., 2][:, :, None]
+    dphi = (qphi - phi[:, None] + np.pi) % (2 * np.pi) - np.pi
+    dr = np.sqrt((qeta - eta[:, None]) ** 2 + dphi**2)
+    dr = np.where(mask[:, None], dr, np.inf)
+    j = dr.argmin(-1)
+    return np.where(np.take_along_axis(dr, j[..., None], -1)[..., 0] < dr_max, j, -1)
+
+
+def load_events(paths, n_jets=8, k=3, is_signal=True, max_events=None, sizes=None,
+                truth="auto"):
+    """truth: "quarks" (nearest-jet, merging allowed; needs truth/quarks),
+    "targets" (TARGETS block, unique matching), or "auto" (quarks if present)."""
+    sizes = tuple(tuple(x) for x in (sizes or ((k, k),)))
+    allowed = {tuple(sorted(x, reverse=True)) for x in sizes}
     files = []
     for p in paths if isinstance(paths, (list, tuple)) else [paths]:
         files += sorted(glob.glob(p)) or [p]
-    lut = _pair_lookup(n_jets, k)
+    lut = _lookup(n_jets, sizes)
     out = {k_: [] for k_ in ["pt", "eta", "phi", "m", "mask", "target", "pmass", "w", "njall"]}
     for fp in files:
         with h5py.File(fp, "r") as f:
@@ -44,7 +68,21 @@ def load_events(paths, n_jets=8, k=3, is_signal=True, max_events=None):
             inv = np.argsort(order, axis=1)  # original index -> sorted position
             njall = mask.sum(1)
             target = np.full(n, -1, dtype=np.int64)
-            if is_signal and "TARGETS" in f:
+            use_q = is_signal and "truth/quarks" in f and truth in ("auto", "quarks")
+            if use_q:
+                tq = truth_sets_from_quarks(f["truth/quarks"][:], eta, phi, mask)
+                for i in range(n):
+                    t = tq[i]
+                    if (t < 0).any() or (t >= n_jets).any():
+                        continue
+                    a_, b_ = set(t[:3].tolist()), set(t[3:].tolist())
+                    if a_ & b_:
+                        continue  # quarks from different parents share a jet
+                    ca = canonical(a_, b_)
+                    if (len(ca[0]), len(ca[1])) not in allowed:
+                        continue
+                    target[i] = lut[ca]
+            elif is_signal and "TARGETS" in f:
                 tg = np.stack(
                     [f[f"TARGETS/g{g}/j{j}"][:] for g in (1, 2) for j in (1, 2, 3)], 1
                 ).astype(np.int64)
@@ -53,12 +91,12 @@ def load_events(paths, n_jets=8, k=3, is_signal=True, max_events=None):
                     t = tg[i]
                     if (t < 0).any() or not mask[i, t].all():
                         continue
-                    s = inv[i, t]
-                    if (s >= n_jets).any() or len(set(s.tolist())) != 2 * kk:
+                    s_ = inv[i, t]
+                    if (s_ >= n_jets).any() or len(set(s_.tolist())) != 2 * kk:
                         continue
-                    a, b = tuple(sorted(s[:kk].tolist())), tuple(sorted(s[kk:].tolist()))
-                    a, b = min(a, b), max(a, b)
-                    target[i] = lut[(a, b)]
+                    ca = canonical(s_[:kk].tolist(), s_[kk:].tolist())
+                    if ca in lut:
+                        target[i] = lut[ca]
             if "EventVars/parent_mass" in f:
                 pm = f["EventVars/parent_mass"][:]
             else:
