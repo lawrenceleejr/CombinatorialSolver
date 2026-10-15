@@ -40,6 +40,17 @@ def range_frame(ax, x=None, y=None):
         ax.spines["left"].set_bounds(min(y), max(y))
 
 
+def spread_labels(ax, items, x, min_gap):
+    """Direct labels at the line ends, nudged apart so they never overlap.
+    items: list of (y, text, color)."""
+    items = sorted(items)
+    ys = [y for y, _, _ in items]
+    for i in range(1, len(ys)):
+        ys[i] = max(ys[i], ys[i - 1] + min_gap)
+    for (y0, t, c), y in zip(items, ys):
+        ax.text(x, y, t, color=c, va="center", fontsize=8)
+
+
 def save(fig, out, name):
     os.makedirs(out, exist_ok=True)
     for ext in ("pdf", "svg", "png"):
@@ -57,16 +68,17 @@ def load(path):
 
 def eff_vs_mass(runs, out):
     fig, ax = plt.subplots(figsize=(4.2, 3))
-    allm, ally = [], []
+    allm, ally, ends = [], [], []
     for i, (name, ev) in enumerate(runs.items()):
         s = ev["is_signal"]
         ms = np.unique(ev["pmass"][s])
         y = [ev["correct"][s & (ev["pmass"] == m)].mean() for m in ms]
         c = PALETTE[i % len(PALETTE)]
         ax.plot(ms, y, "-o", color=c, ms=3, lw=1)
-        ax.text(ms[-1] * 1.02, y[-1], name, color=c, va="center", fontsize=8)
+        ends.append((y[-1], name, c))
         allm += list(ms)
         ally += y
+    spread_labels(ax, ends, max(allm) * 1.02, max(ally) * 0.05)
     ax.set_xlabel("gluino mass [GeV]")
     ax.set_ylabel("true interpretation chosen\n(fraction of all signal events)")
     ax.set_xticks(sorted(set(allm)))
