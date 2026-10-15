@@ -5,7 +5,8 @@ Validate an exported PairNet ONNX against PyTorch and against physics numbers.
 
 Checks
   1. ONNX Runtime vs PyTorch outputs (max |diff|, argmax agreement)
-  2. legacy ordering: argmax index -> enumerate_assignments(7) -> same jets as PairNet's choice
+  2. legacy ordering: argmax index -> enumerate_assignments(A) -> same jets as PairNet's choice
+     (A = the jets the network pairs: 7, or 6 for 6-jet models)
   3. scale invariance: raw GeV vs HT-normalised input give the same logits and p_signal
   4. physics: exact pairing at 1 TeV and P(signal) AUC from the ONNX outputs alone
 """
@@ -48,8 +49,9 @@ def main():
     a = ap.parse_args()
     net, _ = load_checkpoint(a.model)
     J = net.n_jets
-    sig = load_events("data/pythia/sig_m1000_s2.h5", J, 3, True, None, min_jets=6, n_assign=7)
-    bkg = load_events("data/pythia/qcd_s8.h5", J, 3, False, None, min_jets=6, n_assign=7)
+    A = net.n_assign_jets
+    sig = load_events("data/pythia/sig_m1000_s2.h5", J, 3, True, None, min_jets=6, n_assign=A)
+    bkg = load_events("data/pythia/qcd_s8.h5", J, 3, False, None, min_jets=6, n_assign=A)
     d = concat(sig, bkg)
     x = four_vectors(d).astype(np.float32)  # (N, J, 4) E, px, py, pz in GeV, zero-padded
     sess = ort.InferenceSession(a.onnx, providers=["CPUExecutionProvider"])
@@ -69,8 +71,8 @@ def main():
         np.mean(on["logits"].argmax(1) == tl.argmax(1)), np.mean(on["signal_logits"].argmax(1) == ts.argmax(1))))
 
     # 2. legacy ordering decodes to the same jets as PairNet's own table
-    asg = enumerate_assignments(7)
-    ours = enumerate_interpretations(7, ((3, 3),))
+    asg = enumerate_assignments(A)
+    ours = enumerate_interpretations(A, ((3, 3),))
     own = []
     with torch.no_grad():
         t = {k: torch.from_numpy(np.ascontiguousarray(d[k])) for k in ("pt", "eta", "phi", "m", "mask")}
