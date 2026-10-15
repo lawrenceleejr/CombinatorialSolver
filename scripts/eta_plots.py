@@ -12,11 +12,15 @@ import h5py
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-plt.style.use(os.path.join(HERE, "..", "assets", "tufte.mplstyle"))
+import sys  # noqa: E402
+
+sys.path.insert(0, HERE)
+import plotstyle  # noqa: E402
+
+plt = plotstyle.use()
 SHADES = ["#a9bfdf", "#8aa6d2", "#6a8cc2", "#4c72b0", "#34558e", "#1f3a6b"]
 
 

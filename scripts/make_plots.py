@@ -15,11 +15,15 @@ import os
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-plt.style.use(os.path.join(HERE, "..", "assets", "tufte.mplstyle"))
+import sys  # noqa: E402
+
+sys.path.insert(0, HERE)
+import plotstyle  # noqa: E402
+
+plt = plotstyle.use()
 
 INK = "#1f1f1f"
 MUTED = "#8c8c8c"
