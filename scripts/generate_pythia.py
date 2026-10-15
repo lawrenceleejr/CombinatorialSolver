@@ -35,7 +35,10 @@ import time
 import fastjet
 import h5py
 import numpy as np
-import pythia8mc as pythia8
+try:  # PyPI build
+    import pythia8mc as pythia8
+except ImportError:  # conda-forge / source build
+    import pythia8
 
 GLUINO = 1000021
 
@@ -294,7 +297,8 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     pt = np.stack(out["pt"])
-    with h5py.File(args.out, "w") as f:
+    tmp = args.out + ".tmp"  # written then renamed: a killed job never leaves a "finished" file
+    with h5py.File(tmp, "w") as f:
         g = f.create_group("INPUTS/Source")
         g["pt"] = pt
         g["eta"] = np.stack(out["eta"])
@@ -317,6 +321,7 @@ def main():
         f.attrs["n_tried"] = n_tried
         f.attrs["sigma_mb"] = p.infoPython().sigmaGen()
         f.attrs["generator"] = "pythia8 + fastjet anti-kt R=0.4, smeared"
+    os.replace(tmp, args.out)
     print(f"done: {len(pt)} written / {n_tried} tried in {time.time() - t0:.0f}s -> {args.out}")
 
 
