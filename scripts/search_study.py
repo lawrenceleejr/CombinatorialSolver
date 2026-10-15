@@ -68,6 +68,10 @@ def shortest(v, frac):
     return v[i], v[i + k - 1]
 
 
+def _neff(x):
+    return x.sum() ** 2 / max((x**2).sum(), 1e-30) if len(x) else 0.0
+
+
 def fom_table(score, mavg, is_sig, pmass, w, ht):
     out = {}
     s_all = is_sig
@@ -94,7 +98,8 @@ def fom_table(score, mavg, is_sig, pmass, w, ht):
                 if fom > best["fom"]:
                     best = {"fom": float(fom), "keep": keep, "window_frac": q, "S": float(S),
                             "B": float(B), "B_floored": bool(B < floor), "window": [float(a), float(b)],
-                            "n_qcd": int((sel_q & (mq >= a) & (mq <= b)).sum())}
+                            "n_qcd": int((sel_q & (mq >= a) & (mq <= b)).sum()),
+                            "n_eff_qcd": float(_neff(wq[sel_q & (mq >= a) & (mq <= b)]))}
         out[int(M)] = best
     return out
 
@@ -107,11 +112,15 @@ def main():
     ap.add_argument("--extra", nargs="*", default=[], help="name=path to more PairNet checkpoints")
     ap.add_argument("--legacy", default="runs/legacy_asis/model.pt")
     ap.add_argument("--bdt", default="runs/bdt/bdt.pkl")
+    ap.add_argument("--stack", default="runs/stack/stack.pkl")
     ap.add_argument("--out", default="results/search_study")
     a = ap.parse_args()
     torch.set_num_threads(4)
-    bkg_files = a.bkg or sorted(set(glob.glob("data/pythia/qcd_s8.h5") + glob.glob("data/pythia/qcd_s9.h5")
-                                    + glob.glob("data/pythia/qcd_s1[0-9].h5")))
+    # QCD s1-s7 trained the networks, s11-s14 the stacked classifier: never evaluate on them
+    bkg_files = a.bkg or sorted(glob.glob("data/pythia/qcd_s8.h5") + glob.glob("data/pythia/qcd_s9.h5")
+                                + glob.glob("data/pythia/qcd_s10.h5")
+                                + [f for f in glob.glob("data/pythia/qcd_s*.h5")
+                                   if int(os.path.basename(f)[5:-3]) >= 15])
     print("QCD eval files:", [os.path.basename(f) for f in bkg_files])
     sig = load_events(a.sig, 20, 3, True, None, min_jets=6)
     bkg = load_events(bkg_files, 20, 3, False, None, min_jets=6)
@@ -156,6 +165,13 @@ def main():
         m_sig, _ = mavg_asym(d, G1[sb], G2[sb])
         methods[f"{name}, asym cut"] = (-as_mix, m_mix)
         methods[f"{name}, gate cut"] = (gate, m_sig)
+        if name == "gated PairNet" and os.path.exists(a.stack):
+            from train_stack import stack_features
+            st = pickle.load(open(a.stack, "rb"))
+            net_st, _ = load_checkpoint(st["pairnet"])
+            Xst, _, best_st = stack_features(net_st, d)
+            methods["stacked (expert + PairNet), PairNet pairing"] = (
+                st["model"].predict_proba(Xst)[:, 1], mavg_asym(d, G1[best_st], G2[best_st])[0])
         if name == "gated PairNet":
             if "expert BDT, argmin pairing" in methods:
                 methods["expert BDT, PairNet pairing"] = (p_bdt, m_sig)
