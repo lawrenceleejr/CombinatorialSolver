@@ -278,8 +278,58 @@ def strategy_fom(path, out, methods=None, name="strategy_fom"):
     save(fig, out, name)
 
 
+def robustness_plot(path, out, wp="0.01", name="robustness"):
+    """Small multiples: selection efficiency in a varied sample relative to
+    nominal, at a working point fixed on nominal QCD; one column per sample."""
+    r = json.load(open(path))["samples"]
+    cols = [k for k in r if "nominal" not in k]
+    titles = {"signal, chain500": "signal: g̃ → q̃q, q̃ → qq",
+              "signal, as150": "signal: shower αs +10%", "signal, as123": "signal: shower αs −10%",
+              "QCD, as150": "QCD: shower αs +10%", "QCD, as123": "QCD: shower αs −10%"}
+    methods = [m for m in r[cols[0]]["methods"] if not m.startswith("argmin")]
+    methods += [m for m in r[cols[0]]["methods"] if m.startswith("argmin")]
+    fig, axes = plt.subplots(1, len(cols), figsize=(1.55 * len(cols) + 1.8, 0.28 * len(methods) + 0.9),
+                             sharey=True)
+    axes = np.atleast_1d(axes)
+    y = np.arange(len(methods))[::-1]
+    for ax, c in zip(axes, cols):
+        nom = r["signal, nominal" if c.startswith("signal") else "QCD, nominal"]
+        rat, err = [], []
+        for m in methods:
+            v, n = r[c]["methods"][m][wp], nom["methods"][m][wp]
+            rr = v["eff"] / n["eff"] if n["eff"] > 0 else np.nan
+            e = rr * np.hypot(v["err"] / max(v["eff"], 1e-12), n["err"] / max(n["eff"], 1e-12))
+            rat.append(rr)
+            err.append(e)
+        rat, err = np.array(rat), np.array(err)
+        ax.axvline(1.0, color="#d9d9d9", lw=0.8, zorder=0)
+        col = [ACCENT if not m.startswith("argmin") else MUTED for m in methods]
+        for yi, ri, ei, ci in zip(y, rat, err, col):
+            ax.plot([ri - ei, ri + ei], [yi, yi], color=ci, lw=0.8)
+            ax.plot(ri, yi, "o", color=ci, ms=3.2)
+        acc = r[c]["acceptance_6j"] / nom["acceptance_6j"]
+        ax.set_title(titles.get(c, c), fontsize=8.5, loc="left")
+        ax.text(0.0, -0.9, f"≥ 6-jet acceptance ×{acc:.2f}", transform=ax.get_yaxis_transform(),
+                fontsize=7, color=MUTED, va="center")
+        lo, hi = np.nanmin(rat - err), np.nanmax(rat + err)
+        lo, hi = min(lo, 0.9), max(hi, 1.1)
+        ax.set_xlim(lo - 0.05, hi + 0.05)
+        ax.spines["bottom"].set_bounds(lo, hi)
+        ax.spines["left"].set_visible(False)
+        ax.tick_params(axis="y", length=0)
+        ax.tick_params(axis="x", labelsize=7.5)
+    axes[0].set_yticks(y)
+    axes[0].set_yticklabels(methods, fontsize=8)
+    axes[0].set_ylim(-1.3, len(methods) - 0.5)
+    fig.supxlabel(f"selection efficiency / nominal, at the {float(wp):.1%} nominal-QCD working point",
+                  fontsize=8.5, y=0.0)
+    fig.tight_layout(w_pad=0.6)
+    save(fig, out, name)
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--robustness", default=None, help="robustness.json")
     ap.add_argument("--runs", nargs="*", default=[])
     ap.add_argument("--matching", default="results/matching.json")
     ap.add_argument("--out", default="plots/report")
@@ -296,6 +346,8 @@ def main():
         massvar_fom(a.massvars, a.out)
     if a.fom:
         strategy_fom(a.fom, a.out)
+    if a.robustness:
+        robustness_plot(a.robustness, a.out)
     if runs:
         eff_vs_mass(runs, a.out)
         preselection_curve(runs, a.out)

@@ -88,9 +88,11 @@ def _proxy_targets(tq, pt, eta, phi, m, mask, pmass, n_jets, sizes):
 
 
 def load_events(paths, n_jets=8, k=3, is_signal=True, max_events=None, sizes=None,
-                truth="auto", min_jets=None, max_jets=None, proxy=False, n_assign=None):
+                truth="auto", min_jets=None, max_jets=None, proxy=False, n_assign=None,
+                truth_key="truth/quarks"):
     """truth: "quarks" (nearest-jet, merging allowed; needs truth/quarks),
-    "targets" (TARGETS block, unique matching), or "auto" (quarks if present)."""
+    "targets" (TARGETS block, unique matching), or "auto" (quarks if present).
+    truth_key: which stored quark momenta to match, e.g. truth/quarks_before_fsr."""
     sizes = tuple(tuple(x) for x in (sizes or ((k, k),)))
     allowed = {tuple(sorted(x, reverse=True)) for x in sizes}
     files = []
@@ -113,9 +115,9 @@ def load_events(paths, n_jets=8, k=3, is_signal=True, max_events=None, sizes=Non
             inv = np.argsort(order, axis=1)  # original index -> sorted position
             njall = mask.sum(1)
             target = np.full(n, -1, dtype=np.int64)
-            use_q = is_signal and "truth/quarks" in f and truth in ("auto", "quarks")
+            use_q = is_signal and truth_key in f and truth in ("auto", "quarks")
             if use_q:
-                tq = truth_sets_from_quarks(f["truth/quarks"][:], eta, phi, mask)
+                tq = truth_sets_from_quarks(f[truth_key][:], eta, phi, mask)
                 for i in range(n):
                     t = tq[i]
                     if (t < 0).any() or (t >= na).any():
