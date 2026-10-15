@@ -151,8 +151,10 @@ class PairNet(nn.Module):
         n_assign: int | None = None,
         gate_interp: bool = False,
         mass_head: bool = False,
+        massless: bool = False,
     ):
         super().__init__()
+        self.massless = massless  # ignore the jet masses (no quark/gluon handle)
         self.n_jets, self.k = n_jets, k
         self.d, self.nhead = d_model, nhead
         self.use_pair_bias = use_pair_bias
@@ -275,6 +277,8 @@ class PairNet(nn.Module):
           ht       (B,)
         """
         B, N = pt.shape
+        if self.massless:
+            m = torch.zeros_like(m)
         pt, eta, phi, m, ht = canonicalize(pt, eta, phi, m, mask)
         p4 = to_cartesian(pt, eta, phi, m) * mask.unsqueeze(-1)
 
@@ -473,6 +477,7 @@ def load_checkpoint(path):
         use_null=not a["no_null"], sizes=sizes, gated=a.get("gated", False),
         bg_beta=a.get("bg_beta", 1.0), n_assign=a.get("n_assign"),
         gate_interp=a.get("gate_interp", False), mass_head=a.get("mass_head", False),
+        massless=a.get("massless", False),
     )
     net.load_state_dict(ck["state"])
     net.eval()

@@ -210,6 +210,8 @@ def main():
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--n-assign", type=int, default=None,
                     help="pairings use the leading N jets; --n-jets sets the context (encoder) size")
+    ap.add_argument("--massless", action="store_true",
+                    help="set every jet mass to zero inside the network (tests the quark/gluon handle)")
     ap.add_argument("--mass-head", action="store_true",
                     help="also learn a scale-free mass estimate log(M/HT) (output m_est)")
     ap.add_argument("--w-mass", type=float, default=1.0)
@@ -276,6 +278,7 @@ def main():
         use_pair_bias=not args.no_pair_bias, use_group_kin=not args.no_group_kin,
         use_null=not args.no_null, sizes=sizes, gated=args.gated, bg_beta=args.bg_beta,
         n_assign=args.n_assign, gate_interp=args.gate_interp, mass_head=args.mass_head,
+        massless=args.massless,
     ).to(dev)
     A = net.n_assign
     print(f"params {sum(p.numel() for p in net.parameters())/1e3:.0f}k  interpretations {A}")
