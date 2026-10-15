@@ -181,3 +181,152 @@ P(signal) cut for all masses.
 - **Why exact pairing is low.** It is near the information limit
   (`scripts/pairing_ambiguity.py`). An oracle that knows the gluino mass finds
   the true pairing in only 27–34% of available events, the same as the network.
+
+## Follow-up: truth definition, one-network mass, robustness
+
+### Which quark defines the true jets
+
+The files in `data/pythia` match jets to the decay quark traced to the end of
+its own shower (Pythia `iBotCopyId`, like CMS `isLastCopy`). After a hard
+emission that quark can point away from the jet that carries most of its
+energy. The alternative is the quark before its own shower (Pythia `iBotCopy`,
+like CMS `isLastCopyBeforeFSR`). Recoil is handled either way: the gluino's
+daughters and their last carbon copy match identically.
+
+`scripts/truth_quarks_generator.py`, 1500 events per mass:
+
+| | 500 GeV | 1 TeV | 2 TeV |
+|---|---|---|---|
+| all six matched, before / after own FSR | 39% / 41% | 49% / 56% | 54% / 67% |
+| matched-triplet mass, 16–84%: before own FSR | 0.84–1.00 M | 0.83–1.00 M | 0.83–1.00 M |
+| matched-triplet mass, 16–84%: after own FSR | 0.80–1.00 M | 0.76–0.99 M | 0.75–0.99 M |
+| events matched both ways whose true pairing differs | 14% | 20% | 23% |
+| where it differs, triplets within 0.95 ± 0.1 M: before / after | 53% / 44% | 55% / 40% | 60% / 47% |
+
+The before-FSR definition is the cleaner label. Scored against each definition
+(`scripts/truth_definition.py`, 10k held-out events per mass, truth among the
+leading 7 jets; network trained on after-FSR labels):
+
+| | 500 GeV | 750 GeV | 1 TeV | 2 TeV |
+|---|---|---|---|---|
+| truth available, before / after | 25.0 / 24.7% | 30.5 / 31.6% | 34.1 / 35.5% | 41.8 / 46.5% |
+| true-pairing m_avg core, before / after | ±6.5 / ±7.4% | ±6.1 / ±7.2% | ±5.6 / ±6.6% | ±5.1 / ±6.5% |
+| gated PairNet exact pairing, before / after | 28.8 / 26.3% | 29.4 / 26.6% | 29.7 / 26.8% | 28.5 / 24.3% |
+| mass oracle, before / after | 31.0 / 29.0% | 29.4 / 26.7% | 31.8 / 29.3% | 36.9 / 32.0% |
+
+So the network's pairing is 2.5–4 points better than the after-FSR truth
+said, and still close to the oracle except at 2 TeV, the top of the training
+mass grid (an edge effect that a wider grid, as in `docs/PRODUCTION.md`,
+should remove).
+
+Retraining on before-FSR labels (same events, architecture and schedule; the
+mass-head network below), scored on before-FSR truth:
+
+| exact pairing, of available | 500 GeV | 750 GeV | 1 TeV | 2 TeV |
+|---|---|---|---|---|
+| trained on after-FSR labels | 26.4% | 28.1% | 29.9% | 29.9% |
+| trained on before-FSR labels | 27.3% | 28.5% | 29.6% | 30.4% |
+
+The pairing moves by under a point, i.e. within run-to-run noise: the network
+had absorbed the label noise. The cleaner definition mainly changes what is
+measured (+2.5–4 points, and a narrower true-pairing peak). It is still the
+right label for production.
+
+`generate_pythia.py` now stores both (`truth/quarks_before_fsr`,
+`truth/quarks_after_fsr`); `--truth-quarks` picks the one used for `TARGETS`,
+and `produce_samples.py` defaults to `before_fsr`. `train_pairnet.py
+--truth-key` chooses the labels at training time.
+
+### One network for the pairing, P(signal) and the mass
+
+`--gate-interp --mass-head` lets the gate see the pairing summary and adds a
+head that learns log(M/HT), so one forward pass gives the pairing, P(signal)
+and a resonance-mass estimate (`m_est`). Same data and schedule as before,
+held-out test:
+
+| | AUC | QCD rejection at 50% signal | exact pairing | signal in window at 2 / 5 / 8% QCD pass |
+|---|---|---|---|---|
+| gated PairNet, 7 jets | 0.966 | 219 | 8.3% | – |
+| + gate sees pairings + mass head | 0.965 | 198 | 8.1% | 21.7 / 35.3 / 38.8% |
+| gated PairNet, 6 jets | 0.956 | 133 | 7.4% | 14.0 / 28.0 / 32.5% |
+| + gate sees pairings + mass head | 0.956 | 146 | 7.5% | 13.9 / 27.9 / 32.6% |
+
+Selection and pairing are unchanged within run-to-run noise. The learned mass
+matches the separate BDT regressor of `scripts/mass_estimators.py` (core
+half-width of the shortest 68% window, all signal):
+
+| | 500 | 750 | 1000 | 1250 | 1500 | 2000 GeV |
+|---|---|---|---|---|---|---|
+| m_avg of the signal scorer's pairing | 25.3% | 21.8% | 20.7% | 19.1% | 17.9% | 17.0% |
+| separate BDT regressor | 22.0% | 19.4% | 17.5% | 15.9% | 14.7% | 13.3% |
+| **mass head, 7 jets** | 23.2% | 19.7% | 17.5% | 16.1% | 14.7% | 12.9% |
+| mass head, 6 jets | 23.0% | 19.6% | 18.6% | 16.8% | 15.2% | 13.5% |
+
+`export_pairnet_onnx.py` adds the `m_est` output for such checkpoints.
+
+With the new 7-jet network trained on before-FSR labels (exported as
+`models/pairnet_gated_7jet_mass.onnx`, now the recommended model), on the
+search study's held-out events (`scripts/search_study.py`, one P(signal) cut
+for all masses):
+
+| | AUC 6 / 7 / ≥8 jets / all | S/√B: 500 / 750 / 1000 / 1250 / 1500 / 2000 GeV |
+|---|---|---|
+| gated PairNet, 7 jets, m_avg | 0.951 / 0.956 / 0.956 / 0.974 | 2.9 / 8.3 / 17.7 / 42.0 / 58.6 / 149 |
+| gated PairNet + separate mass regressor | same | 2.8 / 8.9 / 22.1 / 43.1 / 64.9 / 190 |
+| **new network, its own mass** | **0.955 / 0.958 / 0.958 / 0.975** | **3.0 / 9.8 / 25.7 / 39.9 / 68.0 / 199** |
+| new network, m_avg | same | 2.8 / 9.0 / 20.2 / 57.5 / 60.6 / 152 |
+| 6 jets, same additions, its own mass | 0.946 / 0.947 / 0.948 / 0.962 | 2.3 / 8.2 / 23.2 / 37.1 / 65.9 / 187 |
+
+Selection is equal or slightly better in every jet bin, and the learned mass
+lifts S/√B by 16–45% at 0.75, 1, 1.5 and 2 TeV (level at 1.25 TeV). Above
+1 TeV the windows hold only 1–13 effective QCD MC events, so differences of
+tens of percent there are not significant. At 1% QCD the new network keeps
+33 / 56 / 71 / 80 / 86 / 91% of signal (500–2000 GeV), 1–2 points more than
+before; `models/README.md` lists the working points.
+
+### Modelling robustness
+
+`scripts/robustness.py` fixes each method's cut on the nominal held-out QCD
+and applies it to varied samples (`scripts/robustness_samples.sh`): 1 TeV
+signal with g̃ → q̃q, q̃ → qq (m_q̃ = 500 GeV), and signal and QCD with both
+shower α_s (ISR and FSR) at 0.150 and 0.123 instead of Monash 0.1365.
+Detector-level variations are applied to the nominal events. Efficiency
+relative to nominal at the 1% nominal-QCD working point:
+
+| | decay chain | signal α_s +10% / −10% | QCD α_s +10% / −10% | signal: JES −3% / fwd −5% / +5% smear | QCD: JES −3% / fwd −5% / +5% smear |
+|---|---|---|---|---|---|
+| gated PairNet, 7 jets | 1.11 | 0.83 / 1.11 | 0.40 / 1.32 | 1.00 / 1.00 / 1.00 | 1.03 / 1.06 / 1.02 |
+| new network (mass head) | 1.11 | 0.85 / 1.12 | 0.47 / 1.27 | – | – |
+| v2 (12-jet context) | 1.08 | 0.94 / 1.05 | 0.57 / 1.28 | 0.99 / 1.00 / 0.99 | 1.01 / 1.01 / 0.97 |
+| gated PairNet, 6 jets | 1.14 | 0.77 / 1.17 | 0.38 / 1.49 | 1.00 / 1.00 / 1.00 | 1.04 / 1.05 / 1.02 |
+| expert BDT | 1.10 | 1.02 / 0.97 | 0.76 / 0.75 | 0.98 / 1.00 / 0.96 | 0.96 / 1.00 / 0.85 |
+
+Statistical precision: ±0.01–0.02 for signal; ±0.07–0.17 for QCD (6k events
+per varied QCD sample).
+
+- **Decay chain:** selected 8–14% more often, peak unchanged. No loss for this
+  signal model.
+- **Detector:** the networks' signal efficiency moves by ≤ 1%, QCD within
+  MC precision. P(signal) is exactly invariant under a global jet energy
+  scale (the network divides by HT); only jets crossing 30 GeV break it. The
+  peak follows the scale (0.961 → 0.932 M at −3%). The BDT loses 4% of
+  signal with extra smearing at 1% QCD (8% at 0.1%).
+- **Shower α_s: the networks' P(signal) depends on the radiation.** More
+  radiation makes both signal and QCD look less signal-like (−15–17% signal,
+  −53–60% QCD at 1% for the 7-jet networks); less radiation the opposite.
+  The BDT's signal efficiency moves by ≤ 3%. The likely lever is the jet mass:
+  QCD jets are heavier than signal jets (⟨m/pT⟩ of the leading six 0.164 vs
+  0.118), and ±10% α_s moves it by about ±0.01 while the jet count barely
+  changes. The four-vector carries the mass, so the network can use it as a
+  quark-versus-gluon handle.
+- **What it means:** hemisphere mixing takes real jets from data, so the
+  background estimate inherits the data's response. The signal efficiency
+  needs a shower systematic (here 11–17% for ±10% α_s at 1% QCD, larger at
+  tighter cuts). To reduce it, train on a mix of shower settings or with
+  massless four-vectors and measure what that costs; both are runs for the
+  GPU machine.
+- Weighted QCD acceptances are not compared between generator runs: the
+  bias-weight normalisation is not consistent across runs.
+
+Figures: `docs/figures/robustness_physics.pdf`, `docs/figures/robustness_detector.pdf`,
+`docs/figures/truth_definition.pdf`.
