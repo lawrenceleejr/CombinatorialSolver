@@ -57,7 +57,15 @@ def main():
         soft = lost & ~fwd & ~mer & (qpt < args.ptmin)
         oth = lost & ~fwd & ~mer & ~soft
         cat = np.select([fwd.any(1), mer.any(1), soft.any(1), oth.any(1)], [1, 2, 3, 4], 0)
+        close = dr < 0.4
+        same = close.copy()
+        same[:, :3, 3:] = False
+        same[:, 3:, :3] = False
+        cross = close & ~same
         r = {
+            "close_pair_any": float(close.any((1, 2)).mean()),
+            "close_pair_same_parent_only": float((same.any((1, 2)) & ~cross.any((1, 2))).mean()),
+            "close_pair_cross_parent": float(cross.any((1, 2)).mean()),
             "n_events": int(len(q)),
             "all_matched": float((cat == 0).mean()),
             "first_reason_forward": float((cat == 1).mean()),
