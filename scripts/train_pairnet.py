@@ -91,6 +91,8 @@ def main():
     ap.add_argument("--bkg", nargs="*", default=[])
     ap.add_argument("--n-jets", type=int, default=8)
     ap.add_argument("--k", type=int, default=3)
+    ap.add_argument("--sizes", default=None,
+                    help='group-size hypotheses, e.g. "33,32" (3+3 and 3+2 for merged jets)')
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--bs", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -110,14 +112,15 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
+    sizes = tuple((int(x[0]), int(x[1])) for x in args.sizes.split(",")) if args.sizes else None
     torch.manual_seed(args.seed)
     torch.set_num_threads(args.threads)
     os.makedirs(args.out, exist_ok=True)
 
-    sig = load_events(args.sig, args.n_jets, args.k, True, args.max_sig)
+    sig = load_events(args.sig, args.n_jets, args.k, True, args.max_sig, sizes=sizes)
     parts = [sig]
     if args.bkg:
-        bkg = load_events(args.bkg, args.n_jets, args.k, False, args.max_bkg)
+        bkg = load_events(args.bkg, args.n_jets, args.k, False, args.max_bkg, sizes=sizes)
         parts.append(bkg)
     data = concat(*parts) if len(parts) > 1 else sig
     tr, va, te = split(data, seed=args.seed)
@@ -129,7 +132,7 @@ def main():
         n_jets=args.n_jets, k=args.k, d_model=args.d_model, nhead=args.heads,
         num_layers=args.layers, dim_ff=2 * args.d_model, dropout=args.dropout,
         use_pair_bias=not args.no_pair_bias, use_group_kin=not args.no_group_kin,
-        use_null=not args.no_null,
+        use_null=not args.no_null, sizes=sizes,
     )
     A = net.n_assign
     print(f"params {sum(p.numel() for p in net.parameters())/1e3:.0f}k  interpretations {A}")
