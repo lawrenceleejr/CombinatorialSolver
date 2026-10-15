@@ -89,6 +89,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sig", nargs="+", required=True)
     ap.add_argument("--bkg", nargs="*", default=[])
+    ap.add_argument("--test-sig", nargs="*", default=[], help="explicit test files (else random split)")
+    ap.add_argument("--test-bkg", nargs="*", default=[])
     ap.add_argument("--n-jets", type=int, default=8)
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--sizes", default=None,
@@ -126,7 +128,16 @@ def main():
                           min_jets=args.min_jets)
         parts.append(bkg)
     data = concat(*parts) if len(parts) > 1 else sig
-    tr, va, te = split(data, seed=args.seed)
+    if args.test_sig:
+        tr, va, _ = split(data, fracs=(0.85, 0.15, 0.0), seed=args.seed)
+        tparts = [load_events(args.test_sig, args.n_jets, args.k, True, None, sizes=sizes,
+                              min_jets=args.min_jets)]
+        if args.test_bkg:
+            tparts.append(load_events(args.test_bkg, args.n_jets, args.k, False, None, sizes=sizes,
+                                      min_jets=args.min_jets))
+        te = concat(*tparts) if len(tparts) > 1 else tparts[0]
+    else:
+        tr, va, te = split(data, seed=args.seed)
     ttr, tva, tte = map(to_tensors, (tr, va, te))
     print(f"train {len(tr['pt'])}  val {len(va['pt'])}  test {len(te['pt'])}; "
           f"sig reconstructable {np.mean(sig['target'] >= 0):.3f}", flush=True)
