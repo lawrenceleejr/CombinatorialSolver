@@ -178,7 +178,8 @@ def main():
     nets = {k: v for k, v in nets.items() if os.path.exists(v)}
 
     # working points on nominal QCD
-    dq = load(a.thr_qcd or a.nom_qcd, False)
+    thr_files = a.thr_qcd or a.nom_qcd
+    dq = load(thr_files, False)
     sq = scores(dq, a, nets)
     thr = {}
     for m, (s, _, _) in sq.items():
@@ -210,6 +211,7 @@ def main():
         if key not in cache:
             cache[key] = (load(plist, is_sig), np.mean([acceptance(p, is_sig) for p in plist]))
         d, acc = cache[key]
+        reuse = kind is None and not is_sig and list(plist) == list(thr_files)
         if kind:
             d, kept = jet_variation(d, kind)
             acc = acc * kept
@@ -219,7 +221,7 @@ def main():
              "frac_7plus": float(np.average(nj >= 7, weights=d["w"])), "methods": {}}
         if is_sig:
             r["frac_all6_matched_distinct"] = float((d["tjets"] >= 0).all(1).mean())
-        for m, (s, g1, g2) in scores(d, a, nets).items():
+        for m, (s, g1, g2) in (sq if reuse else scores(d, a, nets)).items():
             mm = {}
             mavg = mavg_asym(d, g1, g2)[0]
             for e in QCD_EFFS:
