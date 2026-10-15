@@ -50,10 +50,12 @@ def write_slha(mass: float, width: float, path: str) -> None:
         2000011, 2000013, 2000015,
         1000022, 1000023, 1000025, 1000035, 1000024, 1000037,
     ]
+    ident = lambda name, n: [f"BLOCK {name}"] + [
+        f"  {i} {j}  {1.0 if i == j else 0.0:.6e}" for i in range(1, n + 1) for j in range(1, n + 1)
+    ]
     lines = [
         "BLOCK MODSEL",
-        "    1   0",
-        "    4   1   # RPV on",
+        "    1   1",
         "BLOCK SMINPUTS",
         "    1   1.27934e+02",
         "    2   1.16637e-05",
@@ -62,8 +64,33 @@ def write_slha(mass: float, width: float, path: str) -> None:
         "    5   4.20000e+00",
         "    6   1.73000e+02",
         "    7   1.77700e+00",
+        "BLOCK MINPAR",
+        "    1   1.0e+04",
+        "    2   1.0e+04",
+        "    3   1.0e+01",
+        "    4   1.0e+00",
+        "    5   0.0e+00",
+        "BLOCK GAUGE Q= 1.0e+03",
+        "    1   3.6e-01",
+        "    2   6.4e-01",
+        "    3   1.1e+00",
+        "BLOCK HMIX Q= 1.0e+03",
+        "    1   5.0e+04",
+        "    2   1.0e+01",
+        "    3   2.4e+02",
+        "    4   2.5e+09",
+        "BLOCK ALPHA",
+        "   -1.0e-01",
+    ]
+    lines += ident("NMIX", 4) + ident("UMIX", 2) + ident("VMIX", 2)
+    lines += ident("STOPMIX", 2) + ident("SBOTMIX", 2) + ident("STAUMIX", 2)
+    lines += [
         "BLOCK MASS",
         f"  {GLUINO}  {mass:.6e}",
+        "  25  1.25e+02",
+        "  35  5.0e+04",
+        "  36  5.0e+04",
+        "  37  5.0e+04",
     ]
     lines += [f"  {pid}  {heavy:.6e}" for pid in sparticles]
     lines += [
@@ -139,6 +166,7 @@ def decay_quarks(event) -> list[list[tuple[float, float, float]]] | None:
         qs = [event[d] for d in dl if 1 <= abs(event[d].id()) <= 6]
         if len(qs) != 3:
             return None
+        qs = [event[q.iBotCopyId()] for q in qs]
         groups.append([(q.pT(), q.eta(), q.phi()) for q in qs])
     if len(groups) != 2:
         return None
@@ -233,7 +261,7 @@ def main():
         out["phi"].append(pad(sphi))
         out["mass"].append(pad(sm))
         out["ntot"].append(nj)
-        out["w"].append(p.info.weight())
+        out["w"].append(p.infoPython().weight())
 
         tg = np.full(6, -1, dtype=np.int32)
         qk = np.zeros((6, 3), dtype=np.float32)
@@ -287,7 +315,7 @@ def main():
         f.attrs["process"] = args.process
         f.attrs["mass"] = args.mass
         f.attrs["n_tried"] = n_tried
-        f.attrs["sigma_mb"] = p.info.sigmaGen()
+        f.attrs["sigma_mb"] = p.infoPython().sigmaGen()
         f.attrs["generator"] = "pythia8 + fastjet anti-kt R=0.4, smeared"
     print(f"done: {len(pt)} written / {n_tried} tried in {time.time() - t0:.0f}s -> {args.out}")
 
