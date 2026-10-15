@@ -61,10 +61,13 @@ def main():
         if not os.path.exists(path):
             continue
         choice = None
+        nj = max([7] + [net.n_jets for net in nets.values()])
         for lab, key in KEYS.items():
-            d = load_events(path, 7, 3, True, None, min_jets=6, truth_key=key)
+            d = load_events(path, nj, 3, True, None, min_jets=6, n_assign=7, truth_key=key)
             if choice is None:  # network choices do not depend on the truth definition
-                choice = {n: scores(net, d)[0].argmax(1) for n, net in nets.items()}
+                choice = {n: scores(net, {k: v[:, :net.n_jets] for k, v in d.items() if k in
+                                          ("pt", "eta", "phi", "m", "mask")})[0].argmax(1)
+                          for n, net in nets.items()}
                 p4 = four_vectors(d)
                 m1, m2 = inv_mass(p4[:, G1].sum(2)), inv_mass(p4[:, G2].sum(2))
                 valid = d["mask"][:, G1].all(-1) & d["mask"][:, G2].all(-1)

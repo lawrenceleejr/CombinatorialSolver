@@ -13,8 +13,9 @@ different physics:
 
 Reported per sample: the >= 6-jet acceptance, the selection efficiency within
 the >= 6-jet region, the exact-pairing rate and the mass peak of the selected
-signal. Nominal QCD for the ratios is qcd_s15/s16, generated with exactly the
-settings of the varied QCD (>= 6 jets, pTHat > 200 GeV).
+signal. Nominal QCD is the held-out qcd_s8-s10, s15, s16 (>= 6 jets,
+pTHat > 200 GeV, the settings of the varied QCD); with ~12k varied QCD events
+only the 1% working point is statistically meaningful for QCD.
 
   python scripts/robustness.py --extra "7-jet + gate sees pairings + mass head=runs/g7_gi_mh/model.pt"
 """
@@ -118,9 +119,9 @@ def weff(sel, w):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--nom-sig", default="data/pythia/sig_m1000_s2.h5")
-    ap.add_argument("--nom-qcd", nargs="+", default=["data/pythia/qcd_s15.h5", "data/pythia/qcd_s16.h5"])
-    ap.add_argument("--thr-qcd", nargs="+", default=[f"data/pythia/qcd_s{i}.h5" for i in (8, 9, 10, 15, 16)],
-                    help="QCD that fixes the working points")
+    ap.add_argument("--nom-qcd", nargs="+", default=[f"data/pythia/qcd_s{i}.h5" for i in (8, 9, 10, 15, 16)])
+    ap.add_argument("--thr-qcd", nargs="+", default=None,
+                    help="QCD that fixes the working points (default: --nom-qcd)")
     ap.add_argument("--var-sig", nargs="+", default=["data/robust/sig_m1000_chain500.h5",
                                                      "data/robust/sig_m1000_as150.h5",
                                                      "data/robust/sig_m1000_as123.h5"])
@@ -141,7 +142,7 @@ def main():
     nets = {k: v for k, v in nets.items() if os.path.exists(v)}
 
     # working points on nominal QCD
-    dq = load(a.thr_qcd, False)
+    dq = load(a.thr_qcd or a.nom_qcd, False)
     sq = scores(dq, a, nets)
     thr = {}
     for m, (s, _, _) in sq.items():

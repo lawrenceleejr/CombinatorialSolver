@@ -279,8 +279,8 @@ def strategy_fom(path, out, methods=None, name="strategy_fom"):
 
 
 def robustness_plot(path, out, wp="0.01", name="robustness"):
-    """Small multiples: selection efficiency in a varied sample relative to
-    nominal, at a working point fixed on nominal QCD; one column per sample."""
+    """Small multiples on one shared scale: selection efficiency in a varied
+    sample relative to nominal, at a working point fixed on nominal QCD."""
     r = json.load(open(path))["samples"]
     cols = [k for k in r if "nominal" not in k]
     titles = {"signal, chain500": "signal: g̃ → q̃q, q̃ → qq",
@@ -288,42 +288,42 @@ def robustness_plot(path, out, wp="0.01", name="robustness"):
               "QCD, as150": "QCD: shower αs +10%", "QCD, as123": "QCD: shower αs −10%"}
     methods = [m for m in r[cols[0]]["methods"] if not m.startswith("argmin")]
     methods += [m for m in r[cols[0]]["methods"] if m.startswith("argmin")]
-    fig, axes = plt.subplots(1, len(cols), figsize=(1.55 * len(cols) + 1.8, 0.28 * len(methods) + 0.9),
-                             sharey=True)
-    axes = np.atleast_1d(axes)
     y = np.arange(len(methods))[::-1]
-    for ax, c in zip(axes, cols):
+    data = {}
+    for c in cols:
         nom = r["signal, nominal" if c.startswith("signal") else "QCD, nominal"]
         rat, err = [], []
         for m in methods:
             v, n = r[c]["methods"][m][wp], nom["methods"][m][wp]
             rr = v["eff"] / n["eff"] if n["eff"] > 0 else np.nan
-            e = rr * np.hypot(v["err"] / max(v["eff"], 1e-12), n["err"] / max(n["eff"], 1e-12))
             rat.append(rr)
-            err.append(e)
-        rat, err = np.array(rat), np.array(err)
+            err.append(rr * np.hypot(v["err"] / max(v["eff"], 1e-12), n["err"] / max(n["eff"], 1e-12)))
+        data[c] = (np.array(rat), np.array(err), r[c]["acceptance_6j"] / nom["acceptance_6j"])
+    lo = min(0.9, min(np.nanmin(a - e) for a, e, _ in data.values()))
+    hi = max(1.1, max(np.nanmax(a + e) for a, e, _ in data.values()))
+    fig, axes = plt.subplots(1, len(cols), figsize=(1.6 * len(cols) + 1.9, 0.27 * len(methods) + 1.0),
+                             sharey=True, sharex=True)
+    axes = np.atleast_1d(axes)
+    for ax, c in zip(axes, cols):
+        rat, err, acc = data[c]
         ax.axvline(1.0, color="#d9d9d9", lw=0.8, zorder=0)
-        col = [ACCENT if not m.startswith("argmin") else MUTED for m in methods]
-        for yi, ri, ei, ci in zip(y, rat, err, col):
+        for yi, ri, ei, m in zip(y, rat, err, methods):
+            ci = MUTED if m.startswith("argmin") else ACCENT
             ax.plot([ri - ei, ri + ei], [yi, yi], color=ci, lw=0.8)
             ax.plot(ri, yi, "o", color=ci, ms=3.2)
-        acc = r[c]["acceptance_6j"] / nom["acceptance_6j"]
-        ax.set_title(titles.get(c, c), fontsize=8.5, loc="left")
-        ax.text(0.0, -0.9, f"≥ 6-jet acceptance ×{acc:.2f}", transform=ax.get_yaxis_transform(),
-                fontsize=7, color=MUTED, va="center")
-        lo, hi = np.nanmin(rat - err), np.nanmax(rat + err)
-        lo, hi = min(lo, 0.9), max(hi, 1.1)
-        ax.set_xlim(lo - 0.05, hi + 0.05)
+        ax.set_title(f"{titles.get(c, c)}\n≥ 6-jet acceptance ×{acc:.2f}", fontsize=8, loc="left",
+                     color=INK, linespacing=1.4)
         ax.spines["bottom"].set_bounds(lo, hi)
         ax.spines["left"].set_visible(False)
         ax.tick_params(axis="y", length=0)
         ax.tick_params(axis="x", labelsize=7.5)
+    axes[0].set_xlim(lo - 0.03, hi + 0.03)
     axes[0].set_yticks(y)
     axes[0].set_yticklabels(methods, fontsize=8)
-    axes[0].set_ylim(-1.3, len(methods) - 0.5)
-    fig.supxlabel(f"selection efficiency / nominal, at the {float(wp):.1%} nominal-QCD working point",
-                  fontsize=8.5, y=0.0)
-    fig.tight_layout(w_pad=0.6)
+    axes[0].set_ylim(-0.6, len(methods) - 0.4)
+    fig.supxlabel(f"selection efficiency in the varied sample / nominal, at the {float(wp):.1%} "
+                  "nominal-QCD working point (±1σ MC statistics)", fontsize=8.5)
+    fig.tight_layout(w_pad=0.8)
     save(fig, out, name)
 
 
