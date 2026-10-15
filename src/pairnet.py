@@ -1,0 +1,319 @@
+"""
+PairNet: interpretation ranker for pair-produced resonances, jet 4-vectors only.
+
+Question the network answers, per event:
+  "Of all ways to pick two disjoint groups of k jets from the leading N jets,
+   which one looks most like pair production of two equal-mass resonances,
+   and does ANY of them look like it at all?"
+
+Design (see docs/REVIEW.md for the reasoning):
+  * Inputs are only jet four-vectors (pt, eta, phi, m).  The event is put in a
+    canonical frame (leading jet at phi=0, eta>=0) and every momentum scale is
+    divided by HT, so the network sees shapes, not absolute masses.
+  * Jet tokens are encoded by a Transformer whose attention is biased by
+    Lorentz-invariant pairwise features (ln dR, ln kT, ln z, ln m_ij^2), as in
+    the Particle Transformer.  These are functions of the 4-vectors only.
+  * Every interpretation (G1, G2, rest) is scored by a symmetric scorer built
+    from: summed jet embeddings of each group, the group 4-vector kinematics
+    (mass, boost, internal pairwise-mass fractions), the inter-group relations
+    (mass asymmetry, angular separation) and the leftover jets.
+  * One extra "null" logit, from the pooled event, means "no interpretation is
+    pair production".  A single softmax over [interpretations..., null] gives
+      - the best interpretation (argmax over interpretations), and
+      - an event-level signal probability  P(sig) = 1 - p(null).
+    QCD is trained to land on null; signal on its true interpretation.  The
+    network never has to hide QCD inside asymmetric interpretations.
+"""
+
+from itertools import combinations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def enumerate_pairings(n_jets: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """All unordered pairs of disjoint k-subsets of range(n_jets).
+
+    Returns (g1, g2) index tensors of shape (A, k); g1[a] < g2[a] lexicographically.
+    """
+    g1, g2 = [], []
+    for a in combinations(range(n_jets), k):
+        rest = [j for j in range(n_jets) if j not in a]
+        for b in combinations(rest, k):
+            if a < b:
+                g1.append(a)
+                g2.append(b)
+    return torch.tensor(g1, dtype=torch.long), torch.tensor(g2, dtype=torch.long)
+
+
+def to_cartesian(pt, eta, phi, m):
+    px, py, pz = pt * torch.cos(phi), pt * torch.sin(phi), pt * torch.sinh(eta)
+    e = torch.sqrt(px**2 + py**2 + pz**2 + m**2)
+    return torch.stack([e, px, py, pz], dim=-1)
+
+
+def minkowski_m2(p):
+    return p[..., 0] ** 2 - p[..., 1] ** 2 - p[..., 2] ** 2 - p[..., 3] ** 2
+
+
+def canonicalize(pt, eta, phi, m, mask):
+    """Rotate so jet 0 has phi=0, flip so jet 0 has eta>=0, scale by HT.
+
+    Returns (pt/HT, eta, phi, m/HT, ht).  Exact symmetries of the problem, so the
+    network does not need to learn them from augmentation.
+    """
+    ht = (pt * mask).sum(-1, keepdim=True).clamp(min=1e-6)
+    phi = phi - phi[:, :1]
+    phi = (phi + torch.pi) % (2 * torch.pi) - torch.pi
+    sgn = torch.where(eta[:, :1] < 0, -1.0, 1.0)
+    eta = eta * sgn
+    return pt / ht, eta, phi, m / ht, ht.squeeze(-1)
+
+
+class PairBiasEncoderLayer(nn.Module):
+    """Pre-LN Transformer layer with an additive per-head pairwise attention bias."""
+
+    def __init__(self, d, nhead, dff, dropout):
+        super().__init__()
+        self.nhead = nhead
+        self.ln1 = nn.LayerNorm(d)
+        self.attn = nn.MultiheadAttention(d, nhead, dropout=dropout, batch_first=True)
+        self.ln2 = nn.LayerNorm(d)
+        self.ff = nn.Sequential(nn.Linear(d, dff), nn.GELU(), nn.Dropout(dropout), nn.Linear(dff, d))
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, bias, key_pad):
+        # bias: (B*H, N, N) float; key_pad folded into bias as -inf
+        h = self.ln1(x)
+        a, _ = self.attn(h, h, h, attn_mask=bias, need_weights=False)
+        x = x + self.drop(a)
+        x = x + self.drop(self.ff(self.ln2(x)))
+        return x
+
+
+class PairNet(nn.Module):
+    def __init__(
+        self,
+        n_jets: int = 8,
+        k: int = 3,
+        d_model: int = 128,
+        nhead: int = 8,
+        num_layers: int = 4,
+        dim_ff: int = 256,
+        dropout: float = 0.1,
+        use_pair_bias: bool = True,
+        use_group_kin: bool = True,
+        use_null: bool = True,
+    ):
+        super().__init__()
+        self.n_jets, self.k = n_jets, k
+        self.d, self.nhead = d_model, nhead
+        self.use_pair_bias = use_pair_bias
+        self.use_group_kin = use_group_kin
+        self.use_null = use_null
+
+        g1, g2 = enumerate_pairings(n_jets, k)
+        self.register_buffer("g1", g1, persistent=False)
+        self.register_buffer("g2", g2, persistent=False)
+        self.n_assign = g1.shape[0]
+        # membership matrices (A, N): used to sum embeddings / 4-vectors by matmul
+        M1 = torch.zeros(self.n_assign, n_jets)
+        M2 = torch.zeros(self.n_assign, n_jets)
+        M1.scatter_(1, g1, 1.0)
+        M2.scatter_(1, g2, 1.0)
+        self.register_buffer("M1", M1, persistent=False)
+        self.register_buffer("M2", M2, persistent=False)
+
+        n_jet_feat = 7
+        self.embed = nn.Sequential(
+            nn.Linear(n_jet_feat, d_model), nn.GELU(), nn.Linear(d_model, d_model)
+        )
+        n_pair_feat = 4
+        self.pair_mlp = nn.Sequential(
+            nn.Linear(n_pair_feat, 64), nn.GELU(), nn.Linear(64, nhead * num_layers)
+        )
+        self.layers = nn.ModuleList(
+            [PairBiasEncoderLayer(d_model, nhead, dim_ff, dropout) for _ in range(num_layers)]
+        )
+        self.ln_out = nn.LayerNorm(d_model)
+
+        # group kinematics: ln m/HT, ln(pT/m), eta, k sorted pairwise-mass
+        # fractions (k=3: 3 values; k=2: 1 value), ln(m_max_pair/m)
+        n_pairs_in_group = k * (k - 1) // 2
+        self.n_gk = 3 + n_pairs_in_group if use_group_kin else 0
+        # inter-group: asym, ln((m1+m2)/HT), dR, |dphi|, |deta|, pT balance,
+        # ln(m_sys/HT), rest pT fraction
+        self.n_ik = 8 if use_group_kin else 0
+
+        self.group_mlp = nn.Sequential(
+            nn.Linear(d_model + self.n_gk, d_model), nn.GELU(), nn.Linear(d_model, d_model)
+        )
+        self.rest_mlp = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU())
+        self.score_mlp = nn.Sequential(
+            nn.Linear(3 * d_model + self.n_ik, 2 * d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(2 * d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
+        if use_null:
+            self.null_mlp = nn.Sequential(
+                nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, 1)
+            )
+
+    # ------------------------------------------------------------------ features
+    def _jet_features(self, pt, eta, phi, m, mask):
+        lpt = torch.log(pt.clamp(min=1e-6))
+        e = torch.sqrt((pt * torch.cosh(eta)) ** 2 + m**2)
+        le = torch.log(e.clamp(min=1e-6))
+        f = torch.stack(
+            [lpt, eta, torch.cos(phi), torch.sin(phi), le, m / pt.clamp(min=1e-6), lpt - le], -1
+        )
+        return f * mask.unsqueeze(-1)
+
+    def _pair_features(self, p4, pt, eta, phi, mask):
+        deta = eta.unsqueeze(-1) - eta.unsqueeze(-2)
+        dphi = phi.unsqueeze(-1) - phi.unsqueeze(-2)
+        dphi = (dphi + torch.pi) % (2 * torch.pi) - torch.pi
+        dr = torch.sqrt(deta**2 + dphi**2).clamp(min=1e-4)
+        ptmin = torch.minimum(pt.unsqueeze(-1), pt.unsqueeze(-2))
+        kt = ptmin * dr
+        z = ptmin / (pt.unsqueeze(-1) + pt.unsqueeze(-2)).clamp(min=1e-6)
+        pij = p4.unsqueeze(2) + p4.unsqueeze(1)
+        m2 = minkowski_m2(pij).clamp(min=1e-8)
+        f = torch.stack([torch.log(dr), torch.log(kt.clamp(min=1e-6)), torch.log(z.clamp(min=1e-6)),
+                         torch.log(m2)], -1)
+        pm = (mask.unsqueeze(-1) & mask.unsqueeze(-2)).unsqueeze(-1)
+        return f * pm, m2
+
+    # ------------------------------------------------------------------ forward
+    def forward(self, pt, eta, phi, m, mask):
+        """pt/eta/phi/m: (B, N) pT-sorted, zero-padded; mask (B, N) bool.
+
+        Returns dict with
+          logits   (B, A+1)  last column is the null logit (if use_null)
+          valid    (B, A)    interpretation uses only real jets
+          m1, m2   (B, A)    group masses in HT units
+          ht       (B,)
+        """
+        B, N = pt.shape
+        pt, eta, phi, m, ht = canonicalize(pt, eta, phi, m, mask)
+        p4 = to_cartesian(pt, eta, phi, m) * mask.unsqueeze(-1)
+
+        x = self.embed(self._jet_features(pt, eta, phi, m, mask))
+        pf, m2pair = self._pair_features(p4, pt, eta, phi, mask)
+        neg = torch.zeros(B, 1, N, device=pt.device).masked_fill(~mask.unsqueeze(1), float("-inf"))
+        if self.use_pair_bias:
+            pb = self.pair_mlp(pf)  # (B, N, N, H*L)
+            pb = pb.view(B, N, N, len(self.layers), self.nhead).permute(3, 0, 4, 1, 2)
+        for li, layer in enumerate(self.layers):
+            bias = neg.unsqueeze(1).expand(B, self.nhead, N, N)
+            if self.use_pair_bias:
+                bias = bias + pb[li]
+            x = layer(x, bias.reshape(B * self.nhead, N, N), None)
+        x = self.ln_out(x) * mask.unsqueeze(-1)
+
+        # ---- per-interpretation quantities via membership matmuls
+        M1, M2 = self.M1, self.M2
+        Mr = 1.0 - M1 - M2
+        e1 = torch.einsum("an,bnd->bad", M1, x)
+        e2 = torch.einsum("an,bnd->bad", M2, x)
+        er = torch.einsum("an,bnd->bad", Mr, x)
+        P1 = torch.einsum("an,bnc->bac", M1, p4)
+        P2 = torch.einsum("an,bnc->bac", M2, p4)
+        Pr = torch.einsum("an,bnc->bac", Mr, p4)
+        m1 = torch.sqrt(minkowski_m2(P1).clamp(min=1e-8))
+        m2 = torch.sqrt(minkowski_m2(P2).clamp(min=1e-8))
+
+        valid = (torch.einsum("an,bn->ba", M1 + M2, mask.float()) > 2 * self.k - 0.5)
+
+        if self.use_group_kin:
+            gk1 = self._gkin(P1, m1, m2pair, self.g1)
+            gk2 = self._gkin(P2, m2, m2pair, self.g2)
+            h1 = self.group_mlp(torch.cat([e1, gk1], -1))
+            h2 = self.group_mlp(torch.cat([e2, gk2], -1))
+            ik = self._ikin(P1, P2, Pr, m1, m2)
+        else:
+            h1, h2 = self.group_mlp(e1), self.group_mlp(e2)
+            ik = e1.new_zeros(B, self.n_assign, 0)
+        hr = self.rest_mlp(er)
+        s = self.score_mlp(torch.cat([h1 + h2, h1 * h2, hr, ik], -1)).squeeze(-1)
+        s = s.masked_fill(~valid, -1e4)
+
+        out = {"assign_logits": s, "valid": valid, "m1": m1, "m2": m2, "ht": ht}
+        if self.use_null:
+            pooled = torch.cat(
+                [(x.sum(1) / mask.sum(1, keepdim=True).clamp(min=1)), x.max(1).values], -1
+            )
+            null = self.null_mlp(pooled)
+            out["logits"] = torch.cat([s, null], -1)
+        else:
+            out["logits"] = s
+        return out
+
+    def _gkin(self, P, mg, m2pair, gidx):
+        """Group kinematics from 4-vectors only."""
+        pt = torch.sqrt(P[..., 1] ** 2 + P[..., 2] ** 2).clamp(min=1e-6)
+        eta = torch.asinh(P[..., 3] / pt)
+        # pairwise masses inside the group, as fractions of the group mass^2
+        k = self.k
+        pairs = [(i, j) for i in range(k) for j in range(i + 1, k)]
+        fr = []
+        for i, j in pairs:
+            a, b = gidx[:, i], gidx[:, j]  # (A,)
+            fr.append(m2pair[:, a, b])  # (B, A)
+        fr = torch.stack(fr, -1) / (mg**2).unsqueeze(-1).clamp(min=1e-8)
+        fr = fr.sort(-1, descending=True).values
+        return torch.cat(
+            [torch.log(mg).unsqueeze(-1), torch.log(pt / mg).unsqueeze(-1), eta.unsqueeze(-1), fr], -1
+        )
+
+    @staticmethod
+    def _ikin(P1, P2, Pr, m1, m2):
+        def ptetaphi(P):
+            pt = torch.sqrt(P[..., 1] ** 2 + P[..., 2] ** 2).clamp(min=1e-6)
+            return pt, torch.asinh(P[..., 3] / pt), torch.atan2(P[..., 2], P[..., 1])
+
+        pt1, eta1, phi1 = ptetaphi(P1)
+        pt2, eta2, phi2 = ptetaphi(P2)
+        dphi = (phi1 - phi2 + torch.pi) % (2 * torch.pi) - torch.pi
+        deta = eta1 - eta2
+        dr = torch.sqrt(dphi**2 + deta**2)
+        asym = (m1 - m2).abs() / (m1 + m2).clamp(min=1e-6)
+        msys = torch.sqrt(minkowski_m2(P1 + P2).clamp(min=1e-8))
+        ptr = torch.sqrt(Pr[..., 1] ** 2 + Pr[..., 2] ** 2)
+        bal = (pt1 - pt2).abs() / (pt1 + pt2)
+        return torch.stack(
+            [asym, torch.log(m1 + m2), dr, dphi.abs(), deta.abs(), bal, torch.log(msys), ptr], -1
+        )
+
+
+def pairnet_loss(out, target, is_sig, sig_weight=1.0, bkg_weight=1.0):
+    """Joint softmax over [interpretations..., null].
+
+    target: (B,) interpretation index for reconstructable signal, -1 for signal
+            whose true interpretation is not among the candidates, ignored for bkg.
+    is_sig: (B,) bool.
+    """
+    logits = out["logits"]
+    logp = F.log_softmax(logits, -1)
+    A = out["assign_logits"].shape[1]
+    has_null = logits.shape[1] == A + 1
+    loss = logits.new_zeros(logits.shape[0])
+    rec = is_sig & (target >= 0)
+    if rec.any():
+        loss[rec] = -logp[rec, target[rec]]
+    if has_null:
+        unrec = is_sig & (target < 0)
+        if unrec.any():
+            # signal, but no correct candidate: only demand "not null"
+            loss[unrec] = -torch.logsumexp(logp[unrec, :A], -1)
+        bkg = ~is_sig
+        if bkg.any():
+            loss[bkg] = -logp[bkg, A]
+    w = torch.where(is_sig, sig_weight, bkg_weight)
+    if not has_null:
+        w = w * rec.float()
+    return (loss * w).sum() / w.sum().clamp(min=1e-6)
