@@ -106,7 +106,7 @@ def best_window(vs, vb, wb, nsig_tot, wb_tot):
             lo, hi = qs[i], qs[j]
             S = ((vs >= lo) & (vs < hi)).sum() / nsig_tot
             B = (wb * ((vb >= lo) & (vb < hi))).sum() / wb_tot
-            fom = S / np.sqrt(max(B, 1e-6))
+            fom = S / np.sqrt(max(B, 3 * wb.mean() / wb_tot))  # floor: ~3 QCD events
             if fom > best[0]:
                 best = (fom, (float(lo), float(hi)), float(S))
     return best
