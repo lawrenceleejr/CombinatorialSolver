@@ -321,6 +321,10 @@ def main():
         f.attrs["n_tried"] = n_tried
         f.attrs["sigma_mb"] = p.infoPython().sigmaGen()
         f.attrs["generator"] = "pythia8 + fastjet anti-kt R=0.4, smeared"
+        # sum of weights over ALL generated events: per-event cross-section weight is
+        # normweight * sigma_mb / weight_sum, which lets samples with different
+        # pTHat settings be combined
+        f.attrs["weight_sum"] = float(p.infoPython().weightSum())
     os.replace(tmp, args.out)
     print(f"done: {len(pt)} written / {n_tried} tried in {time.time() - t0:.0f}s -> {args.out}")
 
