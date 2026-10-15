@@ -142,8 +142,8 @@ def main():
             fom, win, S = best_window(vs, vb, wb[pre[~s]], sm.sum(), wb.sum())
             med = np.median(vs)
             q16, q84 = np.quantile(vs, [0.16, 0.84])
-            r[v] = {"fom": fom, "window": win, "sig_in_window": S, "median_over_M": med / m,
-                    "rel_width": (q84 - q16) / 2 / med}
+            r[v] = {"fom": float(fom), "window": win, "sig_in_window": float(S), "median_over_M": float(med / m),
+                    "rel_width": float((q84 - q16) / 2 / med)}
         res[int(m)] = r
         print(int(m), {v: round(r[v]["fom"], 1) for v in names},
               "| S:", {v: round(r[v]["sig_in_window"], 3) for v in names})
