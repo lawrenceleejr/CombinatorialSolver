@@ -271,8 +271,8 @@ def strategy_fom(path, out, methods=None, name="strategy_fom"):
     for (_, t, c), yv in zip(items, ys):
         ax.text(max(allm) * 1.03, 10**yv, t, color=c, va="center", fontsize=7.5)
     ax.set_xlabel("gluino mass [GeV]")
-    ax.set_ylabel(r"$S/\sqrt{B}$ (best cut and mass window)")
-    ax.set_xticks(sorted(set(allm)))
+    ax.set_ylabel(r"$S/\sqrt{B}$, relative units (best cut and window)")
+    ax.set_xticks([500, 1000, 1500, 2000])
     ax.set_xlim(min(allm) * 0.9, max(allm) * 1.75)
     ax.spines["bottom"].set_bounds(min(allm), max(allm))
     save(fig, out, name)
