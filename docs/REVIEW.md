@@ -336,6 +336,18 @@ per varied QCD sample).
   tighter cuts). To reduce it, train on a mix of shower settings or with
   massless four-vectors and measure what that costs; both are runs for the
   GPU machine.
+- **Test: the same network with massless jets** (`train_pairnet.py --massless`,
+  6 epochs). The shower sensitivity disappears: signal 1.02 / 1.02 at 1% QCD
+  for α_s ±10% (against 0.85 / 1.12 with masses); QCD 0.89 ± 0.16 /
+  0.68 ± 0.14 (against 0.47 / 1.27). So the jet mass is the lever. But the
+  massless network keeps only 42% of 1 TeV signal at 1% QCD, against 71% with
+  masses (17% against 37% at 0.1%), and its validation AUC levels off at 0.944
+  against 0.964 at the same epoch.
+- **Recommendation:** the jet mass is worth about ×1.7 in signal efficiency at
+  a fixed QCD rate, far more than its 11–17% shower systematic. Keep it (it is
+  part of the four-vector, though it acts as a quark/gluon handle), check the
+  jet-mass modelling in data, for example in the 5-jet control region, and
+  reduce the dependence by training on a mix of shower settings.
 - Weighted QCD acceptances are not compared between generator runs: the
   bias-weight normalisation is not consistent across runs.
 
