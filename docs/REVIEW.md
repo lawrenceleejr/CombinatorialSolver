@@ -89,6 +89,14 @@ the new network before adopting it. `src/hemimix.py` (`mix_replace`) and
 ## Data scaling
 
 Training on 3× the signal statistics (180k events, with QCD weighted 3× to keep
-the balance) does not improve signal-in-window at matched QCD pass rates. That
-holds within ±2 points at 2–8% QCD pass. At this model size the network is not
-limited by training statistics.
+the balance) does not improve signal-in-window at matched QCD pass rates:
+
+| QCD pass | 1× signal | 3× signal |
+|---|---|---|
+| 2% | 21% | 23% |
+| 5% | 35% | 32% |
+| 8% | 39% | 33% |
+
+The 3× run is lower at 5% and 8%, probably because its saved checkpoint sits at
+a different operating point. Either way, more statistics alone does not help at
+this model size.
