@@ -318,15 +318,17 @@ def robustness_plot(path, out, wp="0.01", name="robustness", cols=None):
             ci = MUTED if m.startswith("argmin") else ACCENT
             ax.plot([ri - ei, ri + ei], [yi, yi], color=ci, lw=0.8)
             ax.plot(ri, yi, "o", color=ci, ms=3.2)
-        ax.set_title(f"{titles.get(c, c)}\n≥ 6-jet acceptance ×{acc:.2f}", fontsize=8, loc="left",
-                     color=INK, linespacing=1.4)
+        # weighted QCD acceptances are not comparable between generator runs (bias weights)
+        sub = f"\n≥ 6-jet acceptance ×{acc:.2f}" if c.startswith("signal") else "\n "
+        ax.set_title(f"{titles.get(c, c)}{sub}", fontsize=8, loc="left", color=INK, linespacing=1.4)
         ax.spines["bottom"].set_bounds(lo, hi)
         ax.spines["left"].set_visible(False)
         ax.tick_params(axis="y", length=0)
         ax.tick_params(axis="x", labelsize=7.5)
     axes[0].set_xlim(lo - 0.03, hi + 0.03)
     axes[0].set_yticks(y)
-    axes[0].set_yticklabels(methods, fontsize=8)
+    pretty = {"7-jet gi+mh, before-FSR labels": "new 7-jet network (mass head)"}
+    axes[0].set_yticklabels([pretty.get(m, m) for m in methods], fontsize=8)
     axes[0].set_ylim(-0.6, len(methods) - 0.4)
     fig.supxlabel(f"selection efficiency in the varied sample / nominal, at the {float(wp):.1%} "
                   "nominal-QCD working point (±1σ MC statistics)", fontsize=8.5)
