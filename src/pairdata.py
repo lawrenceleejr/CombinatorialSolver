@@ -88,7 +88,7 @@ def _proxy_targets(tq, pt, eta, phi, m, mask, pmass, n_jets, sizes):
 
 
 def load_events(paths, n_jets=8, k=3, is_signal=True, max_events=None, sizes=None,
-                truth="auto", min_jets=None, max_jets=None, proxy=False):
+                truth="auto", min_jets=None, max_jets=None, proxy=False, n_assign=None):
     """truth: "quarks" (nearest-jet, merging allowed; needs truth/quarks),
     "targets" (TARGETS block, unique matching), or "auto" (quarks if present)."""
     sizes = tuple(tuple(x) for x in (sizes or ((k, k),)))
@@ -96,7 +96,8 @@ def load_events(paths, n_jets=8, k=3, is_signal=True, max_events=None, sizes=Non
     files = []
     for p in paths if isinstance(paths, (list, tuple)) else [paths]:
         files += sorted(glob.glob(p)) or [p]
-    lut = _lookup(n_jets, sizes)
+    na = n_assign or n_jets  # truth / interpretations use the leading na jets
+    lut = _lookup(na, sizes)
     out = {k_: [] for k_ in ["pt", "eta", "phi", "m", "mask", "target", "pmass", "w", "njall"]}
     for fp in files:
         with h5py.File(fp, "r") as f:
@@ -117,7 +118,7 @@ def load_events(paths, n_jets=8, k=3, is_signal=True, max_events=None, sizes=Non
                 tq = truth_sets_from_quarks(f["truth/quarks"][:], eta, phi, mask)
                 for i in range(n):
                     t = tq[i]
-                    if (t < 0).any() or (t >= n_jets).any():
+                    if (t < 0).any() or (t >= na).any():
                         continue
                     a_, b_ = set(t[:3].tolist()), set(t[3:].tolist())
                     if a_ & b_:
@@ -131,9 +132,9 @@ def load_events(paths, n_jets=8, k=3, is_signal=True, max_events=None, sizes=Non
                                else np.full(n, float(f.attrs.get("mass", 0.0))))
                     need = target < 0
                     pt_ = target.copy()
-                    pt_[need] = _proxy_targets(tq[need], pt[need, :n_jets], eta[need, :n_jets],
-                                               phi[need, :n_jets], m[need, :n_jets],
-                                               mask[need, :n_jets], pmass_f[need], n_jets, sizes)
+                    pt_[need] = _proxy_targets(tq[need], pt[need, :na], eta[need, :na],
+                                               phi[need, :na], m[need, :na],
+                                               mask[need, :na], pmass_f[need], na, sizes)
                     target = pt_
             elif is_signal and "TARGETS" in f:
                 tg = np.stack(
@@ -145,7 +146,7 @@ def load_events(paths, n_jets=8, k=3, is_signal=True, max_events=None, sizes=Non
                     if (t < 0).any() or not mask[i, t].all():
                         continue
                     s_ = inv[i, t]
-                    if (s_ >= n_jets).any() or len(set(s_.tolist())) != 2 * kk:
+                    if (s_ >= na).any() or len(set(s_.tolist())) != 2 * kk:
                         continue
                     ca = canonical(s_[:kk].tolist(), s_[kk:].tolist())
                     if ca in lut:

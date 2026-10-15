@@ -128,6 +128,8 @@ class PairNet(nn.Module):
         gated: bool = False,
         bg_beta: float = 1.0,
         bg_kappa: float = 30.0,
+        n_assign: int | None = None,
+        gate_interp: bool = False,
     ):
         super().__init__()
         self.n_jets, self.k = n_jets, k
@@ -137,10 +139,14 @@ class PairNet(nn.Module):
         self.use_null = use_null or gated
         self.gated = gated
         self.bg_beta, self.bg_kappa = bg_beta, bg_kappa
+        self.gate_interp = gate_interp
         use_null = self.use_null
+        # interpretations use the leading n_assign jets; the encoder (context)
+        # sees all n_jets
+        self.n_assign_jets = n_assign or n_jets
 
         self.sizes = tuple(tuple(x) for x in (sizes or ((k, k),)))
-        interp = enumerate_interpretations(n_jets, self.sizes)
+        interp = enumerate_interpretations(self.n_assign_jets, self.sizes)
         self.n_assign = len(interp)
         M1 = torch.zeros(self.n_assign, n_jets)
         M2 = torch.zeros(self.n_assign, n_jets)
@@ -196,8 +202,12 @@ class PairNet(nn.Module):
             nn.Linear(d_model, 1),
         )
         if use_null:
+            # the gate optionally also sees a softmax-pooled summary of the
+            # interpretation representations plus the best and log-sum-exp
+            # scores ("does a convincing pairing exist?")
+            n_in = 2 * d_model + (d_model + 2 if gate_interp else 0)
             self.null_mlp = nn.Sequential(
-                nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, 1)
+                nn.Linear(n_in, d_model), nn.GELU(), nn.Linear(d_model, 1)
             )
 
     # ------------------------------------------------------------------ features
@@ -277,7 +287,8 @@ class PairNet(nn.Module):
             h1, h2 = self.group_mlp(e1), self.group_mlp(e2)
             ik = e1.new_zeros(B, self.n_assign, 0)
         hr = self.rest_mlp(er)
-        s = self.score_mlp(torch.cat([h1 + h2, h1 * h2, hr, ik], -1)).squeeze(-1)
+        hid = self.score_mlp[:-1](torch.cat([h1 + h2, h1 * h2, hr, ik], -1))  # (B, A, d)
+        s = self.score_mlp[-1](hid).squeeze(-1)
         s = s.masked_fill(~valid, -1e4)
 
         out = {"assign_logits": s, "valid": valid, "m1": m1, "m2": m2, "ht": ht}
@@ -285,6 +296,12 @@ class PairNet(nn.Module):
             pooled = torch.cat(
                 [(x.sum(1) / mask.sum(1, keepdim=True).clamp(min=1)), x.max(1).values], -1
             )
+            if self.gate_interp:
+                wts = s.softmax(-1).unsqueeze(-1)
+                summ = (wts * hid).sum(1)
+                nvalid = valid.float().sum(-1, keepdim=True).clamp(min=1)
+                lse = torch.logsumexp(s, -1, keepdim=True) - torch.log(nvalid)
+                pooled = torch.cat([pooled, summ, s.max(-1, keepdim=True).values, lse], -1)
             null = self.null_mlp(pooled)
             if self.gated:
                 # gate: P(signal) = sigmoid(-null).  Mixture of the learned signal
@@ -413,7 +430,8 @@ def load_checkpoint(path):
         num_layers=a["layers"], dim_ff=2 * a["d_model"], dropout=0.0,
         use_pair_bias=not a["no_pair_bias"], use_group_kin=not a["no_group_kin"],
         use_null=not a["no_null"], sizes=sizes, gated=a.get("gated", False),
-        bg_beta=a.get("bg_beta", 1.0),
+        bg_beta=a.get("bg_beta", 1.0), n_assign=a.get("n_assign"),
+        gate_interp=a.get("gate_interp", False),
     )
     net.load_state_dict(ck["state"])
     net.eval()

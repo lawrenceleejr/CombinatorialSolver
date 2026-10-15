@@ -150,11 +150,11 @@ def load_split(args, sizes, which):
     if not files_s:
         return None
     parts = [load_events(files_s, args.n_jets, args.k, True, args.max_sig if which == "train" else None,
-                         sizes=sizes, min_jets=args.min_jets, proxy=args.proxy)]
+                         sizes=sizes, min_jets=args.min_jets, proxy=args.proxy, n_assign=args.n_assign)]
     if files_b:
         parts.append(load_events(files_b, args.n_jets, args.k, False,
                                  args.max_bkg if which == "train" else None,
-                                 sizes=sizes, min_jets=args.min_jets))
+                                 sizes=sizes, min_jets=args.min_jets, n_assign=args.n_assign))
     return concat(*parts) if len(parts) > 1 else parts[0]
 
 
@@ -164,6 +164,7 @@ def cached(args, sizes, which):
         return load_split(args, sizes, which)
     key = json.dumps([which, args.sig, args.bkg, args.val_sig, args.val_bkg, args.test_sig,
                       args.test_bkg, args.n_jets, args.k, str(sizes), args.min_jets, args.proxy,
+                      args.n_assign,
                       args.max_sig, args.max_bkg])
     path = os.path.join(args.cache_dir, f"{which}_{hashlib.md5(key.encode()).hexdigest()[:12]}.npz")
     if os.path.exists(path):
@@ -195,6 +196,10 @@ def main():
                     help="continue an interrupted run from <out>/last.pt (same --epochs)")
     ap.add_argument("--n-jets", type=int, default=8)
     ap.add_argument("--k", type=int, default=3)
+    ap.add_argument("--n-assign", type=int, default=None,
+                    help="pairings use the leading N jets; --n-jets sets the context (encoder) size")
+    ap.add_argument("--gate-interp", action="store_true",
+                    help="gate also sees the softmax-pooled interpretation summary and best scores")
     ap.add_argument("--sizes", default=None,
                     help='group-size hypotheses, e.g. "33,32" (3+3 and 3+2 for merged jets)')
     ap.add_argument("--epochs", type=int, default=30)
@@ -253,6 +258,7 @@ def main():
         num_layers=args.layers, dim_ff=2 * args.d_model, dropout=args.dropout,
         use_pair_bias=not args.no_pair_bias, use_group_kin=not args.no_group_kin,
         use_null=not args.no_null, sizes=sizes, gated=args.gated, bg_beta=args.bg_beta,
+        n_assign=args.n_assign, gate_interp=args.gate_interp,
     ).to(dev)
     A = net.n_assign
     print(f"params {sum(p.numel() for p in net.parameters())/1e3:.0f}k  interpretations {A}")
