@@ -191,7 +191,8 @@ def main():
     ap.add_argument("--select", choices=["sig_at_bkg", "combined"], default="sig_at_bkg")
     ap.add_argument("--select-bkg-pass", type=float, default=0.05,
                     help="weighted QCD pass rate at which --select sig_at_bkg compares epochs")
-    ap.add_argument("--resume", action="store_true", help="continue from <out>/last.pt")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue an interrupted run from <out>/last.pt (same --epochs)")
     ap.add_argument("--n-jets", type=int, default=8)
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--sizes", default=None,
@@ -264,6 +265,9 @@ def main():
     last = os.path.join(args.out, "last.pt")
     if args.resume and os.path.exists(last):
         ck = torch.load(last, map_location=dev, weights_only=False)
+        if ck["args"]["epochs"] != args.epochs:
+            sys.exit(f"--resume continues an interrupted run: use --epochs {ck['args']['epochs']} "
+                     f"as before (the one-cycle LR schedule is fixed to that length)")
         net.load_state_dict(ck["state"])
         opt.load_state_dict(ck["opt"])
         sched.load_state_dict(ck["sched"])
