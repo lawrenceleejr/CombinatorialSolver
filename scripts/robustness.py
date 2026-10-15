@@ -2,7 +2,7 @@
 Modelling robustness of the event selection.
 
 Every method's threshold is fixed on the NOMINAL held-out QCD at a weighted
-efficiency of 1%, 0.3% and 0.1% (as an analysis would fix its working point
+efficiency of 5%, 1%, 0.3% and 0.1% (as an analysis would fix its working point
 in simulation). The same thresholds are then applied to samples generated with
 different physics:
 
@@ -38,7 +38,7 @@ from search_study import mavg_asym, pairnet_outputs, shortest  # noqa: E402
 from src.features import classical_pairing, event_shape_features, pairing_features, stack  # noqa: E402
 from src.pairdata import load_events  # noqa: E402
 
-QCD_EFFS = (0.01, 0.003, 0.001)
+QCD_EFFS = (0.05, 0.01, 0.003, 0.001)
 
 
 def acceptance(path, is_signal):
@@ -240,7 +240,7 @@ def main():
         print(f"{sname:28s} N {len(nj):6d}  acc(>=6j) {acc:.4g}  <nj> {r['mean_njets']:.2f}", flush=True)
 
     # ratios to nominal
-    print("\nselection efficiency relative to nominal at the 1% / 0.3% / 0.1% QCD working points")
+    print("\nselection efficiency relative to nominal at the 5% / 1% / 0.3% / 0.1% QCD working points")
     for sname, r in res["samples"].items():
         if "nominal" in sname:
             continue
