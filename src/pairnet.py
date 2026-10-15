@@ -66,8 +66,28 @@ def enumerate_interpretations(n_jets: int, sizes=((3, 3),)) -> list[tuple[tuple,
     return out
 
 
+def asinh(x):
+    """asinh written with elementary ops (the TorchScript ONNX exporter has no Asinh)."""
+    return torch.sign(x) * torch.log(x.abs() + torch.sqrt(x * x + 1.0))
+
+
+def sinh(x):
+    e = torch.exp(x)
+    return 0.5 * (e - 1.0 / e)
+
+
+def cosh(x):
+    e = torch.exp(x)
+    return 0.5 * (e + 1.0 / e)
+
+
+def logaddexp(a, b):
+    """Stable log(exp(a) + exp(b)) with elementary ops (ONNX-exportable)."""
+    return torch.maximum(a, b) + torch.log1p(torch.exp(-(a - b).abs()))
+
+
 def to_cartesian(pt, eta, phi, m):
-    px, py, pz = pt * torch.cos(phi), pt * torch.sin(phi), pt * torch.sinh(eta)
+    px, py, pz = pt * torch.cos(phi), pt * torch.sin(phi), pt * sinh(eta)
     e = torch.sqrt(px**2 + py**2 + pz**2 + m**2)
     return torch.stack([e, px, py, pz], dim=-1)
 
@@ -213,7 +233,7 @@ class PairNet(nn.Module):
     # ------------------------------------------------------------------ features
     def _jet_features(self, pt, eta, phi, m, mask):
         lpt = torch.log(pt.clamp(min=1e-6))
-        e = torch.sqrt((pt * torch.cosh(eta)) ** 2 + m**2)
+        e = torch.sqrt((pt * cosh(eta)) ** 2 + m**2)
         le = torch.log(e.clamp(min=1e-6))
         f = torch.stack(
             [lpt, eta, torch.cos(phi), torch.sin(phi), le, m / pt.clamp(min=1e-6), lpt - le], -1
@@ -312,7 +332,7 @@ class PairNet(nn.Module):
                 ls = F.log_softmax(s, -1)
                 lb = F.log_softmax(out["bg_logits"], -1)
                 g = out["gate_logit"].unsqueeze(-1)
-                out["logits"] = torch.logaddexp(F.logsigmoid(g) + ls, F.logsigmoid(-g) + lb)
+                out["logits"] = logaddexp(F.logsigmoid(g) + ls, F.logsigmoid(-g) + lb)
             else:
                 out["logits"] = torch.cat([s, null], -1)
         else:
@@ -332,7 +352,7 @@ class PairNet(nn.Module):
     def _gkin(self, P, mg, m2pair, pidx, pmask, M):
         """Group kinematics from 4-vectors only."""
         pt = torch.sqrt(P[..., 1] ** 2 + P[..., 2] ** 2).clamp(min=1e-6)
-        eta = torch.asinh(P[..., 3] / pt)
+        eta = asinh(P[..., 3] / pt)
         # intra-group pairwise masses as fractions of the group mass^2 (sorted, padded)
         fr = m2pair[:, pidx[..., 0], pidx[..., 1]] * pmask  # (B, A, npair)
         fr = fr / (mg**2).unsqueeze(-1).clamp(min=1e-8)
@@ -347,7 +367,7 @@ class PairNet(nn.Module):
     def _ikin(P1, P2, Pr, m1, m2):
         def ptetaphi(P):
             pt = torch.sqrt(P[..., 1] ** 2 + P[..., 2] ** 2).clamp(min=1e-6)
-            return pt, torch.asinh(P[..., 3] / pt), torch.atan2(P[..., 2], P[..., 1])
+            return pt, asinh(P[..., 3] / pt), torch.atan2(P[..., 2], P[..., 1])
 
         pt1, eta1, phi1 = ptetaphi(P1)
         pt2, eta2, phi2 = ptetaphi(P2)
