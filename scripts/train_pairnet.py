@@ -20,7 +20,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.pairdata import concat, load_events, split, to_tensors  # noqa: E402
-from src.pairnet import PairNet, pairnet_loss  # noqa: E402
+from src.pairnet import PairNet, gated_loss, pairnet_loss  # noqa: E402
 
 
 def batches(t, idx, bs):
@@ -32,13 +32,14 @@ def batches(t, idx, bs):
 @torch.no_grad()
 def predict(net, t, bs=1024):
     net.eval()
-    outs = {"logits": [], "m1": [], "m2": [], "ht": []}
+    outs = {"logits": [], "m1": [], "m2": [], "ht": [], "gate_logit": [], "assign_logits": []}
     idx = torch.arange(len(t["pt"]))
     for b in batches(t, idx, bs):
         o = net(b["pt"], b["eta"], b["phi"], b["m"], b["mask"])
         for k in outs:
-            outs[k].append(o[k])
-    return {k: torch.cat(v) for k, v in outs.items()}
+            if k in o:
+                outs[k].append(o[k])
+    return {k: torch.cat(v) for k, v in outs.items() if v}
 
 
 def evaluate(net, t, A):
@@ -46,7 +47,12 @@ def evaluate(net, t, A):
     logits = o["logits"]
     best = logits[:, :A].argmax(1)
     p = logits.softmax(1)
-    psig = 1 - p[:, A] if logits.shape[1] == A + 1 else p[:, :A].max(1).values
+    if "gate_logit" in o:
+        psig = torch.sigmoid(o["gate_logit"])
+    elif logits.shape[1] == A + 1:
+        psig = 1 - p[:, A]
+    else:
+        psig = p[:, :A].max(1).values
     ar = torch.arange(len(best))
     m1, m2 = o["m1"][ar, best], o["m2"][ar, best]
     mavg = 0.5 * (m1 + m2) * o["ht"]
@@ -63,6 +69,9 @@ def evaluate(net, t, A):
     }
 
 
+ASYM_CUT = 0.1  # stand-in for the analysis preselection on mass asymmetry
+
+
 def summarize(ev):
     s = ev["is_signal"]
     tgt = ev["target"]
@@ -74,6 +83,14 @@ def summarize(ev):
         "eff_on_reconstructable": float((ev["best"][rec] == tgt[rec]).mean()) if rec.any() else 0.0,
     }
     r["eff_on_all_signal"] = r["eff_on_reconstructable"] * r["frac_reconstructable"]
+    pas = ev["asym"] < ASYM_CUT
+    r["sig_pass_asym"] = float(pas[s].mean()) if s.any() else 0.0
+    if s.any():
+        rel = ev["mavg"][s] / np.maximum(ev["pmass"][s], 1)
+        r["sig_pass_asym_in_window"] = float((pas[s] & (rel > 0.85) & (rel < 1.1)).mean())
+    if (~s).any():
+        r["bkg_pass_asym"] = float(pas[~s].mean())
+        r["bkg_mavg_median_passing"] = float(np.median(ev["mavg"][~s & pas])) if (pas & ~s).any() else 0.0
     if (~s).any() and s.any():
         from sklearn.metrics import roc_auc_score
 
@@ -106,6 +123,12 @@ def main():
     ap.add_argument("--no-pair-bias", action="store_true")
     ap.add_argument("--no-group-kin", action="store_true")
     ap.add_argument("--no-null", action="store_true")
+    ap.add_argument("--gated", action="store_true",
+                    help="signal scorer + fixed anti-signal choice, mixed by a learned P(signal) gate")
+    ap.add_argument("--proxy", action="store_true",
+                    help="train unmatched signal toward the most signal-like interpretation")
+    ap.add_argument("--w-proxy", type=float, default=0.5)
+    ap.add_argument("--bg-beta", type=float, default=1.0)
     ap.add_argument("--bkg-weight", type=float, default=1.0)
     ap.add_argument("--max-sig", type=int, default=None)
     ap.add_argument("--max-bkg", type=int, default=None)
@@ -121,7 +144,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     sig = load_events(args.sig, args.n_jets, args.k, True, args.max_sig, sizes=sizes,
-                      min_jets=args.min_jets)
+                      min_jets=args.min_jets, proxy=args.proxy)
     parts = [sig]
     if args.bkg:
         bkg = load_events(args.bkg, args.n_jets, args.k, False, args.max_bkg, sizes=sizes,
@@ -131,7 +154,7 @@ def main():
     if args.test_sig:
         tr, va, _ = split(data, fracs=(0.85, 0.15, 0.0), seed=args.seed)
         tparts = [load_events(args.test_sig, args.n_jets, args.k, True, None, sizes=sizes,
-                              min_jets=args.min_jets)]
+                              min_jets=args.min_jets, proxy=args.proxy)]
         if args.test_bkg:
             tparts.append(load_events(args.test_bkg, args.n_jets, args.k, False, None, sizes=sizes,
                                       min_jets=args.min_jets))
@@ -146,7 +169,7 @@ def main():
         n_jets=args.n_jets, k=args.k, d_model=args.d_model, nhead=args.heads,
         num_layers=args.layers, dim_ff=2 * args.d_model, dropout=args.dropout,
         use_pair_bias=not args.no_pair_bias, use_group_kin=not args.no_group_kin,
-        use_null=not args.no_null, sizes=sizes,
+        use_null=not args.no_null, sizes=sizes, gated=args.gated, bg_beta=args.bg_beta,
     )
     A = net.n_assign
     print(f"params {sum(p.numel() for p in net.parameters())/1e3:.0f}k  interpretations {A}")
@@ -163,7 +186,12 @@ def main():
         tot, nb = 0.0, 0
         for b in batches(ttr, perm, args.bs):
             o = net(b["pt"], b["eta"], b["phi"], b["m"], b["mask"])
-            loss = pairnet_loss(o, b["target"], b["is_signal"], bkg_weight=args.bkg_weight)
+            if args.gated:
+                loss = gated_loss(o, b["target"], b["is_signal"], w_proxy=args.w_proxy,
+                                  bkg_weight=args.bkg_weight)
+            else:
+                loss = pairnet_loss(o, b["target"].clamp(min=-1), b["is_signal"],
+                                    bkg_weight=args.bkg_weight)
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
@@ -176,7 +204,7 @@ def main():
         r.update(epoch=ep, loss=tot / nb, time=time.time() - t0)
         hist.append(r)
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()}), flush=True)
-        score = r["eff_on_reconstructable"] + (r.get("auc", 0) if args.bkg else 0)
+        score = r["eff_on_all_signal"] + (1 - r.get("bkg_pass_asym", 1)) * (1 if args.bkg else 0)
         if score > best_score:
             best_score = score
             best_state = {k: v.clone() for k, v in net.state_dict().items()}

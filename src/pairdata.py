@@ -43,8 +43,52 @@ def truth_sets_from_quarks(quarks, eta, phi, mask, dr_max=0.4):
     return np.where(np.take_along_axis(dr, j[..., None], -1)[..., 0] < dr_max, j, -1)
 
 
+def _proxy_targets(tq, pt, eta, phi, m, mask, pmass, n_jets, sizes):
+    """'Most signal-like' interpretation when the exact one is unavailable.
+
+    Score = (#jets grouped consistently with their true parent) first, then
+    closeness of m1, m2 to the true parent mass.  Returned encoded as -2 - idx.
+    Events with no usable interpretation get -1.
+    """
+    import torch
+
+    from .pairnet import minkowski_m2, to_cartesian
+
+    interp = enumerate_interpretations(n_jets, sizes)
+    A = len(interp)
+    M1 = np.zeros((A, n_jets))
+    M2 = np.zeros((A, n_jets))
+    for i, (a, b) in enumerate(interp):
+        M1[i, list(a)] = 1
+        M2[i, list(b)] = 1
+    nev = len(tq)
+    if nev == 0:
+        return np.zeros(0, dtype=np.int64)
+    # parent membership of each jet: bit 1 = parent 1, bit 2 = parent 2
+    par = np.zeros((nev, n_jets), dtype=np.int64)
+    for q in range(6):
+        j = tq[:, q]
+        ok = (j >= 0) & (j < n_jets)
+        par[np.where(ok)[0], j[ok]] |= 1 if q < 3 else 2
+    p1 = (par & 1 > 0).astype(float)
+    p2 = (par & 2 > 0).astype(float)
+    ov = np.maximum(p1 @ M1.T + p2 @ M2.T, p2 @ M1.T + p1 @ M2.T)  # (nev, A)
+    p4 = to_cartesian(*(torch.from_numpy(x).double() for x in (pt, eta, phi, m)))
+    p4 = (p4 * torch.from_numpy(mask).unsqueeze(-1)).numpy()
+    P1 = np.einsum("an,enc->eac", M1, p4)
+    P2 = np.einsum("an,enc->eac", M2, p4)
+    m1 = np.sqrt(np.maximum(minkowski_m2(torch.from_numpy(P1)).numpy(), 0))
+    m2 = np.sqrt(np.maximum(minkowski_m2(torch.from_numpy(P2)).numpy(), 0))
+    dist = (np.abs(m1 - pmass[:, None]) + np.abs(m2 - pmass[:, None])) / np.maximum(pmass[:, None], 1)
+    valid = (mask.astype(float) @ (M1 + M2).T) >= (M1 + M2).sum(1)[None] - 0.5
+    score = np.where(valid, ov * 100.0 - np.minimum(dist, 50.0), -np.inf)
+    best = score.argmax(1)
+    good = np.isfinite(score.max(1))
+    return np.where(good, -2 - best, -1)
+
+
 def load_events(paths, n_jets=8, k=3, is_signal=True, max_events=None, sizes=None,
-                truth="auto", min_jets=None, max_jets=None):
+                truth="auto", min_jets=None, max_jets=None, proxy=False):
     """truth: "quarks" (nearest-jet, merging allowed; needs truth/quarks),
     "targets" (TARGETS block, unique matching), or "auto" (quarks if present)."""
     sizes = tuple(tuple(x) for x in (sizes or ((k, k),)))
@@ -82,6 +126,15 @@ def load_events(paths, n_jets=8, k=3, is_signal=True, max_events=None, sizes=Non
                     if (len(ca[0]), len(ca[1])) not in allowed:
                         continue
                     target[i] = lut[ca]
+                if proxy:
+                    pmass_f = (f["EventVars/parent_mass"][:] if "EventVars/parent_mass" in f
+                               else np.full(n, float(f.attrs.get("mass", 0.0))))
+                    need = target < 0
+                    pt_ = target.copy()
+                    pt_[need] = _proxy_targets(tq[need], pt[need, :n_jets], eta[need, :n_jets],
+                                               phi[need, :n_jets], m[need, :n_jets],
+                                               mask[need, :n_jets], pmass_f[need], n_jets, sizes)
+                    target = pt_
             elif is_signal and "TARGETS" in f:
                 tg = np.stack(
                     [f[f"TARGETS/g{g}/j{j}"][:] for g in (1, 2) for j in (1, 2, 3)], 1

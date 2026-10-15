@@ -125,13 +125,19 @@ class PairNet(nn.Module):
         use_group_kin: bool = True,
         use_null: bool = True,
         sizes=None,
+        gated: bool = False,
+        bg_beta: float = 1.0,
+        bg_kappa: float = 30.0,
     ):
         super().__init__()
         self.n_jets, self.k = n_jets, k
         self.d, self.nhead = d_model, nhead
         self.use_pair_bias = use_pair_bias
         self.use_group_kin = use_group_kin
-        self.use_null = use_null
+        self.use_null = use_null or gated
+        self.gated = gated
+        self.bg_beta, self.bg_kappa = bg_beta, bg_kappa
+        use_null = self.use_null
 
         self.sizes = tuple(tuple(x) for x in (sizes or ((k, k),)))
         interp = enumerate_interpretations(n_jets, self.sizes)
@@ -280,10 +286,31 @@ class PairNet(nn.Module):
                 [(x.sum(1) / mask.sum(1, keepdim=True).clamp(min=1)), x.max(1).values], -1
             )
             null = self.null_mlp(pooled)
-            out["logits"] = torch.cat([s, null], -1)
+            if self.gated:
+                # gate: P(signal) = sigmoid(-null).  Mixture of the learned signal
+                # scorer and a fixed anti-signal choice (high asymmetry, low mass).
+                bgs = self.anti_signal_score(m1, m2, valid)
+                out["bg_logits"] = (self.bg_kappa * bgs).masked_fill(~valid, -1e4)
+                out["gate_logit"] = -null.squeeze(-1)
+                ls = F.log_softmax(s, -1)
+                lb = F.log_softmax(out["bg_logits"], -1)
+                g = out["gate_logit"].unsqueeze(-1)
+                out["logits"] = torch.logaddexp(F.logsigmoid(g) + ls, F.logsigmoid(-g) + lb)
+            else:
+                out["logits"] = torch.cat([s, null], -1)
         else:
             out["logits"] = s
         return out
+
+    def anti_signal_score(self, m1, m2, valid):
+        """Per-interpretation 'obviously not signal' score in [0, 1+beta]:
+        mass asymmetry + beta * (how low m1+m2 is within this event's range)."""
+        asym = (m1 - m2).abs() / (m1 + m2).clamp(min=1e-6)
+        msum = m1 + m2
+        big = torch.where(valid, msum, torch.full_like(msum, -1e9)).max(-1, keepdim=True).values
+        small = torch.where(valid, msum, torch.full_like(msum, 1e9)).min(-1, keepdim=True).values
+        low = (big - msum) / (big - small).clamp(min=1e-6)
+        return asym + self.bg_beta * low
 
     def _gkin(self, P, mg, m2pair, pidx, pmask, M):
         """Group kinematics from 4-vectors only."""
@@ -346,3 +373,31 @@ def pairnet_loss(out, target, is_sig, sig_weight=1.0, bkg_weight=1.0):
     if not has_null:
         w = w * rec.float()
     return (loss * w).sum() / w.sum().clamp(min=1e-6)
+
+
+def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0):
+    """Loss for the gated model.
+
+    target: (B,) exact-truth index for reconstructable signal, or the
+            "most signal-like" proxy index (encoded as -2 - idx) for signal whose
+            true interpretation is unavailable; ignored for background.
+    Signal  -> -log P_mix(target)      (exact: weight 1, proxy: w_proxy)
+    QCD     -> -log P_mix(argmax anti-signal score)
+    plus a BCE on the gate (signal vs QCD).
+    """
+    logp = out["logits"]
+    B = logp.shape[0]
+    exact = is_sig & (target >= 0)
+    proxy = is_sig & (target <= -2)
+    tgt = torch.where(proxy, -2 - target, target)
+    bg_t = out["bg_logits"].argmax(-1)
+    tgt = torch.where(is_sig, tgt, bg_t).clamp(min=0)
+    nll = -logp.gather(1, tgt.unsqueeze(1)).squeeze(1)
+    w = torch.where(exact, 1.0, torch.where(proxy, w_proxy, 0.0))
+    w = torch.where(is_sig, w, torch.full_like(w, bkg_weight))
+    lmix = (nll * w).sum() / w.sum().clamp(min=1e-6)
+    lgate = F.binary_cross_entropy_with_logits(
+        out["gate_logit"], is_sig.float(),
+        weight=torch.where(is_sig, 1.0, bkg_weight) * torch.ones(B, device=logp.device),
+    )
+    return lmix + w_gate * lgate
