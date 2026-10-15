@@ -110,33 +110,39 @@ def preselection_curve(runs, out, window=(0.85, 1.1)):
 
 def mavg_hist(runs, out, cut=0.1):
     for name, ev in runs.items():
-        s = ev["is_signal"]
-        pas = ev["asym"] < cut
-        fig, ax = plt.subplots(figsize=(4.2, 3))
-        bins = np.linspace(0, 2500, 51)
-        ctr = 0.5 * (bins[1:] + bins[:-1])
-        ymax = 0
-        for j, m in enumerate(np.unique(ev["pmass"][s])):
-            sel = s & (ev["pmass"] == m) & pas
-            h, _ = np.histogram(ev["mavg"][sel], bins)
-            h = h / max(s[ev["pmass"] == m].sum(), 1)
-            ax.step(ctr, h, where="mid", color=BLUE, lw=0.8, alpha=0.4 + 0.1 * j)
-            ymax = max(ymax, h.max())
-        if (~s).any():
-            w = ev["w"].astype(float)
-            h, _ = np.histogram(ev["mavg"][~s & pas], bins, weights=w[~s & pas])
-            h = h / w[~s].sum()
-            ax.step(ctr, h, where="mid", color=ACCENT, lw=1.2)
-            k = int(np.argmax(h))
-            ax.text(ctr[k] + 60, h[k], "QCD", color=ACCENT, fontsize=8)
-            ymax = max(ymax, h.max())
-        ax.text(0.98, 0.95, "signal, one curve per mass", color=BLUE, fontsize=8,
-                transform=ax.transAxes, ha="right")
-        ax.set_xlabel(r"$m_{avg}$ of chosen interpretation, $A<%.2g$ [GeV]" % cut)
-        ax.set_ylabel("fraction of all events per 50 GeV")
-        range_frame(ax, x=[0, 2500], y=[0, ymax])
-        slug = "".join(ch if ch.isalnum() else "_" for ch in name).strip("_")
-        save(fig, out, f"mavg_{slug}")
+        for logy in (False, True):
+            s = ev["is_signal"]
+            pas = ev["asym"] < cut
+            fig, ax = plt.subplots(figsize=(4.2, 3))
+            bins = np.linspace(0, 2500, 51)
+            ctr = 0.5 * (bins[1:] + bins[:-1])
+            ymax = 0
+            for j, m in enumerate(np.unique(ev["pmass"][s])):
+                sel = s & (ev["pmass"] == m) & pas
+                h, _ = np.histogram(ev["mavg"][sel], bins)
+                h = h / max(s[ev["pmass"] == m].sum(), 1)
+                ax.step(ctr, h, where="mid", color=BLUE, lw=0.8, alpha=0.4 + 0.1 * j)
+                ymax = max(ymax, h.max())
+            if (~s).any():
+                w = ev["w"].astype(float)
+                h, _ = np.histogram(ev["mavg"][~s & pas], bins, weights=w[~s & pas])
+                h = h / w[~s].sum()
+                ax.step(ctr, h, where="mid", color=ACCENT, lw=1.2)
+                k = int(np.argmax(h))
+                ax.text(ctr[k] + 60, h[k] * (1.3 if logy else 1.0), "QCD", color=ACCENT, fontsize=8)
+                ymax = max(ymax, h.max())
+            ax.text(0.98, 0.95, "signal, one curve per mass", color=BLUE, fontsize=8,
+                    transform=ax.transAxes, ha="right")
+            ax.set_xlabel(r"$m_{avg}$ of chosen interpretation, $A<%.2g$ [GeV]" % cut)
+            ax.set_ylabel("fraction of all events per 50 GeV")
+            if logy:
+                ax.set_yscale("log")
+                ax.set_ylim(1e-5, ymax * 2)
+                ax.spines["bottom"].set_bounds(0, 2500)
+            else:
+                range_frame(ax, x=[0, 2500], y=[0, ymax])
+            slug = "".join(ch if ch.isalnum() else "_" for ch in name).strip("_")
+            save(fig, out, f"mavg_{slug}" + ("_log" if logy else ""))
 
 
 def matching_breakdown(path, out):
