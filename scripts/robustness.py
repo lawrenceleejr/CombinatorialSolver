@@ -111,6 +111,40 @@ def load(paths, is_signal):
     return d
 
 
+def jet_variation(d, kind, seed=0):
+    """Detector-level variations of loaded (pT-sorted) events, no regeneration:
+      jes-3    all jets -3% (pT and mass); P(signal) is invariant by construction
+               (the network divides by HT) except for jets lost below 30 GeV
+      jes-fwd  -5% for |eta| > 1.5 only, which breaks that invariance
+      jer+5    an extra 5% Gaussian pT smearing per jet
+    Re-applies pT > 30 GeV, re-sorts, keeps >= 6-jet events; returns
+    (events, weighted fraction of events kept)."""
+    rng = np.random.default_rng(seed)
+    pt, m, eta, phi, mask = (d[k].copy() for k in ("pt", "m", "eta", "phi", "mask"))
+    f = {"jes-3": lambda: np.full(pt.shape, 0.97),
+         "jes-fwd": lambda: np.where(np.abs(eta) > 1.5, 0.95, 1.0),
+         "jer+5": lambda: np.clip(1 + 0.05 * rng.standard_normal(pt.shape), 0.5, 1.5)}[kind]()
+    pt, m = pt * f, m * f
+    mask &= pt > 30.0
+    order = np.argsort(np.where(mask, -pt, np.inf), 1, kind="stable")
+    tk = lambda x: np.take_along_axis(x, order, 1)
+    out = dict(d)
+    ms = tk(mask)
+    for k, v in (("pt", pt), ("m", m), ("eta", eta), ("phi", phi)):
+        out[k] = np.where(ms, tk(v), 0.0).astype(d[k].dtype)
+    out["mask"] = ms
+    out["njall"] = mask.sum(1)
+    if "tjets" in d:
+        inv = np.argsort(order, 1)  # old position -> new position
+        tj = np.maximum(d["tjets"], 0)
+        still = (d["tjets"] >= 0) & np.take_along_axis(mask, tj, 1)
+        out["tjets"] = np.where(still, np.take_along_axis(inv, tj, 1), -1)
+    keep = out["njall"] >= 6
+    n = len(keep)
+    return ({k: (v[keep] if isinstance(v, np.ndarray) and len(v) == n else v) for k, v in out.items()},
+            float((d["w"] * keep).sum() / d["w"].sum()))
+
+
 def weff(sel, w):
     s, tot = (w * sel).sum(), w.sum()
     return s / tot, np.sqrt((w**2 * sel).sum()) / tot
@@ -127,6 +161,8 @@ def main():
                                                      "data/robust/sig_m1000_as123.h5"])
     ap.add_argument("--var-qcd", nargs="+", default=["as150=data/robust/qcd_as150_*.h5",
                                                      "as123=data/robust/qcd_as123_*.h5"])
+    ap.add_argument("--jet-vars", nargs="*", default=["jes-3", "jes-fwd", "jer+5"],
+                    help="detector-level variations applied to the nominal samples")
     ap.add_argument("--gated", default="runs/gated_n7/model.pt")
     ap.add_argument("--v2", default="runs/v2_full/model.pt")
     ap.add_argument("--n6", default="runs/gated_n6/model.pt")
@@ -153,21 +189,30 @@ def main():
         cw = np.cumsum(dq["w"][o]) / dq["w"].sum()
         thr[m] = {e: float(s[o][min(np.searchsorted(cw, e), len(cw) - 1)]) for e in QCD_EFFS}
 
-    samples = {"signal, nominal": (a.nom_sig, True), "QCD, nominal": (a.nom_qcd, False)}
+    samples = {"signal, nominal": (a.nom_sig, True, None), "QCD, nominal": (a.nom_qcd, False, None)}
     for p in a.var_sig:
         if os.path.exists(p):
-            samples["signal, " + os.path.basename(p)[len("sig_m1000_"):-3]] = (p, True)
+            samples["signal, " + os.path.basename(p)[len("sig_m1000_"):-3]] = (p, True, None)
     for spec in a.var_qcd:
         name, pat = spec.split("=", 1)
         fs = sorted(glob.glob(pat))
         if fs:
-            samples["QCD, " + name] = (fs, False)
+            samples["QCD, " + name] = (fs, False, None)
+    for kind in a.jet_vars:
+        samples["signal, " + kind] = (a.nom_sig, True, kind)
+        samples["QCD, " + kind] = (a.nom_qcd, False, kind)
 
     res = {"thresholds": thr, "samples": {}}
-    for sname, (paths, is_sig) in samples.items():
+    cache = {}
+    for sname, (paths, is_sig, kind) in samples.items():
         plist = paths if isinstance(paths, list) else [paths]
-        d = load(plist, is_sig)
-        acc = np.mean([acceptance(p, is_sig) for p in plist])
+        key = (tuple(plist), is_sig)
+        if key not in cache:
+            cache[key] = (load(plist, is_sig), np.mean([acceptance(p, is_sig) for p in plist]))
+        d, acc = cache[key]
+        if kind:
+            d, kept = jet_variation(d, kind)
+            acc = acc * kept
         nj = d["njall"]
         r = {"n_events": int(len(nj)), "acceptance_6j": float(acc),
              "mean_njets": float(np.average(nj, weights=d["w"])),

@@ -278,14 +278,21 @@ def strategy_fom(path, out, methods=None, name="strategy_fom"):
     save(fig, out, name)
 
 
-def robustness_plot(path, out, wp="0.01", name="robustness"):
+ROBUST_TITLES = {"signal, chain500": "signal: g̃ → q̃q, q̃ → qq",
+                 "signal, as150": "signal: shower αs +10%", "signal, as123": "signal: shower αs −10%",
+                 "QCD, as150": "QCD: shower αs +10%", "QCD, as123": "QCD: shower αs −10%",
+                 "signal, jes-3": "signal: jet energy −3%", "QCD, jes-3": "QCD: jet energy −3%",
+                 "signal, jes-fwd": "signal: −5% at |η| > 1.5", "QCD, jes-fwd": "QCD: −5% at |η| > 1.5",
+                 "signal, jer+5": "signal: +5% jet smearing", "QCD, jer+5": "QCD: +5% jet smearing"}
+DETECTOR_VARS = ("jes-3", "jes-fwd", "jer+5")
+
+
+def robustness_plot(path, out, wp="0.01", name="robustness", cols=None):
     """Small multiples on one shared scale: selection efficiency in a varied
     sample relative to nominal, at a working point fixed on nominal QCD."""
     r = json.load(open(path))["samples"]
-    cols = [k for k in r if "nominal" not in k]
-    titles = {"signal, chain500": "signal: g̃ → q̃q, q̃ → qq",
-              "signal, as150": "signal: shower αs +10%", "signal, as123": "signal: shower αs −10%",
-              "QCD, as150": "QCD: shower αs +10%", "QCD, as123": "QCD: shower αs −10%"}
+    cols = [k for k in (cols or r) if "nominal" not in k and k in r]
+    titles = ROBUST_TITLES
     methods = [m for m in r[cols[0]]["methods"] if not m.startswith("argmin")]
     methods += [m for m in r[cols[0]]["methods"] if m.startswith("argmin")]
     y = np.arange(len(methods))[::-1]
@@ -393,7 +400,13 @@ def main():
     if a.fom:
         strategy_fom(a.fom, a.out)
     if a.robustness:
-        robustness_plot(a.robustness, a.out)
+        keys = list(json.load(open(a.robustness))["samples"])
+        det = [k for k in keys if k.split(", ")[1] in DETECTOR_VARS]
+        robustness_plot(a.robustness, a.out, name="robustness_physics", cols=[k for k in keys if k not in det])
+        if det:
+            robustness_plot(a.robustness, a.out, name="robustness_detector",
+                            cols=sorted(det, key=lambda k: (not k.startswith("signal"),
+                                                            DETECTOR_VARS.index(k.split(", ")[1]))))
     if a.truth_def:
         truth_definition_plot(a.truth_def, a.truth_def_mass, a.out)
     if runs:
