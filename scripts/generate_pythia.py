@@ -18,7 +18,14 @@ this repo (INPUTS/Source/*, TARGETS/g1|g2/j1..3), so files are drop-in:
                                               the quark has no matched jet
   EventVars/normweight                        generator weight
   EventVars/parent_mass                       true gluino masses (mean of two)
-  truth/quarks_{pt,eta,phi}                   (N, 6) decay quarks (g1 then g2)
+  truth/quarks                                (N, 6, 3) (pt, eta, phi) of the decay
+                                              quarks (g1 then g2) used for matching
+  truth/quarks_before_fsr, truth/quarks_after_fsr
+                                              both definitions (--truth-quarks): the
+                                              quark after recoil but before its own
+                                              shower (Pythia iBotCopy), or traced
+                                              through q -> q g to the end of its
+                                              shower (iBotCopyId)
 
 Usage:
   python scripts/generate_pythia.py --process signal --mass 1000 --n 20000 \
@@ -179,23 +186,25 @@ def make_pythia(args) -> pythia8.Pythia:
     return p
 
 
-def _decay_quarks_from(event, idx) -> list[int]:
-    """Final (bottom-copy) decay quarks reached from entry idx, following squarks."""
+def _decay_quarks_from(event, idx, after_fsr) -> list[int]:
+    """Decay quarks reached from entry idx, following squarks: the last carbon
+    copy (after recoil, before the quark's own FSR) or, with after_fsr, the last
+    same-id copy (traced through q -> q g to the end of the quark's shower)."""
     prt = event[idx]
     a = abs(prt.id())
     if 1 <= a <= 6:
-        return [prt.iBotCopyId()]
+        return [prt.iBotCopyId() if after_fsr else prt.iBotCopy()]
     if a in SQUARKS:
-        bot = event[prt.iBotCopyId()]
+        bot = event[prt.iBotCopyId()]  # the squark copy that decays
         d1, d2 = bot.daughter1(), bot.daughter2()
         out = []
         for d in range(d1, max(d1, d2) + 1):
-            out += _decay_quarks_from(event, d)
+            out += _decay_quarks_from(event, d, after_fsr)
         return out
     return []
 
 
-def decay_quarks(event) -> list[list[tuple[float, float, float]]] | None:
+def decay_quarks(event, after_fsr=False) -> list[list[tuple[float, float, float]]] | None:
     """Return [[(pt,eta,phi) x3] for each gluino] from the last gluino copies
     (directly, or through an intermediate squark)."""
     groups = []
@@ -210,7 +219,7 @@ def decay_quarks(event) -> list[list[tuple[float, float, float]]] | None:
         dl = list(range(d1, max(d1, d2) + 1))
         if any(abs(event[d].id()) == GLUINO for d in dl):
             continue
-        qi = [q for d in dl for q in _decay_quarks_from(event, d)]
+        qi = [q for d in dl for q in _decay_quarks_from(event, d, after_fsr)]
         if len(qi) != 3:
             return None
         groups.append([(event[q].pT(), event[q].eta(), event[q].phi()) for q in qi])
@@ -253,6 +262,8 @@ def main():
     ap.add_argument("--no-mpi", action="store_true")
     ap.add_argument("--no-had", action="store_true")
     ap.add_argument("--match-dr", type=float, default=0.4)
+    ap.add_argument("--truth-quarks", choices=["before_fsr", "after_fsr"], default="after_fsr",
+                    help="decay-quark momenta used for jet matching (both are stored)")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed + 7919)
@@ -260,7 +271,7 @@ def main():
     jet_def = fastjet.JetDefinition(fastjet.antikt_algorithm, 0.4)
 
     MJ = args.max_jets
-    out = {k: [] for k in ["pt", "eta", "phi", "mass", "w", "pm", "tg", "qk", "ntot"]}
+    out = {k: [] for k in ["pt", "eta", "phi", "mass", "w", "pm", "tg", "qk", "qb", "qa", "ntot"]}
     n_tried = 0
     t0 = time.time()
     while len(out["pt"]) < args.n:
@@ -270,9 +281,10 @@ def main():
         ev = p.event
         groups = None
         if args.process == "signal":
-            groups = decay_quarks(ev)
-            if groups is None:
+            alt = {f: decay_quarks(ev, after_fsr=f) for f in (False, True)}
+            if alt[False] is None or alt[True] is None:
                 continue
+            groups = alt[args.truth_quarks == "after_fsr"]
         parts = []
         for i in range(ev.size()):
             prt = ev[i]
@@ -316,7 +328,9 @@ def main():
 
         tg = np.full(6, -1, dtype=np.int32)
         qk = np.zeros((6, 3), dtype=np.float32)
+        qb, qa = np.zeros((6, 3), np.float32), np.zeros((6, 3), np.float32)
         if groups is not None:
+            qb[:], qa[:] = np.array(alt[False][0] + alt[False][1]), np.array(alt[True][0] + alt[True][1])
             # Unique greedy DeltaR matching of the 6 decay quarks to the
             # selected (true-level direction) jets.
             q = np.array(groups[0] + groups[1])  # (6,3)
@@ -338,6 +352,8 @@ def main():
             out["pm"].append(0.0)
         out["tg"].append(tg)
         out["qk"].append(qk)
+        out["qb"].append(qb)
+        out["qa"].append(qa)
 
         if len(out["pt"]) % 1000 == 0:
             el = time.time() - t0
@@ -361,6 +377,9 @@ def main():
                     f[f"TARGETS/g{gi + 1}/j{ji + 1}"] = tg[:, 3 * gi + ji]
         f["truth/jet_index"] = tg
         f["truth/quarks"] = np.stack(out["qk"])
+        f["truth/quarks_before_fsr"] = np.stack(out["qb"])
+        f["truth/quarks_after_fsr"] = np.stack(out["qa"])
+        f.attrs["truth_quarks"] = args.truth_quarks
         f["EventVars/normweight"] = np.array(out["w"], dtype=np.float64)
         f["EventVars/parent_mass"] = np.array(out["pm"], dtype=np.float32)
         f["EventVars/n_jets"] = np.array(out["ntot"], dtype=np.int32)
