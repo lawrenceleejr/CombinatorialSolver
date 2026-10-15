@@ -65,7 +65,8 @@ def build_jobs(a) -> list[tuple[str, list[str]]]:
             jobs.append((out, [py, GEN, "--process", "signal", "--mass", str(m),
                                "--width-frac", str(a.width_frac),
                                "--n", str(a.chunk), "--seed", str(seed_for("sig", m, c, a.seed_offset)),
-                               "--min-jets", str(a.min_jets), "--out", out] + common))
+                               "--min-jets", str(a.min_jets), "--truth-quarks", a.truth_quarks,
+                               "--out", out] + common))
     n_chunks = -(-a.qcd_events // a.chunk)
     for c in range(n_chunks):
         out = os.path.join(a.outdir, f"qcd_c{c}.h5")
@@ -92,6 +93,8 @@ def main():
     ap.add_argument("--qcd-min-jets", type=int, default=5, help="QCD: keep 5-jet events for the CR")
     ap.add_argument("--pthat-min", type=float, default=200.0)
     ap.add_argument("--bias-pow", type=float, default=2.0)
+    ap.add_argument("--truth-quarks", choices=["before_fsr", "after_fsr"], default="before_fsr",
+                    help="decay quarks used for jet matching (both are stored in every file)")
     ap.add_argument("--joblist", default=None, help="write commands to this file instead of running")
     a = ap.parse_args()
 

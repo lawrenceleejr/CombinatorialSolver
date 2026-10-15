@@ -161,7 +161,8 @@ def load_split(args, sizes, which):
     if not files_s:
         return None
     parts = [load_events(files_s, args.n_jets, args.k, True, args.max_sig if which == "train" else None,
-                         sizes=sizes, min_jets=args.min_jets, proxy=args.proxy, n_assign=args.n_assign)]
+                         sizes=sizes, min_jets=args.min_jets, proxy=args.proxy, n_assign=args.n_assign,
+                         truth_key=getattr(args, "truth_key", "truth/quarks"))]
     if files_b:
         parts.append(load_events(files_b, args.n_jets, args.k, False,
                                  args.max_bkg if which == "train" else None,
@@ -176,7 +177,7 @@ def cached(args, sizes, which):
     key = json.dumps([which, args.sig, args.bkg, args.val_sig, args.val_bkg, args.test_sig,
                       args.test_bkg, args.n_jets, args.k, str(sizes), args.min_jets, args.proxy,
                       args.n_assign,
-                      args.max_sig, args.max_bkg])
+                      args.max_sig, args.max_bkg, getattr(args, "truth_key", "truth/quarks")])
     path = os.path.join(args.cache_dir, f"{which}_{hashlib.md5(key.encode()).hexdigest()[:12]}.npz")
     if os.path.exists(path):
         print(f"cache hit {path}", flush=True)
@@ -237,6 +238,8 @@ def main():
     ap.add_argument("--max-sig", type=int, default=None)
     ap.add_argument("--max-bkg", type=int, default=None)
     ap.add_argument("--min-jets", type=int, default=6, help="signal-region jet multiplicity")
+    ap.add_argument("--truth-key", default="truth/quarks",
+                    help="decay quarks that define the true jets, e.g. truth/quarks_before_fsr")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", required=True)
