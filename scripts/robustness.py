@@ -156,10 +156,10 @@ def main():
     ap.add_argument("--nom-qcd", nargs="+", default=[f"data/pythia/qcd_s{i}.h5" for i in (8, 9, 10, 15, 16)])
     ap.add_argument("--thr-qcd", nargs="+", default=None,
                     help="QCD that fixes the working points (default: --nom-qcd)")
-    ap.add_argument("--var-sig", nargs="+", default=["data/robust/sig_m1000_chain500.h5",
+    ap.add_argument("--var-sig", nargs="*", default=["data/robust/sig_m1000_chain500.h5",
                                                      "data/robust/sig_m1000_as150.h5",
                                                      "data/robust/sig_m1000_as123.h5"])
-    ap.add_argument("--var-qcd", nargs="+", default=["as150=data/robust/qcd_as150_*.h5",
+    ap.add_argument("--var-qcd", nargs="*", default=["as150=data/robust/qcd_as150_*.h5",
                                                      "as123=data/robust/qcd_as123_*.h5"])
     ap.add_argument("--jet-vars", nargs="*", default=["jes-3", "jes-fwd", "jer+5"],
                     help="detector-level variations applied to the nominal samples")
