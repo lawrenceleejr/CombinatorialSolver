@@ -57,7 +57,12 @@ def pairnet_outputs(path, d, bs=2048):
         sig_best.append(o["assign_logits"].argmax(1))
         mix_best.append(o["logits"][:, :A].argmax(1))
         gate.append(torch.sigmoid(o["gate_logit"]) if "gate_logit" in o else 1 - o["logits"].softmax(1)[:, -1])
-    return torch.cat(sig_best).numpy(), torch.cat(mix_best).numpy(), torch.cat(gate).numpy()
+    # map interpretation indices to jet-index triplets with THIS network's table
+    table = enumerate_interpretations(net.n_assign_jets, net.sizes)
+    g1 = np.array([a for a, _ in table])
+    g2 = np.array([b for _, b in table])
+    sb, mb = torch.cat(sig_best).numpy(), torch.cat(mix_best).numpy()
+    return (g1[sb], g2[sb]), (g1[mb], g2[mb]), torch.cat(gate).numpy(), sb
 
 
 def shortest(v, frac):
@@ -186,9 +191,9 @@ def main():
     ckpts = {"gated PairNet": a.gated}
     ckpts.update(dict(x.split("=", 1) for x in a.extra))
     for name, path in ckpts.items():
-        sb, mb, gate = pairnet_outputs(path, d)
-        m_mix, as_mix = mavg_asym(d, G1[mb], G2[mb])
-        m_sig, _ = mavg_asym(d, G1[sb], G2[sb])
+        (sg1, sg2), (mg1, mg2), gate, sb = pairnet_outputs(path, d)
+        m_mix, as_mix = mavg_asym(d, mg1, mg2)
+        m_sig, _ = mavg_asym(d, sg1, sg2)
         methods[f"{name}, asym cut"] = (-as_mix, m_mix)
         methods[f"{name}, gate cut"] = (gate, m_sig)
         if name == "gated PairNet" and os.path.exists(a.stack):
