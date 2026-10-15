@@ -402,7 +402,9 @@ def main():
     if a.robustness:
         keys = list(json.load(open(a.robustness))["samples"])
         det = [k for k in keys if k.split(", ")[1] in DETECTOR_VARS]
-        robustness_plot(a.robustness, a.out, name="robustness_physics", cols=[k for k in keys if k not in det])
+        phys = [k for k in keys if k not in det and "nominal" not in k]
+        if phys:
+            robustness_plot(a.robustness, a.out, name="robustness_physics", cols=phys)
         if det:
             robustness_plot(a.robustness, a.out, name="robustness_detector",
                             cols=sorted(det, key=lambda k: (not k.startswith("signal"),
