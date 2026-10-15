@@ -133,6 +133,8 @@ def main():
     ap.add_argument("--bkg", nargs="+", default=None)
     ap.add_argument("--gated", default="runs/gated_n7/model.pt")
     ap.add_argument("--extra", nargs="*", default=[], help="name=path to more PairNet checkpoints")
+    ap.add_argument("--ensemble", nargs="*", default=[],
+                    help="7-jet gated checkpoints whose gate and pairing probabilities are averaged")
     ap.add_argument("--legacy", default="runs/legacy_asis/model.pt")
     ap.add_argument("--bdt", default="runs/bdt/bdt.pkl")
     ap.add_argument("--stack", default="runs/stack/stack.pkl")
@@ -216,9 +218,21 @@ def main():
         if "stacked (expert + PairNet), PairNet pairing" in methods:
             methods["stacked, learned mass"] = (methods["stacked (expert + PairNet), PairNet pairing"][0], m_reg)
 
+    if a.ensemble:
+        from mass_estimators import net_probs
+        Ps, gs = [], []
+        for path in a.ensemble:
+            net_e, _ = load_checkpoint(path)
+            P_e, g_e = net_probs(net_e, d)
+            Ps.append(P_e)
+            gs.append(g_e)
+        Pm, gm = np.mean(Ps, 0), np.mean(gs, 0)
+        be = Pm.argmax(1)
+        methods[f"ensemble of {len(Ps)}, gate cut"] = (gm, mavg_asym(d, G1[be], G2[be])[0])
+
     from sklearn.metrics import roc_auc_score
     res = {}
-    floor_variants = [k for k in methods if k.startswith(("gated PairNet, gate cut", "stacked", "v2"))
+    floor_variants = [k for k in methods if k.startswith(("gated PairNet, gate cut", "stacked", "v2", "ensemble"))
                       and "TRUTH" not in k]
     for name in floor_variants:
         methods[name + " + HT floor"] = methods[name] + ("htfloor",)
