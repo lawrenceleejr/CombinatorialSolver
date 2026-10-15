@@ -125,7 +125,8 @@ def main():
     meta = {
         "description": "Gated PairNet: pair-production interpretation + event-level P(signal) from jet four-vectors",
         "input": f"four_momenta (batch,{J},4) = (E,px,py,pz) of the leading {J} jets, pT-ordered, zero-padded",
-        "assignment_order": "src.combinatorics.enumerate_assignments(7): index -> (isr, group1, group2)",
+        "assignment_order": f"src.combinatorics.enumerate_assignments({net.n_assign_jets}): "
+                            "index -> (isr, group1, group2)",
         "outputs": "logits: gated mixture log-probs; p_signal: event P(signal); "
                    "signal_logits: signal scorer; masses: (m1, m2) per assignment in input units"
                    + ("; m_est: learned resonance mass in input units" if net.mass_head else ""),
@@ -138,7 +139,8 @@ def main():
         p.key, p.value = k, str(v)
     onnx.checker.check_model(model)
     onnx.save(model, a.out)
-    spec = {**meta, "assignments": [[isr, list(g1), list(g2)] for isr, g1, g2 in enumerate_assignments(7)]}
+    spec = {**meta, "assignments": [[isr, list(g1), list(g2)]
+                                    for isr, g1, g2 in enumerate_assignments(net.n_assign_jets)]}
     json.dump(spec, open(a.out.replace(".onnx", ".json"), "w"), indent=1)
     print(f"wrote {a.out} ({os.path.getsize(a.out) / 1e6:.1f} MB) and its .json spec")
 
