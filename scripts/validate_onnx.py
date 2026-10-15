@@ -37,7 +37,7 @@ def run_onnx(sess, x, bs=1000):
 @torch.no_grad()
 def run_torch(wrap, x, bs=1000):
     parts = [[t.numpy() for t in wrap(torch.from_numpy(x[i: i + bs]))] for i in range(0, len(x), bs)]
-    return [np.concatenate([p[k] for p in parts]) for k in range(4)]
+    return [np.concatenate([p[k] for p in parts]) for k in range(len(parts[0]))]
 
 
 def main():
@@ -56,12 +56,15 @@ def main():
     on = run_onnx(sess, x)
 
     wrap = PairNetONNX(net).eval()
-    tl, tp, ts, tm = run_torch(wrap, x)
+    tout = run_torch(wrap, x)
+    tl, tp, ts, tm = tout[:4]
     fin = tl > -1e3
     print("1. ONNX vs PyTorch: max|d logits| %.2e  max|d p_signal| %.2e  max|d signal_logits| %.2e  "
           "max rel|d masses| %.2e" % (np.abs(on["logits"] - tl)[fin].max(), np.abs(on["p_signal"] - tp).max(),
                                      np.abs(on["signal_logits"] - ts)[fin].max(),
                                      (np.abs(on["masses"] - tm) / np.maximum(tm, 1)).max()))
+    if "m_est" in on:
+        print("   max rel|d m_est| %.2e" % (np.abs(on["m_est"] - tout[4]) / np.maximum(tout[4], 1)).max())
     print("   argmax agreement: logits %.4f, signal_logits %.4f" % (
         np.mean(on["logits"].argmax(1) == tl.argmax(1)), np.mean(on["signal_logits"].argmax(1) == ts.argmax(1))))
 
@@ -99,6 +102,15 @@ def main():
     w = np.where(s, 1.0 / s.sum(), d["w"] / d["w"][~s].sum())
     print(f"4. 1 TeV signal: exact pairing {exact[rec].mean():.3f} of available, {exact[s].mean():.3f} of all; "
           f"P(signal) AUC vs QCD {roc_auc_score(s, on['p_signal'], sample_weight=w):.4f}")
+    if "m_est" in on:
+        def hw(r):
+            r = np.sort(r)
+            k = int(0.68 * len(r))
+            i = int(np.argmin(r[k:] - r[:-k]))
+            return (r[i + k] - r[i]) / (r[i + k] + r[i])
+        best = on["masses"][np.arange(len(x)), on["signal_logits"].argmax(1)].mean(1)
+        print(f"   1 TeV signal mass peak (68% relative half-width): m_est {hw(on['m_est'][s] / 1000):.3f}, "
+              f"m_avg of chosen pairing {hw(best[s] / 1000):.3f}")
 
 
 if __name__ == "__main__":

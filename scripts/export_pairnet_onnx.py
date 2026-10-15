@@ -24,6 +24,10 @@ so argmax gives the index your code already decodes into (ISR, group1, group2))
                                 a p_signal cut).
   masses         (batch, 70, 2) m1, m2 of the two triplets of every assignment,
                                 in the input's units.
+  m_est          (batch,)       only for checkpoints trained with --mass-head: the
+                                learned resonance-mass estimate (HT x exp(learned
+                                log M/HT)), in the input's units; a narrower peak
+                                than m_avg of the chosen pairing.
 """
 
 import argparse
@@ -79,6 +83,8 @@ class PairNetONNX(nn.Module):
         p_signal = torch.sigmoid(out["gate_logit"])
         masses = torch.stack([out["m1"].index_select(1, perm) * ht,
                               out["m2"].index_select(1, perm) * ht], -1)
+        if "log_m_over_ht" in out:
+            return logits, p_signal, signal_logits, masses, torch.exp(out["log_m_over_ht"]) * out["ht"]
         return logits, p_signal, signal_logits, masses
 
 
@@ -102,7 +108,7 @@ def main():
     example = torch.tensor(np.stack([np.sqrt(px**2 + py**2 + pz**2 + 25), px, py, pz], -1), dtype=torch.float32)
 
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    names_out = ["logits", "p_signal", "signal_logits", "masses"]
+    names_out = ["logits", "p_signal", "signal_logits", "masses"] + (["m_est"] if net.mass_head else [])
     torch.onnx.export(
         wrapper, (example,), a.out,
         input_names=["four_momenta"], output_names=names_out,
@@ -121,9 +127,10 @@ def main():
         "input": f"four_momenta (batch,{J},4) = (E,px,py,pz) of the leading {J} jets, pT-ordered, zero-padded",
         "assignment_order": "src.combinatorics.enumerate_assignments(7): index -> (isr, group1, group2)",
         "outputs": "logits: gated mixture log-probs; p_signal: event P(signal); "
-                   "signal_logits: signal scorer; masses: (m1, m2) per assignment in input units",
+                   "signal_logits: signal scorer; masses: (m1, m2) per assignment in input units"
+                   + ("; m_est: learned resonance mass in input units" if net.mass_head else ""),
         "checkpoint": a.model, "git_commit": commit,
-        "training_args": json.dumps({k: args[k] for k in ("n_jets", "n_assign", "gate_interp", "d_model", "layers",
+        "training_args": json.dumps({k: args[k] for k in ("n_jets", "n_assign", "gate_interp", "mass_head", "d_model", "layers",
                                                           "epochs", "sig", "bkg") if k in args}),
     }
     for k, v in meta.items():
