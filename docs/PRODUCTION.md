@@ -31,8 +31,8 @@ Measured throughput per core:
 - QCD: ~9 kept events/s, about 30 core-hours per million. Roughly 40% of kept
   QCD events have ≥ 6 jets, i.e. are in the signal region.
 
-The example above is about 210 core-hours of signal and 30 of QCD, so about 4
-hours on 64 cores. QCD is the expensive sample per useful event; produce more
+The example above is about 11 core-hours of signal (2.1M events) and 30 of QCD,
+so under an hour on 64 cores. QCD is the expensive sample per useful event; produce more
 of it if the high-mass tail is statistics-limited (the review hit that above
 1.5 TeV).
 
