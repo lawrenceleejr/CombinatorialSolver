@@ -353,3 +353,29 @@ per varied QCD sample).
 
 Figures: `docs/figures/robustness_physics.pdf`, `docs/figures/robustness_detector.pdf`,
 `docs/figures/truth_definition.pdf`.
+
+### Is the pairing near its limit? (follow-up)
+
+Exact pairing is ~30% of the events whose true pairing is in the leading 7
+jets. Four independent tests (before-FSR truth, held-out events) say this is
+close to what the four-vectors allow:
+
+| test (of available events) | 500 GeV | 1 TeV | 2 TeV |
+|---|---|---|---|
+| recommended network (gate + mass head) | 27.3% | 28.9% | 30.4% |
+| pairing-only network, no background or gate | 28.1% | 28.3% | 30.1% |
+| same, 3× signal statistics | plateaus at 30% on validation, same as 1× | | |
+| gradient-boosted ranker on explicit per-pairing features | 27.0% | 27.9% | 28.7% |
+| mass oracle that knows M, targets 0.94 M | 37.3% | 33.2% | 35.5% |
+
+- Training-set accuracy equals test accuracy (29%), so it is not overfitting,
+  and 3× data does not help: not a statistics limit.
+- Only 44–58% of "available" truths have both triplets within ±8% of 0.94 M;
+  the rest lost energy to FSR or a merged jet, and are found 12–16% of the
+  time. On the mass-consistent ones the network gets 62–66% with exactly 6
+  jets and 37–41% with a 7th jet.
+- Half the misses choose the wrong jet to leave out (ISR); most others move a
+  soft jet (~7% of HT) between triplets, which barely changes the masses.
+- The only method above ~30% knows the true mass. A pairing conditioned on the
+  mass hypothesis being tested (natural in a bump hunt) could gain up to
+  4–9 points; nothing else tested does.
