@@ -334,7 +334,7 @@ def main():
             sched.step()
             tot += loss.detach()
             nb += 1
-        ev = evaluate(net, tva, A, args.eval_bs, args.amp)
+        ev = evaluate(net, tva, A, args.eval_bs)  # fp32: bf16 gate outputs tie at thresholds
         r = summarize(ev)
         r.update(epoch=ep, loss=float(tot) / nb, time=time.time() - t0)
         hist.append(r)
@@ -354,7 +354,7 @@ def main():
     net.load_state_dict(best_state)
     torch.save({"state": {k: v.cpu() for k, v in best_state.items()}, "args": vars(args)},
                os.path.join(args.out, "model.pt"))
-    ev = evaluate(net, tte, A, args.eval_bs, args.amp)
+    ev = evaluate(net, tte, A, args.eval_bs)
     np.savez_compressed(os.path.join(args.out, "eval.npz"), **ev)
     final = summarize(ev)
     print("TEST", json.dumps(final), flush=True)
