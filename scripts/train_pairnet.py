@@ -340,9 +340,16 @@ def main():
         print(f"resumed at epoch {start}", flush=True)
 
     has_bkg = bool((~va["is_signal"]).any())
+    # fixed training subset with the validation set's signal and QCD counts, so that training and
+    # validation losses are directly comparable (overtraining check)
     g = torch.Generator().manual_seed(1234)
-    sub = torch.randperm(len(tr["pt"]), generator=g)[: len(va["pt"])].to(dev)
-    ttr_sub = {k: v[sub] for k, v in ttr.items()}  # fixed training subset for overtraining checks
+    tr_sig = torch.from_numpy(np.asarray(tr["is_signal"]))
+    parts = []
+    for want, cls in ((int(va["is_signal"].sum()), True), (int((~va["is_signal"]).sum()), False)):
+        idx = torch.nonzero(tr_sig == cls).squeeze(1)
+        parts.append(idx[torch.randperm(len(idx), generator=g)[:want]])
+    sub = torch.cat(parts).to(dev)
+    ttr_sub = {k: v[sub] for k, v in ttr.items()}
     for ep in range(start, args.epochs):
         net.train()
         t0 = time.time()
