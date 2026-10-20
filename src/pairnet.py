@@ -433,7 +433,7 @@ def pairnet_loss(out, target, is_sig, sig_weight=1.0, bkg_weight=1.0):
 
 
 def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pmass=None, w_mass=1.0,
-               w_sym=0.0, w_qcd_asym=0.0):
+               w_sym=0.0, w_qcd_asym=0.0, w_win=0.0, w_qcd_pass=0.0, asym_cut=0.1, window=(0.85, 1.1)):
     """Loss for the gated model.
 
     target: (B,) exact-truth index for reconstructable signal, or the
@@ -446,6 +446,9 @@ def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pma
     interpretation under the mixture, pushing signal onto symmetric pairings;
     w_qcd_asym > 0 adds, for QCD, the expected (1 - asymmetry), pushing QCD onto
     asymmetric ones.
+    w_win > 0 rewards, for signal, the expected fraction of probability on interpretations
+    with asymmetry < asym_cut and m_avg in window * M (the analysis selection itself);
+    w_qcd_pass > 0 penalises, for QCD, the expected fraction passing asymmetry < asym_cut.
     """
     logp = out["logits"]
     B = logp.shape[0]
@@ -477,6 +480,17 @@ def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pma
         asym = (out["m1"] - out["m2"]).abs() / (out["m1"] + out["m2"]).clamp(min=1e-6)
         p = logp[:, :A].exp()
         loss = loss + w_qcd_asym * (p * (1 - asym)).sum(-1)[~is_sig].mean()
+    if (w_win > 0 and is_sig.any() and pmass is not None) or (w_qcd_pass > 0 and (~is_sig).any()):
+        A = out["m1"].shape[1]
+        asym = (out["m1"] - out["m2"]).abs() / (out["m1"] + out["m2"]).clamp(min=1e-6)
+        p = logp[:, :A].exp()
+        sym = (asym < asym_cut).float()
+        if w_win > 0 and is_sig.any() and pmass is not None:
+            rel = 0.5 * (out["m1"] + out["m2"]) * out["ht"].unsqueeze(-1) / pmass.clamp(min=1.0).unsqueeze(-1)
+            win = sym * ((rel > window[0]) & (rel < window[1])).float()
+            loss = loss - w_win * (p * win).sum(-1)[is_sig].mean()
+        if w_qcd_pass > 0 and (~is_sig).any():
+            loss = loss + w_qcd_pass * (p * sym).sum(-1)[~is_sig].mean()
     return loss
 
 

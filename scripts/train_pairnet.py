@@ -69,7 +69,8 @@ def batch_loss(net, b, args):
     if args.gated:
         return gated_loss(o, b["target"], b["is_signal"], w_proxy=args.w_proxy,
                           bkg_weight=args.bkg_weight, pmass=b["pmass"], w_mass=args.w_mass,
-                          w_sym=args.w_sym, w_qcd_asym=args.w_qcd_asym)
+                          w_sym=args.w_sym, w_qcd_asym=args.w_qcd_asym,
+                          w_win=args.w_win, w_qcd_pass=args.w_qcd_pass)
     return pairnet_loss(o, b["target"].clamp(min=-1), b["is_signal"], bkg_weight=args.bkg_weight)
 
 
@@ -230,7 +231,7 @@ def main():
     ap.add_argument("--amp", action="store_true", help="bfloat16 autocast on CUDA")
     ap.add_argument("--eval-bs", type=int, default=4096)
     ap.add_argument("--cache-dir", default=None, help="cache parsed arrays here (.npz)")
-    ap.add_argument("--select", choices=["sig_at_bkg", "combined"], default="sig_at_bkg")
+    ap.add_argument("--select", choices=["sig_at_bkg", "combined", "win_a01"], default="sig_at_bkg")
     ap.add_argument("--select-bkg-pass", type=float, default=0.05,
                     help="weighted QCD pass rate at which --select sig_at_bkg compares epochs")
     ap.add_argument("--resume", action="store_true",
@@ -248,6 +249,10 @@ def main():
                     help="signal: weight of the expected mass asymmetry of the chosen interpretation")
     ap.add_argument("--w-qcd-asym", type=float, default=0.0,
                     help="QCD: weight of the expected (1 - mass asymmetry) of the chosen interpretation")
+    ap.add_argument("--w-win", type=float, default=0.0,
+                    help="signal: reward on the expected fraction passing asym < 0.1 with m_avg in [0.85, 1.1] M")
+    ap.add_argument("--w-qcd-pass", type=float, default=0.0,
+                    help="QCD: penalty on the expected fraction passing asym < 0.1")
     ap.add_argument("--gate-interp", action="store_true",
                     help="gate also sees the softmax-pooled interpretation summary and best scores")
     ap.add_argument("--sizes", default=None,
@@ -366,7 +371,10 @@ def main():
         hist.append(r)
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()}),
               flush=True)
-        if args.select == "sig_at_bkg" and has_bkg:
+        if args.select == "win_a01" and has_bkg:
+            # signal in mass window passing asym < 0.1, over sqrt(weighted QCD passing asym < 0.1)
+            score = r["sig_pass_asym_in_window"] / math.sqrt(max(r["bkg_pass_asym"], 1e-6))
+        elif args.select == "sig_at_bkg" and has_bkg:
             score = sig_at_bkg_curve(ev, (args.select_bkg_pass,))[f"{args.select_bkg_pass:g}"]
         else:
             score = r["eff_on_all_signal"] + (1 - r.get("bkg_pass_asym", 1)) * has_bkg
