@@ -215,6 +215,8 @@ def main():
     ap.add_argument("--mass-head", action="store_true",
                     help="also learn a scale-free mass estimate log(M/HT) (output m_est)")
     ap.add_argument("--w-mass", type=float, default=1.0)
+    ap.add_argument("--w-sym", type=float, default=0.0,
+                    help="signal: weight of the expected mass asymmetry of the chosen interpretation")
     ap.add_argument("--gate-interp", action="store_true",
                     help="gate also sees the softmax-pooled interpretation summary and best scores")
     ap.add_argument("--sizes", default=None,
@@ -315,7 +317,8 @@ def main():
                      for k, v in o.items()}
                 if args.gated:
                     loss = gated_loss(o, b["target"], b["is_signal"], w_proxy=args.w_proxy,
-                                      bkg_weight=args.bkg_weight, pmass=b["pmass"], w_mass=args.w_mass)
+                                      bkg_weight=args.bkg_weight, pmass=b["pmass"], w_mass=args.w_mass,
+                                      w_sym=args.w_sym)
                 else:
                     loss = pairnet_loss(o, b["target"].clamp(min=-1), b["is_signal"],
                                         bkg_weight=args.bkg_weight)

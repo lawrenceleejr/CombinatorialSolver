@@ -432,7 +432,8 @@ def pairnet_loss(out, target, is_sig, sig_weight=1.0, bkg_weight=1.0):
     return (loss * w).sum() / w.sum().clamp(min=1e-6)
 
 
-def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pmass=None, w_mass=1.0):
+def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pmass=None, w_mass=1.0,
+               w_sym=0.0):
     """Loss for the gated model.
 
     target: (B,) exact-truth index for reconstructable signal, or the
@@ -441,6 +442,8 @@ def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pma
     Signal  -> -log P_mix(target)      (exact: weight 1, proxy: w_proxy)
     QCD     -> -log P_mix(argmax anti-signal score)
     plus a BCE on the gate (signal vs QCD).
+    w_sym > 0 adds, for signal, the expected mass asymmetry of the chosen
+    interpretation under the mixture, pushing signal onto symmetric pairings.
     """
     logp = out["logits"]
     B = logp.shape[0]
@@ -462,6 +465,11 @@ def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pma
         # L1 (median) regression of log(M/HT) on signal events
         tgt_m = torch.log(pmass.clamp(min=1.0) / out["ht"].clamp(min=1e-6))
         loss = loss + w_mass * (out["log_m_over_ht"] - tgt_m).abs()[is_sig].mean()
+    if w_sym > 0 and is_sig.any():
+        A = out["m1"].shape[1]
+        asym = (out["m1"] - out["m2"]).abs() / (out["m1"] + out["m2"]).clamp(min=1e-6)
+        p = logp[:, :A].exp()
+        loss = loss + w_sym * (p * asym).sum(-1)[is_sig].mean()
     return loss
 
 
