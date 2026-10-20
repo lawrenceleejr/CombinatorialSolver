@@ -123,6 +123,9 @@ def summarize(ev):
         r["mavg_rel_halfwidth68"] = float((hi - lo) / (hi + lo))
     pas = ev["asym"] < ASYM_CUT
     r["sig_pass_asym"] = float(pas[s].mean()) if s.any() else 0.0
+    nrec = s & ~rec
+    r["sig_pass_asym_rec"] = float(pas[rec].mean()) if rec.any() else 0.0  # truth in the leading jets
+    r["sig_pass_asym_nonrec"] = float(pas[nrec].mean()) if nrec.any() else 0.0
     if s.any():
         rel = ev["mavg"][s] / np.maximum(ev["pmass"][s], 1)
         r["sig_pass_asym_in_window"] = float((pas[s] & (rel > 0.85) & (rel < 1.1)).mean())
