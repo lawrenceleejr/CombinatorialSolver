@@ -63,6 +63,32 @@ def predict(net, t, bs=4096, amp=False):
     return {k: torch.cat(v) for k, v in outs.items() if v}
 
 
+def batch_loss(net, b, args):
+    o = net(b["pt"], b["eta"], b["phi"], b["m"], b["mask"])
+    o = {k: (v.float() if torch.is_tensor(v) and v.is_floating_point() else v) for k, v in o.items()}
+    if args.gated:
+        return gated_loss(o, b["target"], b["is_signal"], w_proxy=args.w_proxy,
+                          bkg_weight=args.bkg_weight, pmass=b["pmass"], w_mass=args.w_mass,
+                          w_sym=args.w_sym, w_qcd_asym=args.w_qcd_asym)
+    return pairnet_loss(o, b["target"].clamp(min=-1), b["is_signal"], bkg_weight=args.bkg_weight)
+
+
+@torch.no_grad()
+def eval_loss(net, t, args, bs=4096):
+    """Mean training loss in eval mode (no dropout), fp32, for train-vs-validation comparisons."""
+    net.eval()
+    idx = torch.arange(len(t["pt"]), device=t["pt"].device)
+    tot, n = 0.0, 0
+    for b in batches(t, idx, bs):
+        k = len(b["pt"])
+        tot += float(batch_loss(net, b, args)) * k
+        n += k
+    return tot / max(n, 1)
+
+
+OVERTRAIN_KEYS = ("eff_on_reconstructable", "sig_pass_asym", "bkg_pass_asym", "auc", "bkg_rej_at_50")
+
+
 def autocast(device, enabled):
     if enabled and device.type == "cuda":
         return torch.autocast("cuda", dtype=torch.bfloat16)
@@ -309,6 +335,9 @@ def main():
         print(f"resumed at epoch {start}", flush=True)
 
     has_bkg = bool((~va["is_signal"]).any())
+    g = torch.Generator().manual_seed(1234)
+    sub = torch.randperm(len(tr["pt"]), generator=g)[: len(va["pt"])].to(dev)
+    ttr_sub = {k: v[sub] for k, v in ttr.items()}  # fixed training subset for overtraining checks
     for ep in range(start, args.epochs):
         net.train()
         t0 = time.time()
@@ -317,16 +346,7 @@ def main():
         nb = 0
         for b in batches(ttr, perm, args.bs):
             with autocast(dev, args.amp):
-                o = net(b["pt"], b["eta"], b["phi"], b["m"], b["mask"])
-                o = {k: (v.float() if torch.is_tensor(v) and v.is_floating_point() else v)
-                     for k, v in o.items()}
-                if args.gated:
-                    loss = gated_loss(o, b["target"], b["is_signal"], w_proxy=args.w_proxy,
-                                      bkg_weight=args.bkg_weight, pmass=b["pmass"], w_mass=args.w_mass,
-                                      w_sym=args.w_sym, w_qcd_asym=args.w_qcd_asym)
-                else:
-                    loss = pairnet_loss(o, b["target"].clamp(min=-1), b["is_signal"],
-                                        bkg_weight=args.bkg_weight)
+                loss = batch_loss(net, b, args)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
@@ -337,6 +357,12 @@ def main():
         ev = evaluate(net, tva, A, args.eval_bs)  # fp32: bf16 gate outputs tie at thresholds
         r = summarize(ev)
         r.update(epoch=ep, loss=float(tot) / nb, time=time.time() - t0)
+        # overtraining check: same loss and metrics on validation and on a training subset, eval mode
+        r["val_loss"] = eval_loss(net, tva, args)
+        r["train_eval_loss"] = eval_loss(net, ttr_sub, args)
+        rt = summarize(evaluate(net, ttr_sub, A, args.eval_bs))
+        r["train_sub"] = {k: rt[k] for k in OVERTRAIN_KEYS if k in rt}
+        r["train_sub"]["sig_in_window_at_bkg"] = rt.get("sig_in_window_at_bkg")
         hist.append(r)
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()}),
               flush=True)
