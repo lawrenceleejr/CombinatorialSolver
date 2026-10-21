@@ -66,7 +66,7 @@ python -c "import fastjet, h5py, torch, onnx, onnxruntime; print('ok')"
 
 ```bash
 cd $REPO
-python scripts/generate_pythia.py --process signal --mass 1000 --n 200 --seed 1 --out $DATA/smoke/sig.h5
+python scripts/generate_pythia.py --process signal --mass 1000 --n 200 --seed 1 --truth-quarks before_fsr --out $DATA/smoke/sig.h5
 python scripts/generate_pythia.py --process qcd --n 100 --min-jets 5 --seed 1 --out $DATA/smoke/qcd.h5
 python - <<'PY'
 import h5py, os
@@ -213,9 +213,9 @@ cd $REPO
 nvidia-smi
 P=$DATA/prod
 python scripts/train_pairnet.py --gated --proxy --gate-interp --mass-head --n-jets 7 \
-    --sig "$P/sig_*_c[0-7].h5"  --bkg "$P/qcd_c[0-7].h5" \
-    --val-sig "$P/sig_*_c8.h5"  --val-bkg "$P/qcd_c8.h5" \
-    --test-sig "$P/sig_*_c9.h5" --test-bkg "$P/qcd_c9.h5" \
+    --sig "$P/sig_*_c*[0-7].h5"  --bkg "$P/qcd_c*[0-7].h5" \
+    --val-sig "$P/sig_*_c*8.h5"  --val-bkg "$P/qcd_c*8.h5" \
+    --test-sig "$P/sig_*_c*9.h5" --test-bkg "$P/qcd_c*9.h5" \
     --bkg-weight 3 --epochs 40 --bs 1024 --lr 2e-3 --amp --device auto \
     --select combined --cache-dir $DATA/cache --out $DATA/runs/g7_mass
 EOF
@@ -225,6 +225,9 @@ cd $DATA && sbatch --export=ALL train.sbatch
 Notes:
 
 - Keep the glob patterns quoted; the script expands them itself.
+- The split is set by the last digit of the file index (`c*8` = validation, `c*9` = test), so the
+  patterns must be `c*[0-7]`, `c*8`, `c*9`: QCD files run from `qcd_c0` to `qcd_c99`, and `qcd_c[0-7]`
+  would pick only 8 of the 80 training files.
 - `--bkg-weight 3` rebalances QCD against the much larger signal set.
 - `--cache-dir` stores the parsed arrays after the first read. Parsing ~3M
   events from h5 takes several minutes; later runs start in seconds. Delete
