@@ -35,6 +35,7 @@ Usage:
 """
 
 import argparse
+import itertools
 import os
 import tempfile
 import time
@@ -174,6 +175,8 @@ def make_pythia(args) -> pythia8.Pythia:
         cmds.append(f"TimeShower:alphaSvalue = {args.alphas_fsr}")
     if args.alphas_isr is not None:
         cmds.append(f"SpaceShower:alphaSvalue = {args.alphas_isr}")
+    if args.power_shower:
+        cmds.append("SpaceShower:pTmaxMatch = 2")  # ISR up to the kinematic limit: hard-ISR proxy
     if args.no_mpi:
         cmds.append("PartonLevel:MPI = off")
     if args.no_had:
@@ -184,6 +187,28 @@ def make_pythia(args) -> pythia8.Pythia:
     if not p.init():
         raise RuntimeError("Pythia init failed")
     return p
+
+
+_SPLITS = [(t, tuple(sorted(set(six) - set(t))))
+           for six in itertools.combinations(range(7), 6)
+           for t in itertools.combinations(six, 3) if t[0] == six[0]]  # 7 x 10 = 70 splits
+
+
+def has_symmetric_split(pt, eta, phi, m, lo, hi, amax=0.1):
+    """True if some split of the leading (up to 7) jets into two triplets has A < amax and lo < m_avg < hi."""
+    n = min(len(pt), 7)
+    px, py, pz = pt[:n] * np.cos(phi[:n]), pt[:n] * np.sin(phi[:n]), pt[:n] * np.sinh(eta[:n])
+    e = np.sqrt(px ** 2 + py ** 2 + pz ** 2 + m[:n] ** 2)
+    p4 = np.stack([e, px, py, pz], 1)
+    for a, b in _SPLITS:
+        if max(a + b) >= n:
+            continue
+        s1, s2 = p4[list(a)].sum(0), p4[list(b)].sum(0)
+        m1 = np.sqrt(max(s1[0] ** 2 - s1[1] ** 2 - s1[2] ** 2 - s1[3] ** 2, 0.0))
+        m2 = np.sqrt(max(s2[0] ** 2 - s2[1] ** 2 - s2[2] ** 2 - s2[3] ** 2, 0.0))
+        if m1 + m2 > 0 and abs(m1 - m2) / (m1 + m2) < amax and lo < 0.5 * (m1 + m2) < hi:
+            return True
+    return False
 
 
 def _decay_quarks_from(event, idx, after_fsr) -> list[int]:
@@ -257,6 +282,10 @@ def main():
     ap.add_argument("--min-jets", type=int, default=6)
     ap.add_argument("--max-jets", type=int, default=20)
     ap.add_argument("--min-ht", type=float, default=0.0)
+    ap.add_argument("--sym-filter", default=None,
+                    help="LO,HI: keep only events where some split of the leading 7 jets into two triplets has "
+                         "|m1-m2|/(m1+m2) < 0.1 and LO < (m1+m2)/2 < HI (a superset of any A < 0.1 window selection)")
+    ap.add_argument("--power-shower", action="store_true", help="SpaceShower:pTmaxMatch = 2 (hard-ISR proxy)")
     ap.add_argument("--pthat-min", type=float, default=200.0)
     ap.add_argument("--bias-pow", type=float, default=3.0)
     ap.add_argument("--no-mpi", action="store_true")
@@ -271,6 +300,7 @@ def main():
     jet_def = fastjet.JetDefinition(fastjet.antikt_algorithm, 0.4)
 
     MJ = args.max_jets
+    sym_filter = tuple(float(x) for x in args.sym_filter.split(",")) if args.sym_filter else None
     out = {k: [] for k in ["pt", "eta", "phi", "mass", "w", "pm", "tg", "qk", "qb", "qa", "ntot"]}
     n_tried = 0
     t0 = time.time()
@@ -311,6 +341,8 @@ def main():
         order = np.argsort(-spt[sel])
         idx = np.where(sel)[0][order][:MJ]
         if spt[idx].sum() < args.min_ht:
+            continue
+        if sym_filter is not None and not has_symmetric_split(spt[idx], seta[idx], sphi[idx], sm[idx], *sym_filter):
             continue
         nj = len(idx)
 
