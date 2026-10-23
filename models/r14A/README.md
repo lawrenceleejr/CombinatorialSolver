@@ -11,6 +11,7 @@ QCD with p̂T > 200 GeV, H_T > 1.2 TeV and p̂T > 80 GeV (H_T > 400 GeV) samples
 | `pairnet_r14A_model.pt` | PyTorch checkpoint (`state`, `args`), load with `src.pairnet.load_checkpoint` (sha256 `7e5292be6bf575d1bf09f2c240ad51e5b3a40e1766ad4dc940d70fc916bb16d8`) |
 | `metrics.json` | per-epoch training/validation metrics |
 | `train_args.txt` | the exact `train_pairnet.py` arguments (HTCondor submit line) |
+| `validate_r14A.txt` | `scripts/validate_onnx.py` (500 events): argmax agreement 1.0000, max |Δ p_signal| 1.4e-3 |
 
 Interface as for the other models in `models/README.md`: input `four_momenta` (batch, 12, 4) of the leading 12 jets,
 pT-ordered, zero-padded; `argmax(logits)` indexes `src.combinatorics.enumerate_assignments(7)`; `p_signal` is the

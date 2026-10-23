@@ -1,0 +1,7 @@
+1. ONNX vs PyTorch: max|d logits| 9.08e-03  max|d p_signal| 1.42e-03  max|d signal_logits| 1.70e-02  max rel|d masses| 1.08e-04
+   max rel|d m_est| 2.72e-04
+   argmax agreement: logits 1.0000, signal_logits 1.0000
+2. legacy-order index decodes to PairNet's chosen jets: 1.0000
+3. HT-normalised input: max|d p_signal| 1.66e-03, argmax agreement 1.0000, masses scale by HT: True
+4. 1 TeV signal: exact pairing 0.224 of available, 0.076 of all; P(signal) AUC vs QCD 0.9513
+   1 TeV signal mass peak (68% relative half-width): m_est 0.214, m_avg of chosen pairing 0.276
