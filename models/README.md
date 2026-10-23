@@ -2,6 +2,7 @@
 
 | file | jets in | recommended | notes |
 |---|---|---|---|
+| `pairnet_gated_12jet_win5_lowmass_boost_r14A.onnx` | leading 12 (pairs the leading 7) | **current** | r14A, trained down to 200 GeV incl. boosted signal and low-p̂T QCD; checkpoint, metrics and training arguments in `r14A/` |
 | `pairnet_gated_7jet_mass.onnx` | leading 7 | **yes** | drop-in for the current `ml_model.onnx`, plus `m_est`, a learned resonance mass. The gate also sees the pairing summary; trained on before-FSR truth labels. |
 | `pairnet_gated_7jet.onnx` | leading 7 | previous | the morning's recommendation; same interface without `m_est` |
 | `pairnet_v2_12jet.onnx` | leading 12 (pairs the leading 7) | for comparison | best MC numbers, but its gain comes only from events with ≥ 8 jets: it leans on extra-radiation jets, which depend on QCD modelling, and it does not help 6-jet hemisphere-mixed events |
