@@ -37,6 +37,8 @@ d = {"m1": cat("pn_m1"), "m2": cat("pn_m2"), "psig": cat("psig"), "w": np.concat
 d["mavg"] = 0.5 * (d["m1"] + d["m2"]); d["A"] = np.abs(d["m1"] - d["m2"]) / np.maximum(d["m1"] + d["m2"], 1e-9)
 d["half"] = np.arange(len(d["w"])) % 2
 NFIT_MIN = 300
+NEFF_MIN = float(os.environ.get("NEFF_MIN", "0"))  # effective QCD MC events required in the window when tuning
+COUNT_F = float(os.environ["COUNT_F"]) if os.environ.get("COUNT_F") else None
 FT = json.load(open(os.environ["FSYS_JSON"])) if os.environ.get("FSYS_JSON") else None
 
 
@@ -110,6 +112,10 @@ def fom(M, t, hh):
     info["fisher_fb"] = float(1.96 / np.sqrt(rr)) if rr > 0 else np.inf
     info["shape_over_window"] = float((1 / np.sqrt(rr)) / sig_win) if rr > 0 else np.inf
     lim = info["count_f0_fb"] * info["shape_over_window"]
+    if COUNT_F is not None:  # mass-window counting with a fractional background uncertainty instead of the shape fit
+        info["S_per_fb"] = float(sw[win_s].sum()); info["B"] = float(qw[win_q].sum())
+        lim = s_up(info["B"], COUNT_F) / info["S_per_fb"] if info["S_per_fb"] > 0 else np.inf
+        return lim, info, feas
     if FT is not None:  # spurious-signal term f(M) x B in the window, B and S from the MC
         sw_ = sw[win_s].sum()
         lim = 1.96 * np.hypot(lim / 1.96, fr(M) * qw[win_q].sum() / sw_) if sw_ > 0 else np.inf
@@ -153,7 +159,7 @@ for M in range(500, 2401, 100):
         best, bt = np.inf, None
         for t in grid:
             l, info, feas = fom(M, t, hh)
-            if feas and info["nS"] >= 50 and info["nB"] >= 10 and l < best:
+            if feas and info["nS"] >= 50 and info["nB"] >= 10 and info["neffB"] >= NEFF_MIN and l < best:
                 best, bt = l, t
         if bt is None:
             lims.append(np.inf); halves.append({"feasible": False}); continue

@@ -16,5 +16,9 @@ study (`/scratch/llee/pairnet`, `/ospool/uc-shared/project/futurecolliders/llee/
 | `spurious.py`, `spurious_compare.py` | Spurious-signal test of the fit function on the QCD MC. |
 | `spectra_fit.py` | m_avg spectra with a dijet fit from the peak. |
 | `limits.py` | Asimov counting limit with background uncertainty. |
+| `window10_suite.sh` | Mass-window search with a 10% background uncertainty: low-mass runs (offline H_T 400–1050, with/without the falling-spectrum requirement). |
+| `window10.py` | Exclusion plot and per-mass tables for the 10% mass-window search (`window10_results.md`). |
+| `fsys_scan.py` | Expected limit vs the fractional background uncertainty (envelope of the tuned selections). |
+| `cuts_study3.py` | Classical pairings (argmin, max Δ) with tuned H_T, Δ, Dalitz, p_T6 cuts at high mass (`MIN_NB` sets the MC floor). |
 
 Results and the written argument: `~/pairnet_study/RUN3.md` (section "Bump hunt on a smoothly falling spectrum").
