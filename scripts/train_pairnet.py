@@ -169,7 +169,22 @@ def summarize(ev):
         fb = (ev["psig"][~s] >= thr).mean()
         r["bkg_rej_at_50"] = float(1 / max(fb, 1e-6))
         r["sig_in_window_at_bkg"] = sig_at_bkg_curve(ev)
+        r["sig_at_psig_bkg"] = {f"{t:g}": psig_at_bkg(ev, t) for t in (0.002, 0.005, 0.02)}
     return r
+
+
+def psig_at_bkg(ev, target):
+    """Signal passing A < 0.1 with m_avg in [0.85, 1.1] M and P(signal) above the threshold at which a weighted fraction
+    `target` of the QCD passing A < 0.1 survives: the low-working-point figure of merit of a high-purity search."""
+    s = ev["is_signal"]; pas = ev["asym"] < ASYM_CUT
+    qb = ~s & pas
+    if not qb.any() or not s.any():
+        return 0.0
+    w, p = ev["w"][qb], ev["psig"][qb]
+    o = np.argsort(-p); cw = np.cumsum(w[o]) / w.sum()
+    thr = p[o][min(np.searchsorted(cw, target), len(o) - 1)]
+    rel = ev["mavg"] / np.maximum(ev["pmass"], 1)
+    return float((pas & (rel > 0.85) & (rel < 1.1) & (ev["psig"] >= thr))[s].mean())
 
 
 def sig_at_bkg_curve(ev, targets=(0.02, 0.05, 0.08)):
@@ -231,7 +246,7 @@ def main():
     ap.add_argument("--amp", action="store_true", help="bfloat16 autocast on CUDA")
     ap.add_argument("--eval-bs", type=int, default=4096)
     ap.add_argument("--cache-dir", default=None, help="cache parsed arrays here (.npz)")
-    ap.add_argument("--select", choices=["sig_at_bkg", "combined", "win_a01"], default="sig_at_bkg")
+    ap.add_argument("--select", choices=["sig_at_bkg", "combined", "win_a01", "psig_at_bkg"], default="sig_at_bkg")
     ap.add_argument("--select-bkg-pass", type=float, default=0.05,
                     help="weighted QCD pass rate at which --select sig_at_bkg compares epochs")
     ap.add_argument("--resume", action="store_true",
@@ -375,12 +390,15 @@ def main():
         rt = summarize(evaluate(net, ttr_sub, A, args.eval_bs))
         r["train_sub"] = {k: rt[k] for k in OVERTRAIN_KEYS if k in rt}
         r["train_sub"]["sig_in_window_at_bkg"] = rt.get("sig_in_window_at_bkg")
+        r["train_sub"]["sig_at_psig_bkg"] = rt.get("sig_at_psig_bkg")
         hist.append(r)
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()}),
               flush=True)
         if args.select == "win_a01" and has_bkg:
             # signal in mass window passing asym < 0.1, over sqrt(weighted QCD passing asym < 0.1)
             score = r["sig_pass_asym_in_window"] / math.sqrt(max(r["bkg_pass_asym"], 1e-6))
+        elif args.select == "psig_at_bkg" and has_bkg:
+            score = psig_at_bkg(ev, args.select_bkg_pass)
         elif args.select == "sig_at_bkg" and has_bkg:
             score = sig_at_bkg_curve(ev, (args.select_bkg_pass,))[f"{args.select_bkg_pass:g}"]
         else:

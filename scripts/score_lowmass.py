@@ -48,6 +48,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("models", nargs="+")
     ap.add_argument("--window", default=None)
+    ap.add_argument("--tail", default=None,
+                    help="MODEL,PMIN,DMIN,MLO,MHI: keep only events whose MODEL pairing is valid with A < 0.1, MLO < m_avg < MHI "
+                         "and (p_signal >= PMIN or min(Delta)/m_avg >= DMIN): the high-purity tail used for enriched QCD")
+    ap.add_argument("--tail-h5", default=None, help="also write the input events passing --tail to this h5 (same layout and attrs)")
     a = ap.parse_args()
     with h5py.File(a.inp, "r") as f:
         src = f["INPUTS/Source"]
@@ -94,7 +98,23 @@ def main():
             lo, hi = (float(x) for x in a.window.split(","))
             ma = 0.5 * (res[f"{name}_m1"] + res[f"{name}_m2"]); A = np.abs(res[f"{name}_m1"] - res[f"{name}_m2"]) / np.maximum(2 * ma, 1e-9)
             sel |= (A < 0.1) & (ma > lo) & (ma < hi)
-    if a.window:
+    if a.tail:
+        tm, pmin, dmin, mlo, mhi = a.tail.split(","); pmin, dmin, mlo, mhi = float(pmin), float(dmin), float(mlo), float(mhi)
+        ma = 0.5 * (res[f"{tm}_m1"] + res[f"{tm}_m2"]); A = np.abs(res[f"{tm}_m1"] - res[f"{tm}_m2"]) / np.maximum(2 * ma, 1e-9)
+        dm = np.minimum(res[f"{tm}_delta1"], res[f"{tm}_delta2"]) / np.maximum(ma, 1e-9)
+        sel = res[f"{tm}_valid"] & (A < 0.1) & (ma > mlo) & (ma < mhi) & ((res[f"{tm}_psig"] >= pmin) | (dm >= dmin))
+        if a.tail_h5:
+            idx = np.where(keep6)[0][sel]
+            with h5py.File(a.inp, "r") as fi, h5py.File(a.tail_h5, "w") as fo:
+                nin = len(keep6)
+                def copy(name, obj):
+                    if isinstance(obj, h5py.Dataset):
+                        fo.create_dataset(name, data=obj[:][idx] if obj.shape and obj.shape[0] == nin else obj[()], compression="gzip")
+                fi.visititems(copy)
+                for k, v in fi.attrs.items():
+                    fo.attrs[k] = v
+                fo.attrs["tail_filter"] = a.tail; fo.attrs["n_written_unfiltered"] = nin
+    if a.window or a.tail:
         res = {k: x[sel] for k, x in res.items()}
     res["n_all"] = np.array(n)
     for k in ("sigma_mb", "weight_sum", "n_tried", "mass"):
