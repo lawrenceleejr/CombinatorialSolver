@@ -33,7 +33,7 @@ DUMP = os.environ.get("DUMP_SPECTRA")  # directory: save m_avg spectra after the
 MASSES = [int(x) for x in sys.argv[6].split(",")] if len(sys.argv) > 6 else [200, 250, 300, 350, 400, 450, 500, 600, 700, 800, 900, 1000]
 TRIG = max(TRIG, 400.0)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from limits import s_up  # noqa: E402
+from limits import s_up, mu_up_multi, mu_up_multi_corr  # noqa: E402
 
 L = 300.0
 MIN_NEFF, MIN_NB, MIN_NS = 20, 20, 50
@@ -138,6 +138,19 @@ for lo, hi, names in REGIONS:
     merge[f"{lo}-{hi}"] = {n: {"neff": ne[n], "alpha": ne[n] / tot} for n in names}
 for n, d in samples.items():  # events outside a sample's complete region carry no weight there
     d["wfb"] = np.where(d["ht"] >= COMPLETE[n], d["wfb"], 0.0)
+TAILDIR = os.environ.get("TAILDIR")  # enriched-tail QCD (in-job PairNet filter), merged inside its filter region
+if TAILDIR:
+    import tailmerge as TM
+    first = {"qcdvlmT": int(os.environ.get("TAIL_VLM_FIRST", "900")), "qcdhtT": int(os.environ.get("TAIL_HT_FIRST", "500"))}
+    for tname, spec in TM.TAILS.items():
+        t, nf = TM.load_tail(TAILDIR, tname, MODEL, first[tname])
+        if t is None:
+            continue
+        td = derive(std(t, MODEL, "am", {"psig": t[f"{MODEL}_psig"], "ht": t["ht"], "pt6": t["pt6_lead"], "wfb": t["wfb"]}))
+        Fd = lambda d: TM.in_filter(d["pn_valid"], d["pn_m1"], d["pn_m2"], d["psig"], d["pn_delta1"], d["pn_delta2"], spec)
+        base = [(samples[n]["wfb"], samples[n]["ht"], Fd(samples[n])) for n in samples]
+        td["wfb"], tinfo = TM.combine(base, (td["wfb"], td["ht"], Fd(td)), spec)
+        samples[tname] = td; merge[tname] = {"files": nf, "events": int(len(td["wfb"])), **tinfo}
 QCD = {k: np.concatenate([samples[n][k] for n in samples]) for k in samples["old"]}
 QCD["half"] = np.arange(len(QCD["wfb"])) % 2
 print("QCD merge:", json.dumps(merge, default=float), "lm files", nlm, "vlm files", nvlm, flush=True)
@@ -436,6 +449,38 @@ for M in MASSES:
                 lim = 1.96 / np.sqrt(e) if e > 0 else np.inf
                 clims.append(lim); cinfo.append({"bounds": [float(b) for b in bounds]})
             r[name + "+cats"] = {"limit_fb": float(np.exp(np.mean(np.log(clims)))), "halves": cinfo}
+        if os.environ.get("CATS") and FOM == "count" and "psig" in free and np.all(np.isfinite(lims)):
+            # counting in P(signal) categories below the tuned threshold (same other cuts and window), each with its own
+            # relative background uncertainty FSYS: boundaries tuned on one half (greedy) with the categories' uncertainties
+            # uncorrelated, evaluated on the other half both uncorrelated and fully correlated
+            ncat = int(os.environ["CATS"]); pmin = float(os.environ.get("CAT_PMIN", "-1")); cl_u, cl_c, cinfo = [], [], []
+            for h in (0, 1):
+                cuts = info[h]["cuts"]; rest = {k: v for k, v in cuts.items() if k != "psig"}
+                ms, mb = passes(S, rest), passes(B, rest)
+                ps = S.x["psig"][S.h == h]
+                grid = sorted(t for t in set(np.quantile(ps, 1 - np.array([0.95, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.15, 0.1, 0.07, 0.05, 0.03]))) if t >= pmin)
+
+                def cst(bd, hh, floors=True):
+                    sl, bl, edges = [], [], [np.inf] + list(bd)
+                    for i in range(len(bd)):
+                        ks = ms & (S.h == hh) & (S.x["psig"] >= edges[i + 1]) & (S.x["psig"] < edges[i])
+                        kb = mb & (B.h == hh) & (B.x["psig"] >= edges[i + 1]) & (B.x["psig"] < edges[i])
+                        if floors and (kb.sum() < MIN_NB or neff(B.w[kb]) < MIN_NEFF):
+                            return None
+                        sl.append(2 * L * S.w[ks].sum()); bl.append(2 * L * B.w[kb].sum())
+                    return sl, bl
+                bounds = [cuts["psig"]]; cur = mu_up_multi(*cst(bounds, h, False), FSYS)
+                for _ in range(ncat - 1):
+                    cand = [(mu_up_multi(*c, FSYS), t) for t in grid if t < bounds[-1] for c in [cst(bounds + [t], h)] if c]
+                    if not cand or min(cand)[0] >= cur * 0.98:
+                        break
+                    cur, t = min(cand); bounds.append(t)
+                sl, bl = cst(bounds, 1 - h, False)
+                cl_u.append(mu_up_multi(sl, bl, FSYS)); cl_c.append(mu_up_multi_corr(sl, bl, FSYS))
+                cinfo.append({"bounds": [float(b) for b in bounds], "S_per_fb": [float(x) for x in sl], "B": [float(x) for x in bl],
+                              "single_corr_fb": float(mu_up_multi_corr(sl[:1], bl[:1], FSYS))})
+            r[name + "+cats"] = {"limit_fb": float(np.exp(np.mean(np.log(cl_u)))), "limit_corr_fb": float(np.exp(np.mean(np.log(cl_c)))),
+                                 "single_corr_fb": float(np.exp(np.mean(np.log([c["single_corr_fb"] for c in cinfo])))), "halves": cinfo}
     # ISR-model variation: boosted signal efficiency of the tuned P+boost selection with the power-shower sample
     pw = load_sig(M, "power"); bs = load_sig(M, "boost")
     if pw is not None and bs is not None and "P+boost" in r:

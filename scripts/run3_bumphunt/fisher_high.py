@@ -12,7 +12,7 @@ import numpy as np
 
 ht_all, xs_json, full_big, big, htn, out = sys.argv[1:7]
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from limits import s_up  # noqa: E402
+from limits import s_up, mu_up_multi  # noqa: E402
 L = 300.0
 PEAK_MAX = float(os.environ.get("PEAK_MAX", "0.75"))
 filt = {int(k): x for k, x in json.load(open(xs_json))["filter_eff"].items()}
@@ -35,6 +35,26 @@ cat = lambda k: np.concatenate([v[k], h[k]])
 d = {"m1": cat("pn_m1"), "m2": cat("pn_m2"), "psig": cat("psig"), "w": np.concatenate([wo, wn]),
      "sig": np.concatenate([s, np.zeros(len(wn), bool)]), "pm": np.concatenate([v["pmass"], np.zeros(len(wn))])}
 d["mavg"] = 0.5 * (d["m1"] + d["m2"]); d["A"] = np.abs(d["m1"] - d["m2"]) / np.maximum(d["m1"] + d["m2"], 1e-9)
+d["valid"] = cat("pn_valid").astype(bool); d["ht"] = np.concatenate([HT_SUB, h["ht"]])
+TAILDIR = os.environ.get("TAILDIR")  # enriched-tail QCD (in-job PairNet filter), merged inside its filter region
+tail_info = {}
+if TAILDIR:
+    import tailmerge as TM
+    first = {"qcdvlmT": int(os.environ.get("TAIL_VLM_FIRST", "900")), "qcdhtT": int(os.environ.get("TAIL_HT_FIRST", "500"))}
+    for tname, spec in TM.TAILS.items():
+        t, nf = TM.load_tail(TAILDIR, tname, "r14A", first[tname])
+        if t is None:
+            continue
+        Fb = TM.in_filter(d["valid"], d["m1"], d["m2"], d["psig"], None, None, spec, use_delta=False) & ~d["sig"]
+        Ft = TM.in_filter(t["r14A_valid"], t["r14A_m1"], t["r14A_m2"], t["r14A_psig"], None, None, spec, use_delta=False)
+        d["w"] = np.where(Fb & (d["ht"] < 900), 0.0, d["w"])  # the p_T-hat > 200 sample is incomplete below H_T = 900 GeV
+        tw, ti = TM.combine([(d["w"], d["ht"], Fb)], (t["wfb"], t["ht"], Ft), spec)
+        n = len(tw); tail_info[tname] = {"files": nf, "events": n, **ti}
+        add = {"m1": t["r14A_m1"], "m2": t["r14A_m2"], "psig": t["r14A_psig"], "w": np.where(Ft, tw, 0.0), "sig": np.zeros(n, bool),
+               "pm": np.zeros(n), "valid": t["r14A_valid"].astype(bool), "ht": t["ht"]}
+        add["mavg"] = 0.5 * (add["m1"] + add["m2"]); add["A"] = np.abs(add["m1"] - add["m2"]) / np.maximum(add["m1"] + add["m2"], 1e-9)
+        d = {k: np.concatenate([d[k], add[k]]) for k in add}
+    print("tail merge:", tail_info, flush=True)
 d["half"] = np.arange(len(d["w"])) % 2
 NFIT_MIN = 300
 NEFF_MIN = float(os.environ.get("NEFF_MIN", "0"))  # effective QCD MC events required in the window when tuning
@@ -80,6 +100,8 @@ def fom(M, t, hh):
             "sig_peak_over_M": float(peak(sm, sw))}
     allq = (d["A"] < 0.1) & (d["mavg"] > 0.4 * M) & (d["mavg"] < 2.0 * M) & (d["psig"] >= t) & ~d["sig"]  # both halves: robust peak
     info["qcd_peak_over_M"] = float(peak(d["mavg"][allq] / M, d["w"][allq]))
+    alls = (d["A"] < 0.1) & (d["mavg"] > 0.4 * M) & (d["mavg"] < 2.0 * M) & (d["psig"] >= t) & sM  # both halves: robust peak
+    info["sig_peak_over_M"] = float(peak(d["mavg"][alls] / M, np.ones(alls.sum())))
     feas = info["qcd_peak_over_M"] <= PEAK_MAX and 0.85 <= info["sig_peak_over_M"] <= 1.1
     sh, _ = np.histogram(sm, FB, weights=sw); qh, _ = np.histogram(qm, FB, weights=qw); q2, _ = np.histogram(qm, FB, weights=qw ** 2)
     if qq.sum() < NFIT_MIN:  # too few QCD MC events to fit the shape: take it from the looser P cut that keeps NFIT_MIN events
@@ -174,10 +196,29 @@ for M in range(500, 2401, 100):
             bounds.append(max(cand)[1])
         e1, e3 = tot([bt], 1 - hh), tot(bounds, 1 - hh)
         info["cats_bounds"] = [float(b) for b in bounds]; info["cats_gain"] = float(np.sqrt(e1 / e3)) if e1 > 0 and e3 > 0 else 1.0
+        if COUNT_F is not None:  # counting categories in P below bt, each with its own (uncorrelated) COUNT_F on B
+            def cst(bd, h_, floors=True):
+                sl, bl = [], []
+                for lo, hi in zip(bd, [2.0] + bd[:-1]):
+                    base = (d["A"] < 0.1) & (d["mavg"] > 0.85 * M) & (d["mavg"] < 1.1 * M) & (d["half"] == h_) & (d["psig"] >= lo) & (d["psig"] < hi)
+                    qw = 2 * d["w"][base & ~d["sig"]] * L
+                    if floors and ((base & ~d["sig"]).sum() < 10 or neff(qw) < max(NEFF_MIN, 1)):
+                        return None
+                    sl.append((base & sM).sum() / (sM & (d["half"] == h_)).sum() * filt[M] * L); bl.append(qw.sum())
+                return sl, bl
+            cb = [bt]; cur = mu_up_multi(*cst(cb, hh, False), COUNT_F)
+            for _ in range(2):
+                cand = [(mu_up_multi(*c, COUNT_F), t) for t in grid if 0.8 <= t < cb[-1] for c in [cst(cb + [t], hh)] if c]
+                if not cand or min(cand)[0] >= cur * 0.98:
+                    break
+                cur, t = min(cand); cb.append(t)
+            info["count_cats_bounds"] = [float(b) for b in cb]
+            info["count_cats_fb"] = float(mu_up_multi(*cst(cb, 1 - hh, False), COUNT_F))
         lims.append(l if feas else np.inf); halves.append({"psig": float(bt), "feasible": bool(feas), **info})
     lim = float(np.exp(np.mean(np.log(lims))))
     cg = [x.get("cats_gain", 1.0) for x in halves]
-    res[M] = {"limit_cats_fb": float(np.exp(np.mean(np.log([l_ * g_ for l_, g_ in zip(lims, cg)])))), "limit_fb": lim, "count_f0_fb": float(np.exp(np.mean(np.log([x.get("count_f0_fb", np.inf) for x in halves])))), "halves": halves}
+    ccl = [x.get("count_cats_fb", np.inf) if x.get("feasible") else np.inf for x in halves]
+    res[M] = {"count_cats_fb": float(np.exp(np.mean(np.log(ccl)))), "limit_cats_fb": float(np.exp(np.mean(np.log([l_ * g_ for l_, g_ in zip(lims, cg)])))), "limit_fb": lim, "count_f0_fb": float(np.exp(np.mean(np.log([x.get("count_f0_fb", np.inf) for x in halves])))), "halves": halves}
     if halves[0].get("psig") is not None:  # spectra of the half-0 cut on all events
         t = halves[0]["psig"]; base = (d["A"] < 0.1) & (d["mavg"] > 0.4 * M) & (d["mavg"] < 2.0 * M) & (d["psig"] >= t)
         os.makedirs(f"{out}/dump{os.environ.get('FTAG', '')}", exist_ok=True)
@@ -186,4 +227,4 @@ for M in range(500, 2401, 100):
                  sig_mavg=d["mavg"][ss], sig_w=np.full(ss.sum(), filt[M] / sM.sum()), qcd_mavg=d["mavg"][qq], qcd_w=d["w"][qq])
     print(M, "shape-fit limit %.3g fb (P categories %.3g), window counting (same cut, no syst.) %.3g fb" % (lim, res[M]["limit_cats_fb"], res[M]["count_f0_fb"]),
           [(round(x.get("psig", -9), 4), x.get("qcd_peak_over_M"), x.get("feasible"), round(x.get("shape_over_window", -1), 2), x.get("nB")) for x in halves], flush=True)
-json.dump({"results": res, "peak_max": PEAK_MAX, "alpha_old": al}, open(f"{out}/fisher_high{os.environ.get('FTAG', '')}.json", "w"), indent=1, default=float)
+json.dump({"results": res, "peak_max": PEAK_MAX, "alpha_old": al, "tail_merge": tail_info}, open(f"{out}/fisher_high{os.environ.get('FTAG', '')}.json", "w"), indent=1, default=float)

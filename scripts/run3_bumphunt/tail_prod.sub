@@ -1,0 +1,18 @@
+executable     = /scratch/llee/pairnet/gen_tail.sh
+arguments      = jobs_tail.txt $(line) $(name).h5
+transfer_input_files = /scratch/llee/pairnet/stage/gen_env.tar.gz, /ospool/uc-shared/project/futurecolliders/llee/pairnet/tail/repo_tail.tar.gz, /scratch/llee/pairnet/stage/pyonnx.tar.gz, /ospool/uc-shared/project/futurecolliders/llee/pairnet/tail/pairnet_gated_12jet_win5_lowmass_boost_r14A.onnx, /ospool/uc-shared/project/futurecolliders/llee/pairnet/tail/pairnet_gated_12jet_win5_lowmass_boost_r14A.json, /scratch/llee/pairnet/jobs_tail.txt
+transfer_output_files = $(name).npz, $(name)_tail.h5, $(name).h5.log
+transfer_output_remaps = "$(name).npz = /ospool/uc-shared/project/futurecolliders/llee/pairnet/tail/$(name).npz; $(name)_tail.h5 = /ospool/uc-shared/project/futurecolliders/llee/pairnet/tail/$(name)_tail.h5; $(name).h5.log = /ospool/uc-shared/project/futurecolliders/llee/pairnet/tail/$(name).h5.log"
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+output         = /scratch/llee/pairnet/logs_tail/prod_$(line).out
+error          = /scratch/llee/pairnet/logs_tail/prod_$(line).err
+log            = /scratch/llee/pairnet/logs_tail/prod.log
++SingularityImage = "/cvmfs/singularity.opensciencegrid.org/htc/rocky:9"
+request_cpus   = 1
+request_memory = 4GB
+request_disk   = 6GB
+max_retries    = 3
+success_exit_code = 0
+periodic_release = (NumJobStarts < 4) && ((time() - EnteredCurrentStatus) > 300)
+queue line,name from /scratch/llee/pairnet/list_tail_ord.txt

@@ -81,6 +81,15 @@ cur = {}
 hi_pk = {m: r for m, r in high_rows(cfg["high_pk"]).items() if m >= 1000}; hi_free = {m: r for m, r in high_rows(cfg["high_free"]).items() if m >= 1000}
 cur["PairNet, 10% on B"] = best_of(best_of(*[low_rows(p) for p in cfg["low_pk"]]), hi_pk)
 cur["PairNet, 10% on B, no falling-spectrum req."] = best_of(best_of(*[low_rows(p) for p in cfg["low_free"]]), hi_free)
+if cfg.get("cats"):  # P(signal) categories, 10% per category (uncorrelated)
+    cl_low = {}
+    for p in cfg["low_pk"]:
+        for m, x in json.load(open(p))["results"].items():
+            v = min([x[k]["limit_fb"] for k in x if k.endswith("+cats")] + [np.inf])
+            if np.isfinite(v) and (int(m) not in cl_low or v < cl_low[int(m)]["limit_fb"]):
+                cl_low[int(m)] = {"limit_fb": v}
+    hc = json.load(open(cfg["high_pk"]))["results"]
+    cur["PairNet, 10% on B, P categories"] = best_of(cl_low, {int(m): {"limit_fb": x["count_cats_fb"]} for m, x in hc.items() if int(m) >= 1000 and "count_cats_fb" in x})
 am_low = best_of(*[low_rows(p, ("am+all",)) for p in cfg["low_pk"]])
 am_high = json.load(open(cfg["classical_high"]))
 # classical: argmin + tuned cuts (low mass); above 1 TeV the best of argmin / max-Delta / max-Delta-among-A<0.1 + tuned cuts
@@ -95,7 +104,7 @@ col = {v["header"]["name"]: np.array([x["value"] for x in v["values"]], float) f
 cms = col["Expected XSCN"] / col["Acceptance"] * 1e3 * np.sqrt(128 / 300)
 segs = np.split(np.arange(len(cmM)), [i for i in range(1, len(cmM)) if cmM[i] == cmM[i - 1]])
 
-STY = {"PairNet, 10% on B": ("#9b2c2c", "-", 2.0), "PairNet, 10% on B, no falling-spectrum req.": ("#d08770", "--", 1.1),
+STY = {"PairNet, 10% on B, P categories": ("#9b2c2c", "-", 2.2), "PairNet, 10% on B": ("#c26a5a", "-", 1.3), "PairNet, 10% on B, no falling-spectrum req.": ("#d08770", "--", 1.1),
        "best tuned classical, 10% on B": ("0.35", "-", 1.2), "PairNet, B known exactly": ("#9b2c2c", ":", 1.0)}
 summary = {"curves": {}, "reach_GeV": {}}
 fig, ax = plt.subplots(figsize=(5.0, 3.4))
@@ -107,7 +116,7 @@ for n, sg in enumerate(segs):
 for key, r in cur.items():
     M = np.array(sorted(m for m in r if np.isfinite(r[m]["limit_fb"]))); y = np.array([r[m]["limit_fb"] for m in M]); s = sigma_th(M)
     c, ls, lw = STY[key]
-    ax.plot(M, y, color=c, ls=ls, lw=lw, marker="o" if key == "PairNet, 10% on B" else None, ms=2.2, label=key)
+    ax.plot(M, y, color=c, ls=ls, lw=lw, marker="o" if key.startswith("PairNet, 10% on B") and "no falling" not in key else None, ms=2.2, label=key)
     summary["curves"][key] = {int(m): {**{k: v for k, v in r[m].items()}, "sigma_th_fb": float(t), "mu95": float(l / t)} for m, l, t in zip(M, y, s)}
     ex = np.where(y < s)[0]
     if len(ex) and ex[-1] + 1 < len(M):
