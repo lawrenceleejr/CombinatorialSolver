@@ -1,0 +1,153 @@
+"""High-mass (500-2400 GeV) expected limits with the shape-fit figure of merit, same events as compare_models.py.
+
+Per mass: P(signal) cut tuned on one half to minimise the expected limit of a binned m_avg fit (signal strength + free
+4-parameter dijet background, stat-only Fisher information at 300 fb^-1, limit = 1.96 sigma_mu), with the
+falling-background requirement (QCD m_avg peak <= PEAK_MAX * M, signal peak in [0.85, 1.1] M); evaluated on the other
+half. The window-counting limit (no syst.) of the same cut is stored for comparison. Dumps the spectra of the chosen cut.
+usage: fisher_high.py ht_all.npy xs_study.json full_big_vars.npz big.npz ht.npz out
+"""
+import glob, json, os, sys
+import h5py
+import numpy as np
+
+ht_all, xs_json, full_big, big, htn, out = sys.argv[1:7]
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from limits import s_up  # noqa: E402
+L = 300.0
+PEAK_MAX = float(os.environ.get("PEAK_MAX", "0.75"))
+filt = {int(k): x for k, x in json.load(open(xs_json))["filter_eff"].items()}
+P = "/scratch/llee/pairnet/data_r3/prod"
+fac = {f: h5py.File(f).attrs["sigma_mb"] / h5py.File(f).attrs["weight_sum"] * 1e12 for f in sorted(glob.glob(f"{P}/qcd_c*.h5"))}
+pnf = [f for f in fac if f[-4] in "89"]
+k_old = np.mean([fac[f] for f in pnf]) / len(pnf)
+full = np.load(full_big)
+HT_SUB = np.load(ht_all)[full["is_signal"] | np.isin(full["fileclass"], [8, 9])]
+
+v = np.load(big); h = np.load(htn)
+s = v["is_signal"]; q = ~s
+neff = lambda x: x.sum() ** 2 / max((x ** 2).sum(), 1e-300)
+wo = np.where(q, v["w"] * k_old, 0.0)
+wn = h["w"] * h["fac"] / int(h["n_files"])
+hi = q & (HT_SUB > 1200)
+a_, b_ = neff(wo[hi]), neff(wn); al = a_ / (a_ + b_)
+wo = np.where(hi, wo * al, wo); wn = wn * (1 - al)
+cat = lambda k: np.concatenate([v[k], h[k]])
+d = {"m1": cat("pn_m1"), "m2": cat("pn_m2"), "psig": cat("psig"), "w": np.concatenate([wo, wn]),
+     "sig": np.concatenate([s, np.zeros(len(wn), bool)]), "pm": np.concatenate([v["pmass"], np.zeros(len(wn))])}
+d["mavg"] = 0.5 * (d["m1"] + d["m2"]); d["A"] = np.abs(d["m1"] - d["m2"]) / np.maximum(d["m1"] + d["m2"], 1e-9)
+d["half"] = np.arange(len(d["w"])) % 2
+NFIT_MIN = 300
+FT = json.load(open(os.environ["FSYS_JSON"])) if os.environ.get("FSYS_JSON") else None
+
+
+def fr(M):
+    tm_ = np.array(sorted(int(k) for k in FT)); tf_ = np.array([FT[str(k)]["f_corr"] for k in tm_])
+    return float(np.exp(np.interp(M, tm_, np.log(tf_))))
+
+
+FB = np.linspace(0.4, 2.0, 49); FC = 0.5 * (FB[1:] + FB[:-1])
+
+
+def basis(x):
+    return np.stack([np.ones_like(x), np.log1p(-x), np.log(x), np.log(x) ** 2], 1)
+
+
+def peak(m, w):
+    y, _ = np.histogram(m, np.arange(0.4, 1.6001, 0.05), weights=w)
+    y = np.convolve(y, np.ones(3) / 3, mode="same")
+    return 0.425 + 0.05 * np.argmax(y) if y.sum() > 0 else np.nan
+
+
+def fom(M, t, hh):
+    sM = d["sig"] & (d["pm"] == M); base = (d["A"] < 0.1) & (d["mavg"] > 0.4 * M) & (d["mavg"] < 2.0 * M) & (d["half"] == hh) & (d["psig"] >= t)
+    ss = base & sM; qq = base & ~d["sig"]
+    ns_tot = (sM & (d["half"] == hh)).sum()
+    sw = np.full(ss.sum(), filt[M] / ns_tot * L)  # events per fb
+    qw = 2 * d["w"][qq] * L
+    sm, qm = d["mavg"][ss] / M, d["mavg"][qq] / M
+    win_s, win_q = (sm > 0.85) & (sm < 1.1), (qm > 0.85) & (qm < 1.1)
+    info = {"nS": int(win_s.sum()), "nB": int(win_q.sum()), "neffB": float(neff(qw[win_q])),
+            "count_f0_fb": float(s_up(qw[win_q].sum(), 0.0) / sw[win_s].sum()) if win_s.any() else np.inf,
+            "sig_peak_over_M": float(peak(sm, sw))}
+    allq = (d["A"] < 0.1) & (d["mavg"] > 0.4 * M) & (d["mavg"] < 2.0 * M) & (d["psig"] >= t) & ~d["sig"]  # both halves: robust peak
+    info["qcd_peak_over_M"] = float(peak(d["mavg"][allq] / M, d["w"][allq]))
+    feas = info["qcd_peak_over_M"] <= PEAK_MAX and 0.85 <= info["sig_peak_over_M"] <= 1.1
+    sh, _ = np.histogram(sm, FB, weights=sw); qh, _ = np.histogram(qm, FB, weights=qw); q2, _ = np.histogram(qm, FB, weights=qw ** 2)
+    if qq.sum() < NFIT_MIN:  # too few QCD MC events to fit the shape: take it from the looser P cut that keeps NFIT_MIN events
+        lq = (d["A"] < 0.1) & (d["mavg"] > 0.4 * M) & (d["mavg"] < 2.0 * M) & (d["half"] == hh) & ~d["sig"]
+        tq = np.sort(d["psig"][lq])[-NFIT_MIN] if lq.sum() > NFIT_MIN else -1.0
+        lq &= d["psig"] >= min(t, tq)
+        lw = 2 * d["w"][lq] * L; lm = d["mavg"][lq] / M
+        qh, _ = np.histogram(lm, FB, weights=lw); q2, _ = np.histogram(lm, FB, weights=lw ** 2)
+        k = qw.sum() / max(lw.sum(), 1e-300); qh, q2 = qh * k, q2 * k * k
+        info["shape_from_psig"] = float(min(t, tq))
+    if qh.sum() <= 0 or sh.sum() <= 0:
+        return np.inf, info, feas
+    i0 = int(np.argmax(np.convolve(qh, np.ones(3) / 3, mode="same")))
+    fit = (np.arange(len(qh)) >= i0) & (qh > 0) & (q2 > 0)
+    use = np.arange(len(qh)) >= i0
+    if fit.sum() < 8:
+        return np.inf, info, feas
+    x = FC * M / 13600.0
+    X = basis(x)
+    wt = qh[fit] / np.sqrt(q2[fit])
+    th, *_ = np.linalg.lstsq(X[fit] * wt[:, None], np.log(qh[fit]) * wt, rcond=None)
+    b = np.exp(X[use] @ th)
+    A = X[use] * np.sqrt(b)[:, None]; vv = sh[use] / np.sqrt(b)
+    r = vv - A @ np.linalg.lstsq(A, vv, rcond=None)[0]
+    rr = float(r @ r)
+    # Gaussian Fisher fails when the background is tiny: scale the Poisson window-counting limit by the
+    # normalisation-independent ratio sigma_mu(profiled shape fit) / sigma_mu(window counting), same fitted b
+    wb = use[use] & (FC[use] > 0.85) & (FC[use] < 1.1)
+    sig_win = np.sqrt(b[wb].sum()) / sh[use][wb].sum() if sh[use][wb].sum() > 0 else np.inf
+    info["fisher_fb"] = float(1.96 / np.sqrt(rr)) if rr > 0 else np.inf
+    info["shape_over_window"] = float((1 / np.sqrt(rr)) / sig_win) if rr > 0 else np.inf
+    lim = info["count_f0_fb"] * info["shape_over_window"]
+    if FT is not None:  # spurious-signal term f(M) x B in the window, B and S from the MC
+        sw_ = sw[win_s].sum()
+        lim = 1.96 * np.hypot(lim / 1.96, fr(M) * qw[win_q].sum() / sw_) if sw_ > 0 else np.inf
+    return lim, info, feas
+
+
+
+# ---- category study: two P(signal) categories, each with its own free dijet background; Gaussian Fisher (stat only)
+def info_cat(M, lo, hi, hh):
+    sM = d["sig"] & (d["pm"] == M)
+    base = (d["A"] < 0.1) & (d["mavg"] > 0.4 * M) & (d["mavg"] < 2.0 * M) & (d["half"] == hh) & (d["psig"] >= lo) & (d["psig"] < hi)
+    ss = base & sM; qq = base & ~d["sig"]
+    if qq.sum() < 30 or ss.sum() < 30:
+        return 0.0
+    ns_tot = (sM & (d["half"] == hh)).sum()
+    sh, _ = np.histogram(d["mavg"][ss] / M, FB, weights=np.full(ss.sum(), filt[M] / ns_tot * L))
+    qw = 2 * d["w"][qq] * L
+    qh, _ = np.histogram(d["mavg"][qq] / M, FB, weights=qw); q2, _ = np.histogram(d["mavg"][qq] / M, FB, weights=qw ** 2)
+    i0 = int(np.argmax(np.convolve(qh, np.ones(3) / 3, mode="same")))
+    if 0.425 + 0.0333 * i0 > PEAK_MAX + 0.05:
+        return 0.0
+    fit = (np.arange(len(qh)) >= i0) & (qh > 0) & (q2 > 0); use = np.arange(len(qh)) >= i0
+    if fit.sum() < 8:
+        return 0.0
+    X = basis(FC * M / 13600.0); wt = qh[fit] / np.sqrt(q2[fit])
+    th, *_ = np.linalg.lstsq(X[fit] * wt[:, None], np.log(qh[fit]) * wt, rcond=None)
+    b = np.exp(X[use] @ th)
+    A = X[use] * np.sqrt(b)[:, None]; vv = sh[use] / np.sqrt(b)
+    r = vv - A @ np.linalg.lstsq(A, vv, rcond=None)[0]
+    return float(r @ r)
+
+
+for M in (600, 800, 1000, 1200, 1400):
+    sM = d["sig"] & (d["pm"] == M)
+    out_ = []
+    for hh in (0, 1):
+        ps = d["psig"][sM & (d["A"] < 0.1) & (d["half"] == hh)]
+        g = sorted(set(np.quantile(ps, 1 - np.array([0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.15, 0.1, 0.07, 0.05]))))
+        one = max(((info_cat(M, t, 2, hh), t) for t in g))
+        two = max(((info_cat(M, t1, 2, hh) + info_cat(M, t2, t1, hh), t1, t2) for i, t1 in enumerate(g) for t2 in g[:i]), default=(0, 0, 0))
+        three = max(((info_cat(M, t1, 2, hh) + info_cat(M, t2, t1, hh) + info_cat(M, t3, t2, hh), t1, t2, t3)
+                     for i, t1 in enumerate(g) for j, t2 in enumerate(g[:i]) for t3 in g[:j]), default=(0, 0, 0, 0))
+        e1 = info_cat(M, one[1], 2, 1 - hh); e2 = info_cat(M, two[1], 2, 1 - hh) + info_cat(M, two[2], two[1], 1 - hh)
+        e3 = info_cat(M, three[1], 2, 1 - hh) + info_cat(M, three[2], three[1], 1 - hh) + info_cat(M, three[3], three[2], 1 - hh)
+        out_.append((e1, e2, e3, one[1], two[1:], three[1:]))
+    r = [np.mean([1 / np.sqrt(x[k]) for x in out_]) for k in range(3)]
+    print(M, "sigma_mu 1/2/3 P categories: %.3g / %.3g / %.3g fb; ratios %.2f %.2f" % (r[0], r[1], r[2], r[1] / r[0], r[2] / r[0]),
+          "cuts(half0):", [np.round(np.atleast_1d(c), 4).tolist() for c in out_[0][3:]], flush=True)
