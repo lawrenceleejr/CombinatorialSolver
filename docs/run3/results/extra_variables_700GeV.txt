@@ -1,0 +1,13 @@
+signal events 2279, QCD MC events 545 (neff 410) after P >= 0.99, window [0.92, 1.04] M
+|dy| triplets                    sig 90%: QCD 0.87 (< 1.18)   sig 70%: QCD 0.67 (< 0.779)
+cos theta* = |tanh(dy/2)|        sig 90%: QCD 0.87 (< 0.531)   sig 70%: QCD 0.67 (< 0.371)
+pT balance |pT1-pT2|/sum         sig 90%: QCD 0.88 (< 0.294)   sig 70%: QCD 0.68 (< 0.15)
+dphi triplets                    sig 90%: QCD 0.90 (< 3.11)   sig 70%: QCD 0.71 (> 2.82)
+n jets                           sig 90%: QCD 0.92 (> 7)   sig 70%: QCD 0.72 (> 8)
+sum pT of unused jets / M        sig 90%: QCD 0.78 (> 0.0879)   sig 70%: QCD 0.52 (> 0.213)
+leading unused jet pT / M        sig 90%: QCD 0.78 (> 0.0639)   sig 70%: QCD 0.52 (> 0.113)
+mean jet m/pT (6 chosen)         sig 90%: QCD 0.88 (> 0.0906)   sig 70%: QCD 0.67 (> 0.102)
+max jet m/pT (6 chosen)          sig 90%: QCD 0.89 (< 0.219)   sig 70%: QCD 0.70 (> 0.149)
+pair pT / M                      sig 90%: QCD 0.81 (> 0.0685)   sig 70%: QCD 0.54 (> 0.133)
+H_T / M                          sig 90%: QCD 0.50 (> 2.24)   sig 70%: QCD 0.34 (> 2.4)
+1 - P                            sig 90%: QCD 0.85 (< 0.00922)   sig 70%: QCD 0.57 (< 0.00771)
