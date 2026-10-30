@@ -13,7 +13,9 @@ REGIONS = [(400, 900), (900, 1200), (1200, 1e9)]
 # m_avg ranges: the generator-level symmetric-split filter (--sym-filter LO,HI) makes a sample complete only for
 # LO < m_avg < HI (any A < 0.1 pairing with m_avg in range passes it), so the merge uses exactly that range.
 TAILS = {"qcdvlmT": dict(complete=400, pmin=0.8, dmin=0.4, mlo=150, mhi=1150),
-         "qcdhtT": dict(complete=900, pmin=0.8, dmin=0.4, mlo=800, mhi=3000)}
+         "qcdhtT": dict(complete=900, pmin=0.8, dmin=0.4, mlo=800, mhi=3000),
+         "qcd700T": dict(complete=900, pmin=0.9, dmin=0.4, mlo=450, mhi=1000),  # targeted at 600-800 GeV (p_T-hat > 120)
+         "qcd700U": dict(complete=1200, pmin=0.9, dmin=0.4, mlo=450, mhi=1000)}  # p_T-hat > 250, bias 2, H_T > 1200 GeV
 
 
 def neff(w):

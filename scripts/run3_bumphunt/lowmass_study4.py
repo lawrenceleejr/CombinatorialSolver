@@ -143,7 +143,8 @@ if TAILDIR:
     import tailmerge as TM
     first = {"qcdvlmT": int(os.environ.get("TAIL_VLM_FIRST", "900")), "qcdhtT": int(os.environ.get("TAIL_HT_FIRST", "500"))}
     for tname, spec in TM.TAILS.items():
-        t, nf = TM.load_tail(TAILDIR, tname, MODEL, first[tname])
+        tdir = os.environ.get("TAIL700DIR", TAILDIR) if tname.startswith("qcd700") else TAILDIR
+        t, nf = TM.load_tail(tdir, tname, MODEL, first.get(tname, 0))
         if t is None:
             continue
         td = derive(std(t, MODEL, "am", {"psig": t[f"{MODEL}_psig"], "ht": t["ht"], "pt6": t["pt6_lead"], "wfb": t["wfb"]}))
@@ -193,6 +194,8 @@ def load_sig(M, kind):
     if SIG_CLASSES and kind != "power":
         keep = {int(x) for x in SIG_CLASSES.split(",")}
         fs = [f for f in fs if int(f.rsplit("_c", 1)[1][:-4]) in keep]
+    if os.environ.get("EXTRA_SIG_DIR") and kind != "power":  # additional held-out signal (never used in training)
+        fs += sorted(glob.glob(f"{os.environ['EXTRA_SIG_DIR']}/sig{M}X_{kind}_c*.npz"))
     if not fs:
         return None
     ps, ntried = [], 0
@@ -223,7 +226,7 @@ if os.environ.get("DDT"):
 
 class Cand:
     def __init__(self, d, p, M, sig_boost=None, wide=False):
-        lo, hi = (0.4, 2.0) if wide == "fit" else (0.4, 1.6) if wide else (0.85, 1.1)
+        lo, hi = (0.4, 2.0) if wide == "fit" else (0.4, 1.6) if wide else WIN
         sel = (d[f"{p}_asym"] < 0.1) & (d[f"{p}_mavg"] > lo * M) & (d[f"{p}_mavg"] < hi * M) & d[f"{p}_valid"] & (d["ht"] > TRIG) & (d["wfb"] > 0)
         self.x = {n: (d[k] if k in ("psig", "ht", "u") else d[f"{p}_{k}"])[sel] / (M if rel else 1) for n, (k, _, _, rel) in VARS.items() if k in d or f"{p}_{k}" in d}
         self.w = d["wfb"][sel]; self.h = d["half"][sel]; self.m = d[f"{p}_mavg"][sel] / M
@@ -232,6 +235,7 @@ class Cand:
 # PEAK_MAX: require the QCD m_avg spectrum (after the cuts, 0.4-1.6 M) to peak at or below PEAK_MAX * M, i.e. the window
 # [0.85, 1.1] M sits on the falling side, and the signal m_avg peak to lie inside the window. Cuts violating it are rejected.
 SEED_GRID = bool(os.environ.get("SEED_GRID"))
+WIN = tuple(float(x) for x in os.environ.get("WIN", "0.85,1.1").split(","))  # mass window in units of M
 PEAK_MAX = float(os.environ["PEAK_MAX"]) if os.environ.get("PEAK_MAX") else None
 SHAPE_BINS = np.arange(0.4, 1.6001, 0.05)
 
@@ -395,6 +399,18 @@ def merged_signal(M):
     return inc
 
 
+if os.environ.get("EXPORT"):  # dump the merged QCD and per-mass signal (A < 0.1, valid, H_T > trig, 0.4-2 M) and stop
+    ex = os.environ["EXPORT"]; os.makedirs(ex, exist_ok=True)
+    def cutd(d, M):
+        k = (d["pn_asym"] < 0.1) & d["pn_valid"] & (d["ht"] > TRIG) & (d["wfb"] > 0) & (d["pn_mavg"] > 0.4 * M) & (d["pn_mavg"] < 2.0 * M)
+        return {kk: v[k] for kk, v in d.items() if np.ndim(v) == 1 and len(v) == len(k)}
+    for M in MASSES:
+        sig = merged_signal(M)
+        if sig is None:
+            continue
+        np.savez(f"{ex}/sig_m{M}.npz", **cutd(sig, M)); np.savez(f"{ex}/qcd_m{M}.npz", **cutd(QCD, M))
+        print("exported", M, flush=True)
+    sys.exit(0)
 res = {}
 for M in MASSES:
     sig = merged_signal(M)
