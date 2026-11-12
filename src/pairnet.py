@@ -432,8 +432,16 @@ def pairnet_loss(out, target, is_sig, sig_weight=1.0, bkg_weight=1.0):
     return (loss * w).sum() / w.sum().clamp(min=1e-6)
 
 
+def _unit_mean(f, sel):
+    """Rescale the factors f to unit mean over the events in sel (others untouched)."""
+    if not sel.any():
+        return f
+    return torch.where(sel, f / f[sel].mean().clamp(min=1e-9), f)
+
+
 def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pmass=None, w_mass=1.0,
-               w_sym=0.0, w_qcd_asym=0.0, w_win=0.0, w_qcd_pass=0.0, asym_cut=0.1, window=(0.85, 1.1)):
+               w_sym=0.0, w_qcd_asym=0.0, w_win=0.0, w_qcd_pass=0.0, asym_cut=0.1, window=(0.85, 1.1),
+               ev_w=None, gate_wp_qcd=1.0, gate_wp_sig_fail=1.0, gate_focal=0.0):
     """Loss for the gated model.
 
     target: (B,) exact-truth index for reconstructable signal, or the
@@ -449,6 +457,15 @@ def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pma
     w_win > 0 rewards, for signal, the expected fraction of probability on interpretations
     with asymmetry < asym_cut and m_avg in window * M (the analysis selection itself);
     w_qcd_pass > 0 penalises, for QCD, the expected fraction passing asymmetry < asym_cut.
+
+    Working-point variants (all are within-class re-weightings: the total weight of signal and of
+    QCD in a batch is unchanged, only which events carry it):
+    ev_w            (B,) per-event weight of QCD events in every QCD term (1 for signal), e.g. the
+                    physical cross-section weight within H_T slices;
+    gate_wp_qcd     factor on the gate BCE of QCD whose chosen pairing passes asymmetry < asym_cut;
+    gate_wp_sig_fail factor on the gate BCE of signal whose chosen pairing fails the selection
+                    (asymmetry < asym_cut and m_avg in window * M);
+    gate_focal      g > 0: gate BCE of QCD weighted by (0.1 + P(signal))^g (hard negatives).
     """
     logp = out["logits"]
     B = logp.shape[0]
@@ -460,11 +477,33 @@ def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pma
     nll = -logp.gather(1, tgt.unsqueeze(1)).squeeze(1)
     w = torch.where(exact, 1.0, torch.where(proxy, w_proxy, 0.0))
     w = torch.where(is_sig, w, torch.full_like(w, bkg_weight))
+    bkg = ~is_sig
+    if ev_w is not None:
+        ev_w = _unit_mean(torch.where(bkg, ev_w, torch.ones_like(ev_w)), bkg)
+        w = w * ev_w
     lmix = (nll * w).sum() / w.sum().clamp(min=1e-6)
-    lgate = F.binary_cross_entropy_with_logits(
-        out["gate_logit"], is_sig.float(),
-        weight=torch.where(is_sig, 1.0, bkg_weight) * torch.ones(B, device=logp.device),
-    )
+    gw = torch.where(is_sig, 1.0, bkg_weight) * torch.ones(B, device=logp.device)
+    if ev_w is not None:
+        gw = gw * ev_w
+    if gate_wp_qcd != 1.0 or gate_wp_sig_fail != 1.0:
+        with torch.no_grad():
+            A = out["m1"].shape[1]
+            best = logp[:, :A].argmax(-1, keepdim=True)
+            m1b, m2b = out["m1"].gather(1, best).squeeze(1), out["m2"].gather(1, best).squeeze(1)
+            pas = (m1b - m2b).abs() / (m1b + m2b).clamp(min=1e-6) < asym_cut
+            f = torch.where(bkg & pas, gate_wp_qcd, 1.0) * torch.ones_like(gw)
+            if pmass is not None and gate_wp_sig_fail != 1.0:
+                rel = 0.5 * (m1b + m2b) * out["ht"] / pmass.clamp(min=1.0)
+                ok = pas & (rel > window[0]) & (rel < window[1])
+                f = torch.where(is_sig & ~ok, gate_wp_sig_fail, f)
+            f = _unit_mean(_unit_mean(f, bkg), is_sig)
+        gw = gw * f
+    if gate_focal > 0:
+        with torch.no_grad():
+            f = (0.1 + torch.sigmoid(out["gate_logit"])) ** gate_focal
+            f = _unit_mean(torch.where(bkg, f, torch.ones_like(f)), bkg)
+        gw = gw * f
+    lgate = F.binary_cross_entropy_with_logits(out["gate_logit"], is_sig.float(), weight=gw)
     loss = lmix + w_gate * lgate
     if "log_m_over_ht" in out and pmass is not None and is_sig.any():
         # L1 (median) regression of log(M/HT) on signal events
@@ -490,7 +529,11 @@ def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pma
             win = sym * ((rel > window[0]) & (rel < window[1])).float()
             loss = loss - w_win * (p * win).sum(-1)[is_sig].mean()
         if w_qcd_pass > 0 and (~is_sig).any():
-            loss = loss + w_qcd_pass * (p * sym).sum(-1)[~is_sig].mean()
+            qp = (p * sym).sum(-1)[~is_sig]
+            if ev_w is not None:
+                loss = loss + w_qcd_pass * (qp * ev_w[~is_sig]).sum() / ev_w[~is_sig].sum().clamp(min=1e-9)
+            else:
+                loss = loss + w_qcd_pass * qp.mean()
     return loss
 
 
