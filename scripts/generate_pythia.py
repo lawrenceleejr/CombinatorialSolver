@@ -253,6 +253,54 @@ def decay_quarks(event, after_fsr=False) -> list[list[tuple[float, float, float]
     return groups
 
 
+def last_gluinos(event) -> list[int]:
+    """Indices of the decaying gluino copies (those whose daughters are not gluinos), in event-record order
+    (the same order as decay_quarks)."""
+    out = []
+    for i in range(event.size()):
+        prt = event[i]
+        if abs(prt.id()) != GLUINO:
+            continue
+        d1, d2 = prt.daughter1(), prt.daughter2()
+        if d1 <= 0 or any(abs(event[d].id()) == GLUINO for d in range(d1, max(d1, d2) + 1)):
+            continue
+        out.append(i)
+    return out
+
+
+def ancestry_label(event, i, gl, memo) -> int:
+    """0 / 1: entry i descends from the decay of gluino gl[0] / gl[1]; 2: anything else (ISR, MPI, beam remnants,
+    radiation off the gluino before it decays). Follows mothers upwards; where an entry has several mothers
+    (colour-reconnection / junction bookkeeping) it takes the label of the most energetic one."""
+    path = []
+    while True:
+        if i in memo:
+            lab = memo[i]
+            break
+        path.append(i)
+        if i == gl[0] or i == gl[1]:
+            lab = 0 if i == gl[0] else 1
+            break
+        if i <= 2:
+            lab = 2
+            break
+        prt = event[i]
+        m1, m2 = prt.mother1(), prt.mother2()
+        if m1 <= 0:
+            lab = 2
+            break
+        if m2 == 0 or m2 == m1:
+            i = m1
+            continue
+        ms = [m for m in prt.motherList() if m > 0]
+        labs = [ancestry_label(event, m, gl, memo) for m in ms]
+        lab = labs[int(np.argmax([event[m].e() for m in ms]))] if len(set(labs)) > 1 else labs[0]
+        break
+    for j in path:
+        memo[j] = lab
+    return lab
+
+
 def smear_pt(pt: np.ndarray, rng) -> np.ndarray:
     """Calorimeter-like resolution: noise (+) stochastic (+) constant."""
     rel = np.sqrt((5.0 / pt) ** 2 + (0.6 / np.sqrt(pt)) ** 2 + 0.03**2)
@@ -293,6 +341,16 @@ def main():
     ap.add_argument("--match-dr", type=float, default=0.4)
     ap.add_argument("--truth-quarks", choices=["before_fsr", "after_fsr"], default="after_fsr",
                     help="decay-quark momenta used for jet matching (both are stored)")
+    ap.add_argument("--ancestry", action="store_true",
+                    help="signal only: store, per jet, the momentum of the final partons (before hadronisation, "
+                         "ghost-associated to the jets) descending from gluino 1 / gluino 2 / neither, for all jets "
+                         "down to --anc-ptmin and |eta| < 4.9 (ANC/*), the fractions for the stored jets "
+                         "(INPUTS/Source/anc), and the gluino and descendant four-momenta (truth/gluino_p4, desc_p4)")
+    ap.add_argument("--anc-ptmin", type=float, default=10.0, help="true jet pT threshold of the ANC/* jet list")
+    ap.add_argument("--anc-max-jets", type=int, default=40)
+    ap.add_argument("--anc-keep-all", action="store_true",
+                    help="with --ancestry: also write the events failing the jet selection (EventVars/pass_sel = 0), "
+                         "so that alternative jet definitions can be studied relative to all produced events")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed + 7919)
@@ -302,6 +360,10 @@ def main():
     MJ = args.max_jets
     sym_filter = tuple(float(x) for x in args.sym_filter.split(",")) if args.sym_filter else None
     out = {k: [] for k in ["pt", "eta", "phi", "mass", "w", "pm", "tg", "qk", "qb", "qa", "ntot"]}
+    anc = args.ancestry and args.process == "signal"
+    AJ = args.anc_max_jets
+    aout = {k: [] for k in ["frac", "gp4", "dp4", "tj", "sj", "lp4", "lpt", "std", "nall", "pass"]}
+    GHOST = 1e-18
     n_tried = 0
     t0 = time.time()
     while len(out["pt"]) < args.n:
@@ -316,35 +378,77 @@ def main():
                 continue
             groups = alt[args.truth_quarks == "after_fsr"]
         parts = []
+        plab, pp4 = [], []  # final partons before hadronisation: ancestry label, (E, px, py, pz)
+        if anc:
+            gl = last_gluinos(ev)
+            if len(gl) != 2:
+                continue
+            memo = {}
         for i in range(ev.size()):
             prt = ev[i]
+            if anc and prt.isFinalPartonLevel() and (prt.isParton() or prt.isDiquark()):
+                plab.append(ancestry_label(ev, i, gl, memo))
+                pp4.append((prt.e(), prt.px(), prt.py(), prt.pz()))
+                if prt.pT() > 1e-3 and abs(prt.eta()) < 6.0:
+                    g = fastjet.PseudoJet(prt.px() * GHOST, prt.py() * GHOST, prt.pz() * GHOST, prt.e() * GHOST)
+                    g.set_user_index(len(plab) - 1)
+                    parts.append(g)
             if not prt.isFinal() or not prt.isVisible():
                 continue
             if abs(prt.eta()) > 4.9:
                 continue
             parts.append(fastjet.PseudoJet(prt.px(), prt.py(), prt.pz(), prt.e()))
         cs = fastjet.ClusterSequence(parts, jet_def)
-        jets = cs.inclusive_jets(0.8 * args.ptmin)
-        if len(jets) < args.min_jets:
+        jets = cs.inclusive_jets(min(0.8 * args.ptmin, args.anc_ptmin) if anc else 0.8 * args.ptmin)
+        keep_all = anc and args.anc_keep_all
+        if len(jets) < args.min_jets and not keep_all:
             continue
         tpt = np.array([j.pt() for j in jets])
         teta = np.array([j.eta() for j in jets])
         tphi = np.array([j.phi_std() for j in jets])
         tm = np.array([max(j.m(), 0.0) for j in jets])
-        spt = smear_pt(tpt, rng)
+        spt = smear_pt(tpt, rng) if len(jets) else tpt.copy()
         seta = teta + 0.01 * rng.standard_normal(teta.shape)
         sphi = dphi(tphi + 0.01 * rng.standard_normal(tphi.shape), 0.0)
-        sm = tm * spt / tpt
-        sel = (spt > args.ptmin) & (np.abs(seta) < args.etamax)
-        if sel.sum() < args.min_jets:
+        sm = tm * spt / np.maximum(tpt, 1e-9)
+        # the stored jets keep their definition (true pT > 0.8 ptmin before smearing) when softer jets are clustered
+        sel = (spt > args.ptmin) & (np.abs(seta) < args.etamax) & (tpt >= 0.8 * args.ptmin)
+        passed = sel.sum() >= args.min_jets
+        if not passed and not keep_all:
             continue
         order = np.argsort(-spt[sel])
         idx = np.where(sel)[0][order][:MJ]
         if spt[idx].sum() < args.min_ht:
-            continue
-        if sym_filter is not None and not has_symmetric_split(spt[idx], seta[idx], sphi[idx], sm[idx], *sym_filter):
+            passed = False
+        elif sym_filter is not None and passed and not has_symmetric_split(
+                spt[idx], seta[idx], sphi[idx], sm[idx], *sym_filter):
+            passed = False
+        if not passed and not keep_all:
             continue
         nj = len(idx)
+        if anc:
+            plab_a, pp4_a = np.array(plab, dtype=int), np.array(pp4, dtype=np.float64).reshape(-1, 4)
+            lp4 = np.zeros((len(jets), 3, 4)); lpt = np.zeros((len(jets), 3))
+            for ji, j in enumerate(jets):
+                for c in j.constituents():
+                    u = c.user_index()
+                    if u >= 0:
+                        lp4[ji, plab_a[u]] += pp4_a[u]
+                        lpt[ji, plab_a[u]] += np.hypot(pp4_a[u, 1], pp4_a[u, 2])
+            oall = np.argsort(-tpt)[:AJ]
+            na = len(oall)
+            std = np.full(len(jets), -1, dtype=np.int32); std[idx] = np.arange(nj)
+            z = lambda shape: np.zeros(shape, dtype=np.float32)
+            a_tj, a_sj, a_lp4, a_lpt, a_std = z((AJ, 4)), z((AJ, 4)), z((AJ, 3, 4)), z((AJ, 3)), np.full(AJ, -1, np.int32)
+            a_tj[:na] = np.stack([tpt, teta, tphi, tm], 1)[oall]; a_sj[:na] = np.stack([spt, seta, sphi, sm], 1)[oall]
+            a_lp4[:na], a_lpt[:na], a_std[:na] = lp4[oall], lpt[oall], std[oall]
+            fr = z((MJ, 3)); tot = lpt[idx].sum(1, keepdims=True)
+            fr[:nj] = np.where(tot > 0, lpt[idx] / np.maximum(tot, 1e-12), np.array([0.0, 0.0, 1.0]))
+            aout["pass"].append(passed)
+            aout["frac"].append(fr); aout["tj"].append(a_tj); aout["sj"].append(a_sj); aout["lp4"].append(a_lp4)
+            aout["lpt"].append(a_lpt); aout["std"].append(a_std); aout["nall"].append(na)
+            aout["gp4"].append(np.array([[ev[g].e(), ev[g].px(), ev[g].py(), ev[g].pz()] for g in gl], dtype=np.float32))
+            aout["dp4"].append(np.stack([pp4_a[plab_a == k].sum(0) for k in range(3)]).astype(np.float32))
 
         def pad(a):
             z = np.zeros(MJ, dtype=np.float32)
@@ -415,6 +519,19 @@ def main():
         f["EventVars/normweight"] = np.array(out["w"], dtype=np.float64)
         f["EventVars/parent_mass"] = np.array(out["pm"], dtype=np.float32)
         f["EventVars/n_jets"] = np.array(out["ntot"], dtype=np.int32)
+        if anc:
+            g["anc"] = np.stack(aout["frac"])  # (N, max_jets, 3): parton pT fraction from gluino 1 / gluino 2 / other
+            f["truth/gluino_p4"] = np.stack(aout["gp4"])  # (N, 2, 4) (E, px, py, pz) of the decaying gluinos
+            f["truth/desc_p4"] = np.stack(aout["dp4"])  # (N, 3, 4) sum of final partons per label (g1, g2, other)
+            a = f.create_group("ANC")  # all jets with true pT > anc_ptmin, |eta_particles| < 4.9, sorted by true pT
+            for k, name in (("tj", "true"), ("sj", "smeared")):  # (N, AJ, 4): pt, eta, phi, mass
+                a.create_dataset(name, data=np.stack(aout[k]), compression="gzip", compression_opts=4)
+            a.create_dataset("label_p4", data=np.stack(aout["lp4"]), compression="gzip", compression_opts=4)  # (N, AJ, 3, 4)
+            a.create_dataset("label_pt", data=np.stack(aout["lpt"]), compression="gzip", compression_opts=4)  # (N, AJ, 3) scalar pT
+            a.create_dataset("std_index", data=np.stack(aout["std"]), compression="gzip", compression_opts=4)  # slot in INPUTS/Source or -1
+            a["n"] = np.array(aout["nall"], dtype=np.int32)
+            f["EventVars/pass_sel"] = np.array(aout["pass"], dtype=bool)
+            f.attrs["anc_ptmin"] = args.anc_ptmin
         f.attrs["process"] = args.process
         f.attrs["mass"] = args.mass
         f.attrs["n_tried"] = n_tried
