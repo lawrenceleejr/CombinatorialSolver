@@ -152,6 +152,7 @@ class PairNet(nn.Module):
         gate_interp: bool = False,
         mass_head: bool = False,
         massless: bool = False,
+        interp_attn: int = 0,
     ):
         super().__init__()
         self.massless = massless  # ignore the jet masses (no quark/gluon handle)
@@ -217,6 +218,11 @@ class PairNet(nn.Module):
             nn.Linear(d_model + self.n_gk, d_model), nn.GELU(), nn.Linear(d_model, d_model)
         )
         self.rest_mlp = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU())
+        # optional attention across the interpretations of an event before the final score, so that
+        # alternatives are compared directly rather than only through the softmax
+        self.interp_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(d_model, nhead, dim_ff, dropout, activation="gelu", batch_first=True,
+                                       norm_first=True) for _ in range(interp_attn)])
         self.score_mlp = nn.Sequential(
             nn.Linear(3 * d_model + self.n_ik, 2 * d_model),
             nn.GELU(),
@@ -321,6 +327,8 @@ class PairNet(nn.Module):
             ik = e1.new_zeros(B, self.n_assign, 0)
         hr = self.rest_mlp(er)
         hid = self.score_mlp[:-1](torch.cat([h1 + h2, h1 * h2, hr, ik], -1))  # (B, A, d)
+        for layer in self.interp_layers:
+            hid = layer(hid, src_key_padding_mask=~valid)
         s = self.score_mlp[-1](hid).squeeze(-1)
         s = s.masked_fill(~valid, -1e4)
 
@@ -432,8 +440,25 @@ def pairnet_loss(out, target, is_sig, sig_weight=1.0, bkg_weight=1.0):
     return (loss * w).sum() / w.sum().clamp(min=1e-6)
 
 
+def _unit_mean(f, sel):
+    """Rescale the factors f to unit mean over the events in sel (others untouched)."""
+    if not sel.any():
+        return f
+    return torch.where(sel, f / f[sel].mean().clamp(min=1e-9), f)
+
+
+def distance_corr(x, y):
+    """Distance correlation (squared) of two 1-D samples (DisCo, arXiv:2001.05310)."""
+    a = (x.unsqueeze(0) - x.unsqueeze(1)).abs()
+    b = (y.unsqueeze(0) - y.unsqueeze(1)).abs()
+    A = a - a.mean(0, keepdim=True) - a.mean(1, keepdim=True) + a.mean()
+    Bm = b - b.mean(0, keepdim=True) - b.mean(1, keepdim=True) + b.mean()
+    return (A * Bm).mean() / ((A * A).mean() * (Bm * Bm).mean()).sqrt().clamp(min=1e-12)
+
+
 def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pmass=None, w_mass=1.0,
-               w_sym=0.0, w_qcd_asym=0.0, w_win=0.0, w_qcd_pass=0.0, asym_cut=0.1, window=(0.85, 1.1)):
+               w_sym=0.0, w_qcd_asym=0.0, w_win=0.0, w_qcd_pass=0.0, asym_cut=0.1, window=(0.85, 1.1),
+               ev_w=None, gate_wp_qcd=1.0, gate_wp_sig_fail=1.0, gate_focal=0.0, w_decor=0.0):
     """Loss for the gated model.
 
     target: (B,) exact-truth index for reconstructable signal, or the
@@ -449,6 +474,18 @@ def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pma
     w_win > 0 rewards, for signal, the expected fraction of probability on interpretations
     with asymmetry < asym_cut and m_avg in window * M (the analysis selection itself);
     w_qcd_pass > 0 penalises, for QCD, the expected fraction passing asymmetry < asym_cut.
+
+    Working-point variants (all are within-class re-weightings: the total weight of signal and of
+    QCD in a batch is unchanged, only which events carry it):
+    ev_w            (B,) per-event weight of QCD events in every QCD term (1 for signal), e.g. the
+                    physical cross-section weight within H_T slices;
+    gate_wp_qcd     factor on the gate BCE of QCD whose chosen pairing passes asymmetry < asym_cut;
+    gate_wp_sig_fail factor on the gate BCE of signal whose chosen pairing fails the selection
+                    (asymmetry < asym_cut and m_avg in window * M);
+    gate_focal      g > 0: gate BCE of QCD weighted by (0.1 + P(signal))^g (hard negatives).
+    w_decor         > 0 adds the distance correlation, on QCD, between the gate logit and log m_avg of the
+                    chosen pairing (in GeV, not differentiated), so that a cut on P does not reshape the
+                    QCD m_avg spectrum (no sculpting).
     """
     logp = out["logits"]
     B = logp.shape[0]
@@ -460,12 +497,40 @@ def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pma
     nll = -logp.gather(1, tgt.unsqueeze(1)).squeeze(1)
     w = torch.where(exact, 1.0, torch.where(proxy, w_proxy, 0.0))
     w = torch.where(is_sig, w, torch.full_like(w, bkg_weight))
+    bkg = ~is_sig
+    if ev_w is not None:
+        ev_w = _unit_mean(torch.where(bkg, ev_w, torch.ones_like(ev_w)), bkg)
+        w = w * ev_w
     lmix = (nll * w).sum() / w.sum().clamp(min=1e-6)
-    lgate = F.binary_cross_entropy_with_logits(
-        out["gate_logit"], is_sig.float(),
-        weight=torch.where(is_sig, 1.0, bkg_weight) * torch.ones(B, device=logp.device),
-    )
+    gw = torch.where(is_sig, 1.0, bkg_weight) * torch.ones(B, device=logp.device)
+    if ev_w is not None:
+        gw = gw * ev_w
+    if gate_wp_qcd != 1.0 or gate_wp_sig_fail != 1.0:
+        with torch.no_grad():
+            A = out["m1"].shape[1]
+            best = logp[:, :A].argmax(-1, keepdim=True)
+            m1b, m2b = out["m1"].gather(1, best).squeeze(1), out["m2"].gather(1, best).squeeze(1)
+            pas = (m1b - m2b).abs() / (m1b + m2b).clamp(min=1e-6) < asym_cut
+            f = torch.where(bkg & pas, gate_wp_qcd, 1.0) * torch.ones_like(gw)
+            if pmass is not None and gate_wp_sig_fail != 1.0:
+                rel = 0.5 * (m1b + m2b) * out["ht"] / pmass.clamp(min=1.0)
+                ok = pas & (rel > window[0]) & (rel < window[1])
+                f = torch.where(is_sig & ~ok, gate_wp_sig_fail, f)
+            f = _unit_mean(_unit_mean(f, bkg), is_sig)
+        gw = gw * f
+    if gate_focal > 0:
+        with torch.no_grad():
+            f = (0.1 + torch.sigmoid(out["gate_logit"])) ** gate_focal
+            f = _unit_mean(torch.where(bkg, f, torch.ones_like(f)), bkg)
+        gw = gw * f
+    lgate = F.binary_cross_entropy_with_logits(out["gate_logit"], is_sig.float(), weight=gw)
     loss = lmix + w_gate * lgate
+    if w_decor > 0 and bkg.sum() > 8:
+        with torch.no_grad():
+            A_ = out["m1"].shape[1]
+            best = logp[:, :A_].argmax(-1, keepdim=True)
+            mb = 0.5 * (out["m1"].gather(1, best) + out["m2"].gather(1, best)).squeeze(1) * out["ht"]
+        loss = loss + w_decor * distance_corr(out["gate_logit"][bkg], torch.log(mb[bkg].clamp(min=1.0)))
     if "log_m_over_ht" in out and pmass is not None and is_sig.any():
         # L1 (median) regression of log(M/HT) on signal events
         tgt_m = torch.log(pmass.clamp(min=1.0) / out["ht"].clamp(min=1e-6))
@@ -490,7 +555,11 @@ def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pma
             win = sym * ((rel > window[0]) & (rel < window[1])).float()
             loss = loss - w_win * (p * win).sum(-1)[is_sig].mean()
         if w_qcd_pass > 0 and (~is_sig).any():
-            loss = loss + w_qcd_pass * (p * sym).sum(-1)[~is_sig].mean()
+            qp = (p * sym).sum(-1)[~is_sig]
+            if ev_w is not None:
+                loss = loss + w_qcd_pass * (qp * ev_w[~is_sig]).sum() / ev_w[~is_sig].sum().clamp(min=1e-9)
+            else:
+                loss = loss + w_qcd_pass * qp.mean()
     return loss
 
 
@@ -501,12 +570,12 @@ def load_checkpoint(path):
     sizes = tuple((int(x[0]), int(x[1])) for x in a["sizes"].split(",")) if a.get("sizes") else None
     net = PairNet(
         n_jets=a["n_jets"], k=a["k"], d_model=a["d_model"], nhead=a["heads"],
-        num_layers=a["layers"], dim_ff=2 * a["d_model"], dropout=0.0,
+        num_layers=a["layers"], dim_ff=a.get("ff_mult", 2) * a["d_model"], dropout=0.0,
         use_pair_bias=not a["no_pair_bias"], use_group_kin=not a["no_group_kin"],
         use_null=not a["no_null"], sizes=sizes, gated=a.get("gated", False),
         bg_beta=a.get("bg_beta", 1.0), n_assign=a.get("n_assign"),
         gate_interp=a.get("gate_interp", False), mass_head=a.get("mass_head", False),
-        massless=a.get("massless", False),
+        massless=a.get("massless", False), interp_attn=a.get("interp_attn", 0),
     )
     net.load_state_dict(ck["state"])
     net.eval()

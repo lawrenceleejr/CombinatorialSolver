@@ -131,7 +131,7 @@ def main():
                    "signal_logits: signal scorer; masses: (m1, m2) per assignment in input units"
                    + ("; m_est: learned resonance mass in input units" if net.mass_head else ""),
         "checkpoint": a.model, "git_commit": commit,
-        "training_args": json.dumps({k: args[k] for k in ("n_jets", "n_assign", "gate_interp", "mass_head", "d_model", "layers",
+        "training_args": json.dumps({k: args[k] for k in ("n_jets", "n_assign", "gate_interp", "mass_head", "d_model", "layers", "interp_attn", "eta_shift", "w_win", "w_qcd_pass", "dropout",
                                                           "epochs", "sig", "bkg") if k in args}),
     }
     for k, v in meta.items():

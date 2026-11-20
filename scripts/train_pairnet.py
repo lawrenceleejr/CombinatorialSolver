@@ -63,14 +63,19 @@ def predict(net, t, bs=4096, amp=False):
     return {k: torch.cat(v) for k, v in outs.items() if v}
 
 
-def batch_loss(net, b, args):
+def batch_loss(net, b, args, nominal=False):
+    """nominal=True: the plain loss without the working-point re-weightings (--qcd-phys-weight,
+    --gate-wp-*, --gate-focal), so that validation losses are comparable between runs."""
     o = net(b["pt"], b["eta"], b["phi"], b["m"], b["mask"])
     o = {k: (v.float() if torch.is_tensor(v) and v.is_floating_point() else v) for k, v in o.items()}
     if args.gated:
+        var = {} if nominal else dict(ev_w=b.get("lw"), gate_wp_qcd=args.gate_wp_qcd,
+                                      gate_wp_sig_fail=args.gate_wp_sig_fail, gate_focal=args.gate_focal,
+                                      w_decor=args.w_decor)
         return gated_loss(o, b["target"], b["is_signal"], w_proxy=args.w_proxy,
                           bkg_weight=args.bkg_weight, pmass=b["pmass"], w_mass=args.w_mass,
                           w_sym=args.w_sym, w_qcd_asym=args.w_qcd_asym,
-                          w_win=args.w_win, w_qcd_pass=args.w_qcd_pass)
+                          w_win=args.w_win, w_qcd_pass=args.w_qcd_pass, **var)
     return pairnet_loss(o, b["target"].clamp(min=-1), b["is_signal"], bkg_weight=args.bkg_weight)
 
 
@@ -82,7 +87,7 @@ def eval_loss(net, t, args, bs=4096):
     tot, n = 0.0, 0
     for b in batches(t, idx, bs):
         k = len(b["pt"])
-        tot += float(batch_loss(net, b, args)) * k
+        tot += float(batch_loss(net, b, args, nominal=True)) * k
         n += k
     return tot / max(n, 1)
 
@@ -96,7 +101,7 @@ def autocast(device, enabled):
     return torch.autocast("cpu", enabled=False)
 
 
-def evaluate(net, t, A, bs=4096, amp=False):
+def evaluate(net, t, A, bs=4096, amp=False, keep_logits=False):
     o = predict(net, t, bs, amp)
     logits = o["logits"]
     best = logits[:, :A].argmax(1)
@@ -114,6 +119,10 @@ def evaluate(net, t, A, bs=4096, amp=False):
     extra = {}
     if "log_m_over_ht" in o:
         extra["m_est"] = (torch.exp(o["log_m_over_ht"]) * o["ht"]).numpy()
+    if "gate_logit" in o:
+        extra["gate_logit"] = o["gate_logit"].numpy()
+    if keep_logits:  # (B, A) mixture log-probabilities, for averaging over an ensemble
+        extra["logp"] = logits[:, :A].clamp(min=-6.0e4).numpy().astype(np.float16)
     return {
         **extra,
         "best": best.numpy(),
@@ -234,9 +243,82 @@ def cached(args, sizes, which):
     return d
 
 
+def phys_weights(d, clip, nbins=20):
+    """Per-event loss weight: 1 for signal; for QCD the physical weight relative to the mean in its
+    H_T slice (nbins quantile slices of the QCD H_T), clipped to [1/clip, clip] and rescaled to unit
+    mean per slice.  The H_T spectrum the network is trained on is unchanged; within a slice the
+    events count in proportion to their cross section (the QCD samples are generated with biased
+    phase space and mixed without their weights otherwise)."""
+    b = ~d["is_signal"]
+    ht = (d["pt"] * d["mask"]).sum(1)
+    lw = np.ones(len(ht), np.float32)
+    idx = np.nonzero(b)[0]
+    edges = np.quantile(ht[idx], np.linspace(0, 1, nbins + 1)[1:-1])
+    sl = np.searchsorted(edges, ht[idx])
+    w = d["w"][idx].astype(np.float64)
+    out = np.ones(len(idx))
+    for i in range(nbins):
+        m = sl == i
+        if not m.any():
+            continue
+        r = np.clip(w[m] / np.median(w[m]), 1.0 / clip, clip)
+        out[m] = r / r.mean()
+    lw[idx] = out
+    return lw
+
+
+def mass_variant(t, kind, seed=4321):
+    """Copy of the tensors t with distorted jet masses (evaluation of the trust put in jet masses)."""
+    t = dict(t)
+    if kind == "mup":
+        t["m"] = t["m"] * 1.1
+    elif kind == "mdn":
+        t["m"] = t["m"] * 0.9
+    elif kind == "msm":
+        g = torch.Generator(device=t["m"].device).manual_seed(seed)
+        t["m"] = (t["m"] * (1 + 0.15 * torch.randn(t["m"].shape, generator=g, device=t["m"].device))).clamp(min=0)
+    elif kind == "m0":
+        t["m"] = torch.zeros_like(t["m"])
+    else:
+        raise ValueError(kind)
+    return t
+
+
 def main():
+    T0 = time.time()
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sig", nargs="+", required=True)
+    ap.add_argument("--sig", nargs="*", default=[])
+    ap.add_argument("--train-npz", default=None, help="training arrays (cache file) instead of --sig/--bkg")
+    ap.add_argument("--train-n", type=int, default=None, help="use the first N events of --train-npz")
+    ap.add_argument("--train-frac", type=float, default=None,
+                    help="random fraction of the training events (fixed seed; data-scaling tests)")
+    ap.add_argument("--eta-shift", type=float, default=0.0,
+                    help="training only: shift all jet eta of an event by U(-s, s), kept inside |eta| < --eta-max "
+                         "(a longitudinal boost; jet ordering and pairing targets are unchanged)")
+    ap.add_argument("--eta-max", type=float, default=3.0)
+    ap.add_argument("--w-decor", type=float, default=0.0,
+                    help="weight of the QCD distance correlation between P(signal) and log m_avg (no sculpting)")
+    ap.add_argument("--val-npz", default=None)
+    ap.add_argument("--test-npz", default=None)
+    ap.add_argument("--extra-eval", nargs="*", default=[],
+                    help="name=file.npz: also evaluate the selected checkpoint on these arrays (eval_<name>.npz)")
+    ap.add_argument("--eval-mass-variants", nargs="*", default=[],
+                    help="also evaluate the test set with distorted jet masses: mup mdn msm m0")
+    ap.add_argument("--save-logits", action="store_true",
+                    help="write the per-interpretation log-probabilities of the test set (eval_logits.npz)")
+    ap.add_argument("--time-budget", type=float, default=None,
+                    help="seconds; exit with code 85 after an epoch if the next one would not fit (self-checkpointing)")
+    ap.add_argument("--mass-aug", default=None,
+                    help="SCALE,SMEAR_LO,SMEAR_HI: training-time jet-mass augmentation, per event a scale "
+                         "1 +- SCALE (uniform) and per jet a Gaussian smearing of relative width uniform in [LO, HI]")
+    ap.add_argument("--qcd-phys-weight", type=float, default=None,
+                    help="CLIP: weight QCD in the loss by its physical weight within H_T slices, clipped to [1/CLIP, CLIP]")
+    ap.add_argument("--gate-wp-qcd", type=float, default=1.0,
+                    help="gate BCE factor for QCD whose chosen pairing passes asymmetry < 0.1")
+    ap.add_argument("--gate-wp-sig-fail", type=float, default=1.0,
+                    help="gate BCE factor for signal whose chosen pairing fails asymmetry < 0.1 or the mass window")
+    ap.add_argument("--gate-focal", type=float, default=0.0,
+                    help="gate BCE of QCD weighted by (0.1 + P(signal))^g")
     ap.add_argument("--bkg", nargs="*", default=[])
     ap.add_argument("--val-sig", nargs="*", default=[], help="explicit validation files")
     ap.add_argument("--val-bkg", nargs="*", default=[])
@@ -280,6 +362,9 @@ def main():
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--ff-mult", type=int, default=2, help="feed-forward width = ff_mult * d_model")
+    ap.add_argument("--interp-attn", type=int, default=0,
+                    help="transformer layers across the interpretations before the final score")
     ap.add_argument("--no-pair-bias", action="store_true")
     ap.add_argument("--no-group-kin", action="store_true")
     ap.add_argument("--no-null", action="store_true")
@@ -309,9 +394,20 @@ def main():
         torch.backends.cudnn.allow_tf32 = True
     os.makedirs(args.out, exist_ok=True)
 
-    data = cached(args, sizes, "train")
-    va = cached(args, sizes, "val")
-    te = cached(args, sizes, "test")
+    if args.train_npz:
+        data = dict(np.load(args.train_npz))
+        if args.train_n:
+            data = {k: v[: args.train_n] for k, v in data.items()}
+        if args.train_frac:
+            n = len(data["pt"])
+            pick = np.sort(np.random.default_rng(777).choice(n, int(args.train_frac * n), replace=False))
+            data = {k: v[pick] for k, v in data.items()}
+        va = dict(np.load(args.val_npz)) if args.val_npz else None
+        te = dict(np.load(args.test_npz)) if args.test_npz else None
+    else:
+        data = cached(args, sizes, "train")
+        va = cached(args, sizes, "val")
+        te = cached(args, sizes, "test")
     if va is None and te is None:
         tr, va, te = split(data, seed=args.seed)
     elif va is None:
@@ -320,6 +416,12 @@ def main():
         tr = data
     if te is None:
         te = va
+    if args.qcd_phys_weight:
+        tr = dict(tr)
+        tr["lw"] = phys_weights(tr, args.qcd_phys_weight)
+        q = tr["lw"][~tr["is_signal"]]
+        print(f"QCD loss weights: min {q.min():.3g} median {np.median(q):.3g} max {q.max():.3g} "
+              f"n_eff/n {q.sum() ** 2 / (q ** 2).sum() / len(q):.3f}", flush=True)
     ttr, tva, tte = ({k: v.to(dev) for k, v in to_tensors(d).items()} for d in (tr, va, te))
     s_tr = tr["is_signal"]
     print(f"device {dev}  train {len(tr['pt'])}  val {len(va['pt'])}  test {len(te['pt'])}; "
@@ -327,7 +429,8 @@ def main():
 
     net = PairNet(
         n_jets=args.n_jets, k=args.k, d_model=args.d_model, nhead=args.heads,
-        num_layers=args.layers, dim_ff=2 * args.d_model, dropout=args.dropout,
+        num_layers=args.layers, dim_ff=args.ff_mult * args.d_model, dropout=args.dropout,
+        interp_attn=args.interp_attn,
         use_pair_bias=not args.no_pair_bias, use_group_kin=not args.no_group_kin,
         use_null=not args.no_null, sizes=sizes, gated=args.gated, bg_beta=args.bg_beta,
         n_assign=args.n_assign, gate_interp=args.gate_interp, mass_head=args.mass_head,
@@ -365,6 +468,7 @@ def main():
         parts.append(idx[torch.randperm(len(idx), generator=g)[:want]])
     sub = torch.cat(parts).to(dev)
     ttr_sub = {k: v[sub] for k, v in ttr.items()}
+    maug = [float(x) for x in args.mass_aug.split(",")] if args.mass_aug else None
     for ep in range(start, args.epochs):
         net.train()
         t0 = time.time()
@@ -372,6 +476,18 @@ def main():
         tot = torch.zeros((), device=dev)
         nb = 0
         for b in batches(ttr, perm, args.bs):
+            if maug:
+                n = b["m"].shape
+                scale = 1 + maug[0] * (2 * torch.rand(n[0], 1, device=dev) - 1)
+                width = maug[1] + (maug[2] - maug[1]) * torch.rand(n[0], 1, device=dev)
+                b["m"] = (b["m"] * scale * (1 + width * torch.randn(n, device=dev))).clamp(min=0)
+            if args.eta_shift:
+                msk = b["mask"]
+                big = torch.full_like(b["eta"], 1e9)
+                lo = (-args.eta_max - torch.where(msk, b["eta"], big).min(1).values).clamp(min=-args.eta_shift, max=0)
+                hi = (args.eta_max - torch.where(msk, b["eta"], -big).max(1).values).clamp(min=0, max=args.eta_shift)
+                d = lo + (hi - lo) * torch.rand_like(lo)
+                b["eta"] = (b["eta"] + d.unsqueeze(1)) * msk
             with autocast(dev, args.amp):
                 loss = batch_loss(net, b, args)
             opt.zero_grad(set_to_none=True)
@@ -383,7 +499,7 @@ def main():
             nb += 1
         ev = evaluate(net, tva, A, args.eval_bs)  # fp32: bf16 gate outputs tie at thresholds
         r = summarize(ev)
-        r.update(epoch=ep, loss=float(tot) / nb, time=time.time() - t0)
+        r.update(epoch=ep, loss=float(tot) / nb, time=time.time() - t0, lr=sched.get_last_lr()[0])
         # overtraining check: same loss and metrics on validation and on a training subset, eval mode
         r["val_loss"] = eval_loss(net, tva, args)
         r["train_eval_loss"] = eval_loss(net, ttr_sub, args)
@@ -409,12 +525,27 @@ def main():
         torch.save({"state": net.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
                     "hist": hist, "epoch": ep, "best_score": best_score, "best_state": best_state,
                     "args": vars(args)}, last)
+        if args.time_budget and ep + 1 < args.epochs and \
+                time.time() - T0 + 1.2 * (time.time() - t0) > args.time_budget:
+            print(f"time budget: checkpoint exit after epoch {ep}", flush=True)
+            sys.exit(85)
 
     net.load_state_dict(best_state)
     torch.save({"state": {k: v.cpu() for k, v in best_state.items()}, "args": vars(args)},
                os.path.join(args.out, "model.pt"))
-    ev = evaluate(net, tte, A, args.eval_bs)
+    ev = evaluate(net, tte, A, args.eval_bs, keep_logits=args.save_logits)
+    if args.save_logits:
+        np.savez_compressed(os.path.join(args.out, "eval_logits.npz"), logp=ev.pop("logp"))
     np.savez_compressed(os.path.join(args.out, "eval.npz"), **ev)
+    for kind in args.eval_mass_variants:
+        evm = evaluate(net, mass_variant(tte, kind), A, args.eval_bs)
+        np.savez_compressed(os.path.join(args.out, f"eval_test_{kind}.npz"),
+                            **{k: evm[k] for k in ("best", "psig", "gate_logit", "mavg", "asym", "m_est") if k in evm})
+    for spec in args.extra_eval:
+        name, path = spec.split("=", 1)
+        tx = {k: v.to(dev) for k, v in to_tensors(dict(np.load(path))).items()}
+        np.savez_compressed(os.path.join(args.out, f"eval_{name}.npz"), **evaluate(net, tx, A, args.eval_bs))
+        del tx
     final = summarize(ev)
     print("TEST", json.dumps(final), flush=True)
     json.dump({"test": final, "history": hist, "args": vars(args)},
