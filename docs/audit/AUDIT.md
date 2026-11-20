@@ -277,6 +277,19 @@ vs m_avg (slope +2 → ≈ 0) at ≤ 4 % signal cost.  Ancestry pairing targets,
 training-level DisCo term do not help.  The stage-2 MLP must then be built on the decorrelated score and checked
 for re-sculpting (it uses H_T/m and event shapes).
 
+## 12. Delivered network (Nov 19)
+
+`models/pairnet_gated_12jet_attn_eta_f9.onnx` (+ `.json` spec, same interface and assignment order as the r14A
+ONNX): r14A recipe + interpretation attention (2 layers across the 70 pairings) + longitudinal-boost augmentation
+(η shift ≤ 0.5); checkpoint `/scratch/llee/pairnet/audit/F9_data/runs/out_f9_ia2_eta/f9_ia2_eta/model.pt`.
+Versus r14A: +2–8 % signal at fixed QCD in the peak, +3.3 % mean signal efficiency at 0.1 % QCD, no extra
+sculpting, no overtraining; at the hardest cuts (0.02 % QCD) +2 % ± 1.3 %, i.e. not separable from r14A with the
+present QCD MC.  `models/pairnet_gated_12jet_attn_eta_f9_decorrelation_map.json`: per m_avg bin (150–3000 GeV) the
+p_signal threshold keeping a fraction 1e-1 … 1e-4 of QCD with A < 0.1 — cutting on it keeps QCD flat in m_avg
+(sculpting slope +2 → ≈ 0 at ≤ 4 % signal cost); thresholds below ~1e-3 above 1.6 TeV rest on 50–175 effective QCD
+events.  ONNX vs PyTorch on 20 k test events: max |ΔP| 0.0026, pairing argmax identical, no flips at P = 0.99 /
+0.997 / 0.999.
+
 ## 9. Status of running work
 
 (updated as results arrive)
