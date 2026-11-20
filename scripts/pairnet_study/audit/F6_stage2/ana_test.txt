@@ -1,0 +1,3 @@
+t_b34, data_test.tar, base34.py, t_b34.json, 2, 4GB, F6_TEST=1:F6_RES=rescored_test, 700
+t_cond, data_test.tar, cond.py, t_cond.json, 2, 4GB, F6_TEST=1:F6_RES=rescored_test, 700
+t_s2, data_test.tar, stage2.py, t_s2.json, 4, 6GB, F6_TEST=1:F6_RES=rescored_test, 700

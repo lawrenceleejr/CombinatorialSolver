@@ -1,0 +1,23 @@
+executable     = /scratch/llee/pairnet/audit/F5_train/train_f5.sh
+arguments      = "10800 --gated --proxy --gate-interp --mass-head --train-npz cache/train_a57f78a76e60.npz --val-npz cache/val_8ddd403e85f3.npz --test-npz cache/test_2da66480a069.npz --extra-eval tail=f5/tail_eval.npz --eval-mass-variants mup mdn msm m0 --save-logits --device auto --threads 2 --n-jets 12 --n-assign 7 --bs 1024 --bkg-weight 3 --select win_a01 --w-win 5 --w-qcd-pass 5 --time-budget 7200 --out out/f5_wp --train-n 17396294 --d-model 128 --layers 4 --lr 2e-3 --epochs 12 --gate-wp-qcd 5 --gate-wp-sig-fail 0.2"
+transfer_input_files = osdf:///ospool/uc-shared/project/futurecolliders/llee/pairnet/train_env_v1.tar.gz, osdf:///ospool/uc-shared/project/futurecolliders/llee/pairnet/data_cache_r15.tar, osdf:///ospool/uc-shared/project/futurecolliders/llee/pairnet/audit_f5/data_f5_tail_v1.tar, /scratch/llee/pairnet/audit/F5_train/stage/repo_f5.tar.gz
+transfer_output_files = out
+transfer_output_remaps = "out = /scratch/llee/pairnet/audit/F5_train/runs/out_f5_wp"
+checkpoint_exit_code = 85
+transfer_checkpoint_files = out
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+output         = /scratch/llee/pairnet/audit/F5_train/logs/f5_wp.out
+error          = /scratch/llee/pairnet/audit/F5_train/logs/f5_wp.err
+log            = /scratch/llee/pairnet/audit/F5_train/logs/f5_wp.log
++JobDurationCategory = "Long"
+request_gpus   = 1
+max_retries    = 3
+success_exit_code = 0
+requirements   = !regexp("qa-rtx6k-020", Machine)
+gpus_minimum_memory = 11000
+
+request_cpus   = 2
+request_memory = 24GB
+request_disk   = 30GB
+queue

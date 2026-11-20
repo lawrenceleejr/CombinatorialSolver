@@ -1,0 +1,18 @@
+executable     = /scratch/llee/pairnet/audit/F2_data/f2_job.sh
+arguments      = sv_jobs.txt $(line) $(name)
+transfer_input_files = /scratch/llee/pairnet/stage/gen_env.tar.gz, /ospool/uc-shared/project/futurecolliders/llee/pairnet/tail/repo_tail.tar.gz, /scratch/llee/pairnet/stage/pyonnx.tar.gz, /ospool/uc-shared/project/futurecolliders/llee/pairnet/tail/pairnet_gated_12jet_win5_lowmass_boost_r14A.onnx, /ospool/uc-shared/project/futurecolliders/llee/pairnet/tail/pairnet_gated_12jet_win5_lowmass_boost_r14A.json, /scratch/llee/pairnet/audit/F2_data/sv_jobs.txt, /scratch/llee/pairnet/audit/F2_data/gen_f2.py, /scratch/llee/pairnet/audit/F2_data/f2_post.py
+transfer_output_files = $(name).npz, $(name).log
+transfer_output_remaps = "$(name).npz = /scratch/llee/pairnet/audit/F2_data/jobs_out/$(name).npz; $(name).log = /scratch/llee/pairnet/audit/F2_data/jobs_out/$(name).log"
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+output         = /scratch/llee/pairnet/audit/F2_data/logs/$(name).out
+error          = /scratch/llee/pairnet/audit/F2_data/logs/$(name).err
+log            = /scratch/llee/pairnet/audit/F2_data/logs/f2.log
++SingularityImage = "/cvmfs/singularity.opensciencegrid.org/htc/rocky:9"
+request_cpus   = 1
+request_memory = 4GB
+request_disk   = 6GB
+max_retries    = 3
+success_exit_code = 0
+periodic_release = (NumJobStarts < 4) && ((time() - EnteredCurrentStatus) > 300)
+queue line,name from /scratch/llee/pairnet/audit/F2_data/sv_list.txt

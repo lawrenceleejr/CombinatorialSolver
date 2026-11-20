@@ -1,0 +1,4 @@
+combo_a, data_full.tar, combo.py, combo_a.json, 2, 16GB, -, 300,350,400,450,500
+combo_b, data_full.tar, combo.py, combo_b.json, 2, 16GB, -, 600,700,800,900,1000
+combo_c, data_full.tar, combo.py, combo_c.json, 2, 16GB, -, 1100,1200,1300,1400,1500,1600,1700
+combo_d, data_full.tar, combo.py, combo_d.json, 2, 16GB, -, 1800,1900,2000,2100,2200,2300,2400

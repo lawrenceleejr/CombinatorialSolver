@@ -1,0 +1,19 @@
+executable     = /scratch/llee/pairnet/audit/F4_peak/gen/gen_anc.sh
+arguments      = jobs_anc.txt $(line) $(name).h5
+transfer_input_files = /scratch/llee/pairnet/stage/gen_env.tar.gz, /scratch/llee/pairnet/audit/F4_peak/gen/generate_pythia_anc.py, /scratch/llee/pairnet/audit/F4_peak/gen/jobs_anc.txt
+transfer_output_files = $(name).h5
+transfer_output_remaps = "$(name).h5 = /scratch/llee/pairnet/audit/F4_peak/samples/$(name).h5"
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+output         = /scratch/llee/pairnet/audit/F4_peak/gen/logs/anc_$(line).out
+error          = /scratch/llee/pairnet/audit/F4_peak/gen/logs/anc_$(line).err
+log            = /scratch/llee/pairnet/audit/F4_peak/gen/logs/anc.log
++SingularityImage = "/cvmfs/singularity.opensciencegrid.org/htc/rocky:9"
++JobBatchName  = "f4_anc"
+request_cpus   = 1
+request_memory = 4GB
+request_disk   = 4GB
+max_retries    = 3
+success_exit_code = 0
+periodic_release = (NumJobStarts < 4) && ((time() - EnteredCurrentStatus) > 300)
+queue line,name from /scratch/llee/pairnet/audit/F4_peak/gen/list_anc.txt

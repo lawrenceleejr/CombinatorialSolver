@@ -1,0 +1,18 @@
+executable     = /scratch/llee/pairnet/audit/F6_stage2/resc_job.sh
+arguments      = $(name) $(kind)
+transfer_input_files = /scratch/llee/pairnet/stage/gen_env.tar.gz, /scratch/llee/pairnet/stage/pyonnx.tar.gz, /scratch/llee/pairnet/audit/F6_stage2/rescore.py, /scratch/llee/pairnet/audit/F6_stage2/score_lowmass_copy.py, /scratch/llee/pairnet/audit/F6_stage2/pairnet_gated_12jet_win5_lowmass_boost_r14A.onnx, /scratch/llee/pairnet/audit/F6_stage2/pairnet_gated_12jet_win5_lowmass_boost_r14A.json, /scratch/llee/pairnet/audit/F6_stage2/bundles/$(name).tar
+transfer_output_files = $(name).npz
+transfer_output_remaps = "$(name).npz = /scratch/llee/pairnet/audit/F6_stage2/rescored/$(name).npz"
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+output         = /scratch/llee/pairnet/audit/F6_stage2/logs/resc_$(name).out
+error          = /scratch/llee/pairnet/audit/F6_stage2/logs/resc_$(name).err
+log            = /scratch/llee/pairnet/audit/F6_stage2/logs/resc.log
++SingularityImage = "/cvmfs/singularity.opensciencegrid.org/htc/rocky:9"
+request_cpus   = 1
+request_memory = 2GB
+request_disk   = 3GB
+max_retries    = 3
+success_exit_code = 0
+periodic_release = (NumJobStarts < 4) && ((time() - EnteredCurrentStatus) > 300)
+queue name,kind from /scratch/llee/pairnet/audit/F6_stage2/bundles/list.txt

@@ -1,0 +1,17 @@
+executable     = /scratch/llee/pairnet/audit/F6_stage2/ana_job.sh
+arguments      = $(data) $(script) $(out) $(f6env) $(cpus) $(args)
+transfer_input_files = /scratch/llee/pairnet/stage/gen_env.tar.gz, /scratch/llee/pairnet/audit/F6_stage2/pysk.tar.gz, /scratch/llee/pairnet/audit/F6_stage2/f6lib.py, /scratch/llee/pairnet/audit/F6_stage2/base34.py, /scratch/llee/pairnet/audit/F6_stage2/cond.py, /scratch/llee/pairnet/audit/F6_stage2/stage2.py, /scratch/llee/pairnet/audit/F6_stage2/combo.py, /scratch/llee/pairnet/audit/F6_stage2/$(data)
+transfer_output_files = $(tag).tar
+transfer_output_remaps = "$(tag).tar = /scratch/llee/pairnet/audit/F6_stage2/out/$(tag).tar"
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+output         = /scratch/llee/pairnet/audit/F6_stage2/logs/ana_$(tag).out
+error          = /scratch/llee/pairnet/audit/F6_stage2/logs/ana_$(tag).err
+log            = /scratch/llee/pairnet/audit/F6_stage2/logs/ana.log
++SingularityImage = "/cvmfs/singularity.opensciencegrid.org/htc/rocky:9"
+request_cpus   = $(cpus)
+request_memory = $(mem)
+request_disk   = 12GB
+priority       = 5
+max_retries    = 2
+queue tag,data,script,out,cpus,mem,f6env,args from $(LIST)

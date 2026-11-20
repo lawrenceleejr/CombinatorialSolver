@@ -1,0 +1,10 @@
+['pthat', 'sym_pass', 'f2_args'] 7502 n_all 7502
+events with >=6 jets: 7502 sym_pass fraction (unweighted): 0.7728605705145295
+r14A sel (A<0.1, 150<m_avg<1150, H_T>450, P>-1): n=530, sym_pass fails=0; frac of weight with pthat<120: 0.093, pthat<200: 0.576
+r14A sel (A<0.1, 150<m_avg<1150, H_T>450, P>0.5): n=216, sym_pass fails=0; frac of weight with pthat<120: 0.114, pthat<200: 0.621
+r14A sel (A<0.1, 150<m_avg<1150, H_T>450, P>0.9): n=67, sym_pass fails=0; frac of weight with pthat<120: 0.000, pthat<200: 0.595
+r14A sel (A<0.1, 150<m_avg<1150, H_T>450, P>0.99): n=4, sym_pass fails=0; frac of weight with pthat<120: 0.000, pthat<200: 0.000
+M=300 window P>0.9 n=4: weight frac pthat<120 0.000, <200 0.724, pthat min 135
+M=400 window P>0.9 n=7: weight frac pthat<120 0.000, <200 0.000, pthat min 288
+M=500 window P>0.9 n=14: weight frac pthat<120 0.000, <200 0.000, pthat min 279
+M=700 window P>0.9 n=16: weight frac pthat<120 0.000, <200 0.000, pthat min 320

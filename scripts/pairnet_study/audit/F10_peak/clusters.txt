@@ -1,0 +1,5 @@
+f10a_anc_win5 43165661
+f10b_anc_win1 43165662
+f10c_anc_win0 43165663
+f10d_anc_win1_dc1 43165664
+f10e_anc_win1_dc5 43165665

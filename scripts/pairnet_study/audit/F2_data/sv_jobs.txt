@@ -1,0 +1,96 @@
+--process signal --mass 700 --n 10000 --seed 898000001 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01
+--process signal --mass 700 --n 10000 --seed 898000002 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01
+--process signal --mass 700 --n 10000 --seed 898000003 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01
+--process signal --mass 700 --n 10000 --seed 898000004 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01
+--process signal --mass 700 --n 10000 --seed 898000005 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01
+--process signal --mass 700 --n 10000 --seed 898000006 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01
+--process signal --mass 700 --n 10000 --seed 898000007 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01
+--process signal --mass 700 --n 10000 --seed 898000008 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01
+--process signal --mass 700 --n 10000 --seed 898000009 --min-jets 6 --truth-quarks before_fsr --width-frac 0.05
+--process signal --mass 700 --n 10000 --seed 898000010 --min-jets 6 --truth-quarks before_fsr --width-frac 0.05
+--process signal --mass 700 --n 10000 --seed 898000011 --min-jets 6 --truth-quarks before_fsr --width-frac 0.05
+--process signal --mass 700 --n 10000 --seed 898000012 --min-jets 6 --truth-quarks before_fsr --width-frac 0.05
+--process signal --mass 700 --n 10000 --seed 898000013 --min-jets 6 --truth-quarks before_fsr --width-frac 0.05
+--process signal --mass 700 --n 10000 --seed 898000014 --min-jets 6 --truth-quarks before_fsr --width-frac 0.05
+--process signal --mass 700 --n 10000 --seed 898000015 --min-jets 6 --truth-quarks before_fsr --width-frac 0.05
+--process signal --mass 700 --n 10000 --seed 898000016 --min-jets 6 --truth-quarks before_fsr --width-frac 0.05
+--process signal --mass 700 --n 10000 --seed 898000017 --min-jets 6 --truth-quarks before_fsr --width-frac 0.10
+--process signal --mass 700 --n 10000 --seed 898000018 --min-jets 6 --truth-quarks before_fsr --width-frac 0.10
+--process signal --mass 700 --n 10000 --seed 898000019 --min-jets 6 --truth-quarks before_fsr --width-frac 0.10
+--process signal --mass 700 --n 10000 --seed 898000020 --min-jets 6 --truth-quarks before_fsr --width-frac 0.10
+--process signal --mass 700 --n 10000 --seed 898000021 --min-jets 6 --truth-quarks before_fsr --width-frac 0.10
+--process signal --mass 700 --n 10000 --seed 898000022 --min-jets 6 --truth-quarks before_fsr --width-frac 0.10
+--process signal --mass 700 --n 10000 --seed 898000023 --min-jets 6 --truth-quarks before_fsr --width-frac 0.10
+--process signal --mass 700 --n 10000 --seed 898000024 --min-jets 6 --truth-quarks before_fsr --width-frac 0.10
+--process signal --mass 700 --n 10000 --seed 898000025 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 350
+--process signal --mass 700 --n 10000 --seed 898000026 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 350
+--process signal --mass 700 --n 10000 --seed 898000027 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 350
+--process signal --mass 700 --n 10000 --seed 898000028 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 350
+--process signal --mass 700 --n 10000 --seed 898000029 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 350
+--process signal --mass 700 --n 10000 --seed 898000030 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 350
+--process signal --mass 700 --n 10000 --seed 898000031 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 350
+--process signal --mass 700 --n 10000 --seed 898000032 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 350
+--process signal --mass 700 --n 10000 --seed 898000033 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 595
+--process signal --mass 700 --n 10000 --seed 898000034 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 595
+--process signal --mass 700 --n 10000 --seed 898000035 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 595
+--process signal --mass 700 --n 10000 --seed 898000036 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 595
+--process signal --mass 700 --n 10000 --seed 898000037 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 595
+--process signal --mass 700 --n 10000 --seed 898000038 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 595
+--process signal --mass 700 --n 10000 --seed 898000039 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 595
+--process signal --mass 700 --n 10000 --seed 898000040 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 595
+--process signal --mass 700 --n 10000 --seed 898000041 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --sig-third 5
+--process signal --mass 700 --n 10000 --seed 898000042 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --sig-third 5
+--process signal --mass 700 --n 10000 --seed 898000043 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --sig-third 5
+--process signal --mass 700 --n 10000 --seed 898000044 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --sig-third 5
+--process signal --mass 700 --n 10000 --seed 898000045 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --sig-third 5
+--process signal --mass 700 --n 10000 --seed 898000046 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --sig-third 5
+--process signal --mass 700 --n 10000 --seed 898000047 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --sig-third 5
+--process signal --mass 700 --n 10000 --seed 898000048 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --sig-third 5
+--process signal --mass 1500 --n 10000 --seed 898000049 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01
+--process signal --mass 1500 --n 10000 --seed 898000050 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01
+--process signal --mass 1500 --n 10000 --seed 898000051 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01
+--process signal --mass 1500 --n 10000 --seed 898000052 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01
+--process signal --mass 1500 --n 10000 --seed 898000053 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01
+--process signal --mass 1500 --n 10000 --seed 898000054 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01
+--process signal --mass 1500 --n 10000 --seed 898000055 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01
+--process signal --mass 1500 --n 10000 --seed 898000056 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01
+--process signal --mass 1500 --n 10000 --seed 898000057 --min-jets 6 --truth-quarks before_fsr --width-frac 0.05
+--process signal --mass 1500 --n 10000 --seed 898000058 --min-jets 6 --truth-quarks before_fsr --width-frac 0.05
+--process signal --mass 1500 --n 10000 --seed 898000059 --min-jets 6 --truth-quarks before_fsr --width-frac 0.05
+--process signal --mass 1500 --n 10000 --seed 898000060 --min-jets 6 --truth-quarks before_fsr --width-frac 0.05
+--process signal --mass 1500 --n 10000 --seed 898000061 --min-jets 6 --truth-quarks before_fsr --width-frac 0.05
+--process signal --mass 1500 --n 10000 --seed 898000062 --min-jets 6 --truth-quarks before_fsr --width-frac 0.05
+--process signal --mass 1500 --n 10000 --seed 898000063 --min-jets 6 --truth-quarks before_fsr --width-frac 0.05
+--process signal --mass 1500 --n 10000 --seed 898000064 --min-jets 6 --truth-quarks before_fsr --width-frac 0.05
+--process signal --mass 1500 --n 10000 --seed 898000065 --min-jets 6 --truth-quarks before_fsr --width-frac 0.10
+--process signal --mass 1500 --n 10000 --seed 898000066 --min-jets 6 --truth-quarks before_fsr --width-frac 0.10
+--process signal --mass 1500 --n 10000 --seed 898000067 --min-jets 6 --truth-quarks before_fsr --width-frac 0.10
+--process signal --mass 1500 --n 10000 --seed 898000068 --min-jets 6 --truth-quarks before_fsr --width-frac 0.10
+--process signal --mass 1500 --n 10000 --seed 898000069 --min-jets 6 --truth-quarks before_fsr --width-frac 0.10
+--process signal --mass 1500 --n 10000 --seed 898000070 --min-jets 6 --truth-quarks before_fsr --width-frac 0.10
+--process signal --mass 1500 --n 10000 --seed 898000071 --min-jets 6 --truth-quarks before_fsr --width-frac 0.10
+--process signal --mass 1500 --n 10000 --seed 898000072 --min-jets 6 --truth-quarks before_fsr --width-frac 0.10
+--process signal --mass 1500 --n 10000 --seed 898000073 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 750
+--process signal --mass 1500 --n 10000 --seed 898000074 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 750
+--process signal --mass 1500 --n 10000 --seed 898000075 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 750
+--process signal --mass 1500 --n 10000 --seed 898000076 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 750
+--process signal --mass 1500 --n 10000 --seed 898000077 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 750
+--process signal --mass 1500 --n 10000 --seed 898000078 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 750
+--process signal --mass 1500 --n 10000 --seed 898000079 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 750
+--process signal --mass 1500 --n 10000 --seed 898000080 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 750
+--process signal --mass 1500 --n 10000 --seed 898000081 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 1275
+--process signal --mass 1500 --n 10000 --seed 898000082 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 1275
+--process signal --mass 1500 --n 10000 --seed 898000083 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 1275
+--process signal --mass 1500 --n 10000 --seed 898000084 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 1275
+--process signal --mass 1500 --n 10000 --seed 898000085 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 1275
+--process signal --mass 1500 --n 10000 --seed 898000086 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 1275
+--process signal --mass 1500 --n 10000 --seed 898000087 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 1275
+--process signal --mass 1500 --n 10000 --seed 898000088 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --decay chain --squark-mass 1275
+--process signal --mass 1500 --n 10000 --seed 898000089 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --sig-third 5
+--process signal --mass 1500 --n 10000 --seed 898000090 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --sig-third 5
+--process signal --mass 1500 --n 10000 --seed 898000091 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --sig-third 5
+--process signal --mass 1500 --n 10000 --seed 898000092 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --sig-third 5
+--process signal --mass 1500 --n 10000 --seed 898000093 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --sig-third 5
+--process signal --mass 1500 --n 10000 --seed 898000094 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --sig-third 5
+--process signal --mass 1500 --n 10000 --seed 898000095 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --sig-third 5
+--process signal --mass 1500 --n 10000 --seed 898000096 --min-jets 6 --truth-quarks before_fsr --width-frac 0.01 --sig-third 5

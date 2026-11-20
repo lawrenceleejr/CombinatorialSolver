@@ -1,0 +1,10 @@
+vincia 1 files; sigma_gen[mb], tried, written: [(0.0006528078087577743, 50000.0, 1354)]
+  H_T>900 P>0.9: vincia    620.23+- 290.22 fb (n=6)  default   2636.21+-  9.99 fb  ratio 0.24 +- 0.11
+  H_T>900 P>0.95: vincia    460.92+- 242.59 fb (n=5)  default   1184.86+-  6.37 fb  ratio 0.39 +- 0.20
+  H_T>900 P>0.99: vincia n=1 (138.86 fb), default 87.64+-1.63 fb
+  H_T>900 P>0.9966: vincia n=0 (0.00 fb), default 6.21+-0.38 fb
+  H_T>1200 P>0.9: vincia    620.23+- 290.22 fb (n=6)  default   2020.89+-  6.96 fb  ratio 0.31 +- 0.14
+  H_T>1200 P>0.95: vincia    460.92+- 242.59 fb (n=5)  default    960.23+-  4.75 fb  ratio 0.48 +- 0.25
+  H_T>1200 P>0.99: vincia n=1 (138.86 fb), default 77.44+-1.31 fb
+  H_T>1200 P>0.9966: vincia n=0 (0.00 fb), default 5.72+-0.36 fb
+  no P cut, H_T>900: vincia 5113+-2395 fb (n=26)

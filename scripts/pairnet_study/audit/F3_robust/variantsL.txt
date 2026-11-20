@@ -1,0 +1,15 @@
+nom
+m0
+msm:0.1
+msm:0.2
+msc:1.1
+mq:0.25
+msc:1.05+msm:0.1
+msc:1.1+msm:0.2
+jes:0.95
+thr:40
+jes:1.05@40
+jer:0.1@40
+pu:1
+ang:0.02
+msm:0.2+jer:0.1@40

@@ -1,0 +1,142 @@
+== Item 4: signal response (weights per produced event). pre = valid, A<0.1, H_T>450; +P = working-point P cut
+    M sel   var         acc  peak/M   med/M  68% width/M  in[.85,1.1] in[.92,1.04]
+  400 pre   mavg    0.38894   0.934   0.956        0.473        0.435        0.253   n=8716
+  400 pre   mest    0.38894   0.995   1.005        0.448        0.464        0.237   n=8716
+  400 +P    mavg    0.01476   0.992   1.103        0.569        0.403        0.231   n=2028
+  400 +P    mest    0.01476   1.030   1.156        0.564        0.377        0.207   n=2028
+  700 pre   mavg    0.61319   0.938   0.929        0.416        0.445        0.241   n=21817
+  700 pre   mest    0.61319   0.944   0.956        0.396        0.466        0.240   n=21817
+  700 +P    mavg    0.00857   0.994   1.122        0.602        0.390        0.243   n=1144
+  700 +P    mest    0.00857   1.081   1.158        0.613        0.370        0.186   n=1144
+ 1000 pre   mavg    0.74824   0.942   0.930        0.391        0.476        0.265   n=34626
+ 1000 pre   mest    0.74824   0.935   0.949        0.355        0.500        0.271   n=34626
+ 1000 +P    mavg    0.02983   0.962   1.115        0.575        0.396        0.253   n=4134
+ 1000 +P    mest    0.02983   1.008   1.138        0.535        0.388        0.234   n=4134
+ 1500 pre   mavg    0.84717   0.951   0.950        0.381        0.536        0.318   n=10857
+ 1500 pre   mest    0.84717   0.972   0.958        0.352        0.549        0.310   n=10857
+ 1500 +P    mavg    0.09182   0.984   1.055        0.313        0.539        0.320   n=1884
+ 1500 +P    mest    0.09182   1.034   1.075        0.320        0.516        0.286   n=1884
+ 2000 pre   mavg    0.90073   0.967   0.941        0.235        0.674        0.422   n=13297
+ 2000 pre   mest    0.90073   0.978   0.955        0.240        0.682        0.410   n=13297
+ 2000 +P    mavg    0.07337   0.969   0.981        0.186        0.790        0.494   n=1499
+ 2000 +P    mest    0.07337   1.006   1.012        0.174        0.795        0.505   n=1499
+
+   m_est vs m_avg on the SAME events (pre + P cut): fraction in the narrow window if the window were placed on each variable's own peak (±6% around the peak)
+   M=400: m_avg peak 0.992, frac ±6% 0.222;  m_est peak 1.030, frac ±6% 0.228
+   M=700: m_avg peak 0.994, frac ±6% 0.234;  m_est peak 1.081, frac ±6% 0.242
+   M=1000: m_avg peak 0.962, frac ±6% 0.243;  m_est peak 1.008, frac ±6% 0.248
+   M=1500: m_avg peak 0.984, frac ±6% 0.314;  m_est peak 1.034, frac ±6% 0.334
+   M=2000: m_avg peak 0.969, frac ±6% 0.492;  m_est peak 1.006, frac ±6% 0.524
+
+== Item 4/5: drift with H_T/M (signal, pre + wide window): P efficiency at the working-point cut and at a common cut 0.997; m_avg median/M
+ M=400  (P cut 0.98833)
+    H_T/M [0.0, 2.0): frac of events  0.347  eff(P_wp)  0.0078±0.0023  eff(P>=0.997)  0.0000±0.0000   m_avg med/M all 0.767, P>=0.99 0.793
+    H_T/M [2.0, 2.3): frac of events  0.210  eff(P_wp)  0.0315±0.0049  eff(P>=0.997)  0.0000±0.0000   m_avg med/M all 0.893, P>=0.99 0.913
+    H_T/M [2.3, 2.6): frac of events  0.140  eff(P_wp)  0.0512±0.0035  eff(P>=0.997)  0.0005±0.0003   m_avg med/M all 0.969, P>=0.99 0.968
+    H_T/M [2.6, 3.0): frac of events  0.124  eff(P_wp)  0.0581±0.0049  eff(P>=0.997)  0.0021±0.0007   m_avg med/M all 1.077, P>=0.99 1.086
+    H_T/M [3.0, 3.5): frac of events  0.095  eff(P_wp)  0.0155±0.0036  eff(P>=0.997)  0.0000±0.0000   m_avg med/M all 1.228, P>=0.99 1.266
+    H_T/M [3.5, 4.5): frac of events  0.056  eff(P_wp)  0.0120±0.0067  eff(P>=0.997)  0.0000±0.0000   m_avg med/M all 1.535, P>=0.99 1.538
+ M=700  (P cut 0.99705)
+    H_T/M [0.0, 2.0): frac of events  0.436  eff(P_wp)  0.0041±0.0012  eff(P>=0.997)  0.0044±0.0012   m_avg med/M all 0.782, P>=0.99 0.813
+    H_T/M [2.0, 2.3): frac of events  0.219  eff(P_wp)  0.0144±0.0023  eff(P>=0.997)  0.0153±0.0024   m_avg med/M all 0.892, P>=0.99 0.905
+    H_T/M [2.3, 2.6): frac of events  0.145  eff(P_wp)  0.0155±0.0012  eff(P>=0.997)  0.0163±0.0013   m_avg med/M all 0.973, P>=0.99 0.982
+    H_T/M [2.6, 3.0): frac of events  0.112  eff(P_wp)  0.0195±0.0018  eff(P>=0.997)  0.0203±0.0019   m_avg med/M all 1.082, P>=0.99 1.093
+    H_T/M [3.0, 3.5): frac of events  0.052  eff(P_wp)  0.0051±0.0019  eff(P>=0.997)  0.0051±0.0019   m_avg med/M all 1.255, P>=0.99 1.289
+    H_T/M [3.5, 4.5): frac of events  0.030  eff(P_wp)  0.0000±0.0000  eff(P>=0.997)  0.0000±0.0000   m_avg med/M all 1.624, P>=0.99 1.748
+ M=1000  (P cut 0.997445)
+    H_T/M [0.0, 2.0): frac of events  0.493  eff(P_wp)  0.0177±0.0019  eff(P>=0.997)  0.0231±0.0022   m_avg med/M all 0.831, P>=0.99 0.846
+    H_T/M [2.0, 2.3): frac of events  0.238  eff(P_wp)  0.0400±0.0034  eff(P>=0.997)  0.0547±0.0042   m_avg med/M all 0.929, P>=0.99 0.939
+    H_T/M [2.3, 2.6): frac of events  0.132  eff(P_wp)  0.0529±0.0024  eff(P>=0.997)  0.0715±0.0029   m_avg med/M all 1.000, P>=0.99 1.011
+    H_T/M [2.6, 3.0): frac of events  0.080  eff(P_wp)  0.0462±0.0033  eff(P>=0.997)  0.0625±0.0040   m_avg med/M all 1.127, P>=0.99 1.209
+    H_T/M [3.0, 3.5): frac of events  0.040  eff(P_wp)  0.0131±0.0034  eff(P>=0.997)  0.0238±0.0048   m_avg med/M all 1.405, P>=0.99 1.482
+    H_T/M [3.5, 4.5): frac of events  0.016  eff(P_wp)  0.0038±0.0039  eff(P>=0.997)  0.0038±0.0039   m_avg med/M all 1.722, P>=0.99 1.785
+ M=1500  (P cut 0.998078)
+    H_T/M [0.0, 2.0): frac of events  0.612  eff(P_wp)  0.0781±0.0046  eff(P>=0.997)  0.1355±0.0067   m_avg med/M all 0.900, P>=0.99 0.918
+    H_T/M [2.0, 2.3): frac of events  0.235  eff(P_wp)  0.1743±0.0104  eff(P>=0.997)  0.2702±0.0143   m_avg med/M all 0.997, P>=0.99 1.019
+    H_T/M [2.3, 2.6): frac of events  0.097  eff(P_wp)  0.1364±0.0152  eff(P>=0.997)  0.2195±0.0206   m_avg med/M all 1.107, P>=0.99 1.132
+    H_T/M [2.6, 3.0): frac of events  0.042  eff(P_wp)  0.0744±0.0192  eff(P>=0.997)  0.1256±0.0254   m_avg med/M all 1.246, P>=0.99 1.272
+ M=2000  (P cut 0.99928)
+    H_T/M [0.0, 2.0): frac of events  0.708  eff(P_wp)  0.0752±0.0033  eff(P>=0.997)  0.3142±0.0087   m_avg med/M all 0.910, P>=0.99 0.922
+    H_T/M [2.0, 2.3): frac of events  0.206  eff(P_wp)  0.1459±0.0087  eff(P>=0.997)  0.4298±0.0195   m_avg med/M all 0.995, P>=0.99 0.998
+    H_T/M [2.3, 2.6): frac of events  0.062  eff(P_wp)  0.1262±0.0160  eff(P>=0.997)  0.4515±0.0373   m_avg med/M all 1.062, P>=0.99 1.092
+    H_T/M [2.6, 3.0): frac of events  0.020  eff(P_wp)  0.0970±0.0332  eff(P>=0.997)  0.3273±0.0887   m_avg med/M all 1.132, P>=0.99 1.173
+
+== Item 5: efficiency of a FIXED P cut vs true mass (signal; given pre + wide window; and absolute per produced event)
+  P>=0.99: M400: 0.0267±0.0017 (abs 0.00452); M700: 0.1230±0.0041 (abs 0.03360); M1000: 0.2200±0.0062 (abs 0.07831); M1500: 0.4348±0.0124 (abs 0.19733); M2000: 0.5908±0.0123 (abs 0.35888)
+  P>=0.997: M400: 0.0005±0.0001 (abs 0.00009); M700: 0.0129±0.0009 (abs 0.00353); M1000: 0.0449±0.0018 (abs 0.01597); M1500: 0.1789±0.0061 (abs 0.08119); M2000: 0.3490±0.0080 (abs 0.21199)
+  P>=0.999: M400: 0.0000±0.0000 (abs 0.00000); M700: 0.0005±0.0002 (abs 0.00014); M1000: 0.0038±0.0004 (abs 0.00135); M1500: 0.0413±0.0023 (abs 0.01876); M2000: 0.1428±0.0042 (abs 0.08674)
+
+== Item 5: QCD m_avg sculpting (tail samples: valid, A<0.1, H_T>450; B in fb per 5% m_avg bin; ratio to P>=0.9)
+ TvlmT:  m_avg  B(P>=0.9)±  B(P>=0.99)±  B(P>=0.997)±  B(P>=0.9985)±   pass fraction of the tightest cut rel. to P>=0.9
+       308    4.2e+03±4.5e+02       17.7±    2.7          0±      0          0±      0   0.00e+00
+       323   3.42e+03±3.8e+02       18.4±    2.6      0.157±   0.14          0±      0   0.00e+00
+       340   3.57e+03±5.1e+02       17.9±    2.1          0±      0          0±      0   0.00e+00
+       357   2.77e+03±3.4e+02       18.6±    2.2      0.251±   0.14          0±      0   0.00e+00
+       376    2.3e+03±  2e+02         25±    3.7      0.782±   0.54          0±      0   0.00e+00
+       395   2.62e+03±2.3e+02       19.6±      2      0.592±   0.33          0±      0   0.00e+00
+       415   1.67e+03±1.3e+02       21.2±    1.9      0.574±   0.27          0±      0   0.00e+00
+       436   1.53e+03±1.1e+02       22.2±    1.9      0.824±   0.49          0±      0   0.00e+00
+       459   1.43e+03±  1e+02       23.2±    1.7      0.282±   0.13      0.112±   0.11   7.82e-05
+       482    1.4e+03±1.2e+02       22.8±    1.7      0.444±   0.19          0±      0   0.00e+00
+       507   1.01e+03±     74       20.1±    1.3      0.931±   0.29     0.0416±  0.042   4.14e-05
+       533   1.07e+03±     76         24±    1.7      0.609±    0.2       0.05±  0.043   4.67e-05
+       560        808±     63       22.7±    1.4       1.14±   0.28     0.0332±  0.029   4.11e-05
+       589        817±     62       18.7±   0.96      0.963±   0.19     0.0324±  0.028   3.96e-05
+       619        681±     50       18.8±   0.97      0.606±   0.12     0.0557±  0.042   8.18e-05
+       651        531±     34       17.5±   0.79      0.792±   0.17      0.092±  0.047   1.73e-04
+       685        448±     33       16.9±   0.81      0.842±   0.15     0.0847±  0.041   1.89e-04
+       720        380±     25       15.9±   0.69      0.948±   0.14      0.144±  0.058   3.80e-04
+       757        386±     27       14.8±   0.61      0.761±   0.12      0.184±  0.088   4.76e-04
+       795        271±     17       13.2±   0.51      0.951±   0.14      0.084±  0.034   3.10e-04
+       836        250±     18       13.3±   0.56      0.801±   0.13      0.131±  0.046   5.24e-04
+       879        216±     14       11.2±   0.44      0.796±    0.1     0.0948±  0.038   4.39e-04
+       924        173±     11       10.2±   0.42      0.804±   0.08      0.134±  0.032   7.75e-04
+       971        176±     27       9.56±   0.37      0.842±  0.088      0.125±  0.032   7.10e-04
+      1021        125±    8.8       8.13±   0.32      0.757±  0.087      0.089±  0.027   7.12e-04
+      1074        102±    7.5       7.63±   0.27      0.731±  0.079      0.156±  0.035   1.52e-03
+   P>=0.99: quadratic log-log fit chi2/ndf = 18.3/23; largest pull +1.9 at m_avg 533, most negative -1.1 at 795
+   P>=0.997: quadratic log-log fit chi2/ndf = 15.4/21; largest pull +1.6 at m_avg 560, most negative -1.6 at 459
+   P>=0.9985: quadratic log-log fit chi2/ndf = 8.3/14; largest pull +1.2 at m_avg 757, most negative -1.3 at 1021
+ ThtT:  m_avg  B(P>=0.9)±  B(P>=0.99)±  B(P>=0.998)±  B(P>=0.9993)±   pass fraction of the tightest cut rel. to P>=0.9
+      1179       75.4±    5.4       6.23±   0.46      0.329±  0.046     0.0083± 0.0035   1.10e-04
+      1240       61.6±    5.2       5.31±   0.38      0.331±  0.045     0.0181± 0.0097   2.94e-04
+      1303       53.5±    4.2       4.95±   0.33      0.353±   0.04     0.0189± 0.0091   3.54e-04
+      1370       46.1±    3.4       5.16±   0.32      0.367±  0.041     0.0167± 0.0061   3.62e-04
+      1440       42.6±    3.5       4.43±   0.24      0.394±   0.04     0.0252±  0.013   5.91e-04
+      1514       35.2±    3.2        4.6±   0.26      0.371±  0.033     0.0197± 0.0066   5.60e-04
+      1592       28.2±    2.2       4.01±   0.26      0.343±  0.027     0.0316± 0.0078   1.12e-03
+      1673       21.3±    1.5       3.59±    0.2      0.401±  0.039     0.0427±  0.017   2.01e-03
+      1759         18±    1.5       2.71±   0.15      0.349±  0.028     0.0426±  0.012   2.36e-03
+      1849       14.7±    1.9       2.59±   0.15      0.317±  0.021     0.0534± 0.0089   3.64e-03
+      1944       9.48±    1.3       1.62±  0.079      0.283±  0.026     0.0385±  0.011   4.06e-03
+      2044       6.54±   0.52       1.29±   0.08      0.234±  0.019     0.0423± 0.0075   6.47e-03
+      2148        4.8±   0.65      0.954±  0.065      0.148±  0.011     0.0265± 0.0041   5.51e-03
+      2259       2.54±   0.26      0.704±  0.062      0.105±   0.01     0.0155± 0.0026   6.11e-03
+      2374       1.65±    0.3      0.287±  0.023     0.0454± 0.0053    0.00527± 0.0015   3.20e-03
+   P>=0.99: quadratic log-log fit chi2/ndf = 46.9/12; largest pull +2.9 at m_avg 1179, most negative -3.8 at 2374
+   P>=0.998: quadratic log-log fit chi2/ndf = 37.6/12; largest pull +2.4 at m_avg 2044, most negative -3.7 at 2374
+   P>=0.9993: quadratic log-log fit chi2/ndf = 19.1/12; largest pull +1.7 at m_avg 2044, most negative -2.3 at 2374
+
+== where QCD sits relative to the window after the working-point selection (no window cut; tail samples; m/M quantiles 16/50/84% and fraction in window)
+  400 P+all        mavg: range [0.71,2.82]M n= 2440  q16/50/84 = 0.90/1.16/1.69  frac in window 0.333  upper/lower half of window 0.80
+  400 P+all        mest: range [0.71,2.82]M n= 2440  q16/50/84 = 1.01/1.26/1.83  frac in window 0.235  upper/lower half of window 2.35
+  400 P            mavg: range [0.71,2.82]M n=31557  q16/50/84 = 0.87/1.22/1.89  frac in window 0.262  upper/lower half of window 0.65
+  400 P            mest: range [0.71,2.82]M n=31557  q16/50/84 = 0.91/1.27/1.95  frac in window 0.264  upper/lower half of window 1.14
+  700 P+all        mavg: range [0.41,1.61]M n=  683  q16/50/84 = 0.59/0.84/1.20  frac in window 0.231  upper/lower half of window 0.82
+  700 P+all        mest: range [0.41,1.61]M n=  683  q16/50/84 = 0.65/0.91/1.29  frac in window 0.308  upper/lower half of window 0.65
+  700 P            mavg: range [0.41,1.61]M n= 1906  q16/50/84 = 0.59/0.91/1.33  frac in window 0.223  upper/lower half of window 1.20
+  700 P            mest: range [0.41,1.61]M n= 1906  q16/50/84 = 0.61/0.94/1.36  frac in window 0.220  upper/lower half of window 1.14
+  700 P+boost      mavg: range [0.41,1.61]M n=  472  q16/50/84 = 0.78/1.05/1.33  frac in window 0.322  upper/lower half of window 1.11
+  700 P+boost      mest: range [0.41,1.61]M n=  472  q16/50/84 = 0.87/1.14/1.44  frac in window 0.313  upper/lower half of window 0.96
+  700 P narrow     mavg: range [0.41,1.61]M n= 1756  q16/50/84 = 0.60/0.92/1.33  frac in window 0.108  upper/lower half of window 1.04
+  700 P narrow     mest: range [0.41,1.61]M n= 1756  q16/50/84 = 0.64/0.95/1.36  frac in window 0.099  upper/lower half of window 1.10
+  700 P+boost nar  mavg: range [0.41,1.61]M n=  728  q16/50/84 = 0.52/0.78/1.15  frac in window 0.096  upper/lower half of window 0.39
+  700 P+boost nar  mest: range [0.41,1.61]M n=  728  q16/50/84 = 0.49/0.82/1.21  frac in window 0.123  upper/lower half of window 0.78
+  1000 P+boost     mavg: range [0.29,1.13]M n=  217  q16/50/84 = 0.56/0.66/0.89  frac in window 0.181  upper/lower half of window 0.96
+  1000 P+boost     mest: range [0.29,1.13]M n=  217  q16/50/84 = 0.62/0.74/0.98  frac in window 0.174  upper/lower half of window 1.43
+  1000 P           mavg: range [0.29,1.13]M n= 1302  q16/50/84 = 0.43/0.65/0.93  frac in window 0.222  upper/lower half of window 0.93
+  1000 P           mest: range [0.29,1.13]M n= 1302  q16/50/84 = 0.45/0.67/0.96  frac in window 0.233  upper/lower half of window 0.91
+  1500 P           mavg: range [0.75,1.70]M n= 4842  q16/50/84 = 0.84/1.04/1.29  frac in window 0.414  upper/lower half of window 1.00
+  1500 P           mest: range [0.75,1.70]M n= 4842  q16/50/84 = 0.85/1.06/1.32  frac in window 0.397  upper/lower half of window 1.12
+  2000 P           mavg: range [0.56,1.27]M n=  704  q16/50/84 = 0.70/0.88/1.02  frac in window 0.496  upper/lower half of window 0.83
+  2000 P           mest: range [0.56,1.27]M n=  704  q16/50/84 = 0.74/0.90/1.05  frac in window 0.535  upper/lower half of window 0.84

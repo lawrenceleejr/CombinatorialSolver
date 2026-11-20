@@ -1,0 +1,13 @@
+nom
+thr:40
+msm:0.3
+msc:0.9
+msc:1.2
+moff:5
+mq:0.1
+thr:50
+jer:0.2@40
+eta:2.4
+drop:0.05
+pu:2
+jes:0.98

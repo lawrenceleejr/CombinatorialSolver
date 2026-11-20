@@ -1,0 +1,22 @@
+noqgd region1 m_jjj 200-300: data 7574  MC 118529 +- 7870  MC/data 15.65 +- 1.04  (data bins 200-300, mc 200-300)
+noqgd region1 m_jjj 300-400: data 5677  MC 86008 +- 4107  MC/data 15.15 +- 0.72  (data bins 300-400, mc 300-400)
+noqgd region1 m_jjj 400-500: data 3750  MC 44817 +- 2084  MC/data 11.95 +- 0.56  (data bins 400-500, mc 400-500)
+   pthat-bin sums [fb] noqgd r1: [   0.      0.     30.43   72.89 2765.38]
+noqgd region2 m_jjj 500-700: data 24311  MC 146514 +- 4256  MC/data 6.03 +- 0.18  (data bins 500-700, mc 500-700)
+noqgd region2 m_jjj 700-900: data 8754  MC 46889 +- 1500  MC/data 5.36 +- 0.17  (data bins 700-900, mc 700-900)
+   pthat-bin sums [fb] noqgd r2: [   0.      0.    246.21 1098.25 7630.4 ]
+noqgd region3 m_jjj 900-1200: data 1282  MC 12217 +- 589  MC/data 9.53 +- 0.46  (data bins 900-1200, mc 900-1200)
+noqgd region3 m_jjj 1200-1600: data 373  MC 3322 +- 220  MC/data 8.91 +- 0.59  (data bins 1200-1600, mc 1200-1600)
+noqgd region3 m_jjj 1600-2000: data 59  MC 339 +- 43  MC/data 5.75 +- 0.73  (data bins 1600-2000, mc 1600-2000)
+   pthat-bin sums [fb] noqgd r3: [   0.      0.      0.     21.99 1565.46]
+qgd region1 m_jjj 200-300: data 7574  MC 13790 +- 2107  MC/data 1.82 +- 0.28  (data bins 200-300, mc 200-300)
+qgd region1 m_jjj 300-400: data 5677  MC 10221 +- 1277  MC/data 1.80 +- 0.22  (data bins 300-400, mc 300-400)
+qgd region1 m_jjj 400-500: data 3750  MC 5686 +- 678  MC/data 1.52 +- 0.18  (data bins 400-500, mc 400-500)
+   pthat-bin sums [fb] qgd r1: [  0.     0.     0.     3.31 333.02]
+qgd region2 m_jjj 500-700: data 24311  MC 15941 +- 1307  MC/data 0.66 +- 0.05  (data bins 500-700, mc 500-700)
+qgd region2 m_jjj 700-900: data 8754  MC 5090 +- 485  MC/data 0.58 +- 0.06  (data bins 700-900, mc 700-900)
+   pthat-bin sums [fb] qgd r2: [  0.     0.     5.95  88.02 817.94]
+qgd region3 m_jjj 900-1200: data 1282  MC 1135 +- 173  MC/data 0.89 +- 0.14  (data bins 900-1200, mc 900-1200)
+qgd region3 m_jjj 1200-1600: data 373  MC 314 +- 58  MC/data 0.84 +- 0.16  (data bins 1200-1600, mc 1200-1600)
+qgd region3 m_jjj 1600-2000: data 59  MC 33 +- 14  MC/data 0.56 +- 0.23  (data bins 1600-2000, mc 1600-2000)
+   pthat-bin sums [fb] qgd r3: [  0.     0.     0.     0.71 136.76]

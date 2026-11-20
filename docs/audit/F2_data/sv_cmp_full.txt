@@ -1,0 +1,24 @@
+M=700  generated events: {'nom': 85711, 'w5': 85841, 'w10': 86194, 'ch50': 83134, 'ch85': 84159, 'udb': 85665}
+ P>-1.0000: nom 28.654+-0.183% w5 27.172+-0.178% w10 24.694+-0.169% ch50 34.168+-0.203% ch85 26.438+-0.177% udb 28.440+-0.182%  | ratio to nom: w5 0.95+-0.01 w10 0.86+-0.01 ch50 1.19+-0.01 ch85 0.92+-0.01 udb 0.99+-0.01
+ P> 0.5000: nom 28.197+-0.181% w5 26.737+-0.176% w10 24.243+-0.168% ch50 33.796+-0.202% ch85 26.006+-0.176% udb 27.978+-0.181%  | ratio to nom: w5 0.95+-0.01 w10 0.86+-0.01 ch50 1.20+-0.01 ch85 0.92+-0.01 udb 0.99+-0.01
+ P> 0.9000: nom 19.680+-0.152% w5 18.542+-0.147% w10 16.698+-0.139% ch50 25.612+-0.176% ch85 16.990+-0.142% udb 19.546+-0.151%  | ratio to nom: w5 0.94+-0.01 w10 0.85+-0.01 ch50 1.30+-0.01 ch85 0.86+-0.01 udb 0.99+-0.01
+ P> 0.9900: nom 3.217+-0.061% w5 3.174+-0.061% w10 2.672+-0.056% ch50 5.573+-0.082% ch85 2.108+-0.050% udb 3.349+-0.063%  | ratio to nom: w5 0.99+-0.03 w10 0.83+-0.02 ch50 1.73+-0.04 ch85 0.66+-0.02 udb 1.04+-0.03
+ P> 0.9966: nom 0.480+-0.024% w5 0.444+-0.023% w10 0.382+-0.021% ch50 1.002+-0.035% ch85 0.213+-0.016% udb 0.496+-0.024%  | ratio to nom: w5 0.93+-0.07 w10 0.80+-0.06 ch50 2.09+-0.13 ch85 0.44+-0.04 udb 1.03+-0.07
+   nom: P>0.9 candidates m_avg/M median 0.931 half-width68 0.161 (n=30441); P median of valid A<0.1 window events 0.948
+   w5: P>0.9 candidates m_avg/M median 0.928 half-width68 0.166 (n=29873); P median of valid A<0.1 window events 0.948
+   w10: P>0.9 candidates m_avg/M median 0.921 half-width68 0.174 (n=28774); P median of valid A<0.1 window events 0.946
+   ch50: P>0.9 candidates m_avg/M median 0.914 half-width68 0.155 (n=39334); P median of valid A<0.1 window events 0.962
+   ch85: P>0.9 candidates m_avg/M median 0.929 half-width68 0.170 (n=26880); P median of valid A<0.1 window events 0.938
+   udb: P>0.9 candidates m_avg/M median 0.932 half-width68 0.161 (n=30459); P median of valid A<0.1 window events 0.948
+M=1500  generated events: {'nom': 81998, 'w5': 82036, 'w10': 82038, 'ch50': 80936, 'ch85': 81219, 'udb': 82009}
+ P>-1.0000: nom 45.049+-0.234% w5 42.515+-0.228% w10 37.027+-0.212% ch50 47.775+-0.243% ch85 42.969+-0.230% udb 44.873+-0.234%  | ratio to nom: w5 0.94+-0.01 w10 0.82+-0.01 ch50 1.06+-0.01 ch85 0.95+-0.01 udb 1.00+-0.01
+ P> 0.5000: nom 44.958+-0.234% w5 42.451+-0.227% w10 36.945+-0.212% ch50 47.715+-0.243% ch85 42.900+-0.230% udb 44.772+-0.234%  | ratio to nom: w5 0.94+-0.01 w10 0.82+-0.01 ch50 1.06+-0.01 ch85 0.95+-0.01 udb 1.00+-0.01
+ P> 0.9000: nom 39.306+-0.219% w5 37.117+-0.213% w10 32.209+-0.198% ch50 44.099+-0.233% ch85 37.187+-0.214% udb 39.073+-0.218%  | ratio to nom: w5 0.94+-0.01 w10 0.82+-0.01 ch50 1.12+-0.01 ch85 0.95+-0.01 udb 0.99+-0.01
+ P> 0.9900: nom 19.535+-0.154% w5 18.494+-0.150% w10 15.955+-0.139% ch50 26.816+-0.182% ch85 16.409+-0.142% udb 19.564+-0.154%  | ratio to nom: w5 0.95+-0.01 w10 0.82+-0.01 ch50 1.37+-0.01 ch85 0.84+-0.01 udb 1.00+-0.01
+ P> 0.9980: nom 5.205+-0.080% w5 4.880+-0.077% w10 4.097+-0.071% ch50 8.636+-0.103% ch85 3.244+-0.063% udb 5.214+-0.080%  | ratio to nom: w5 0.94+-0.02 w10 0.79+-0.02 ch50 1.66+-0.03 ch85 0.62+-0.02 udb 1.00+-0.02
+   nom: P>0.9 candidates m_avg/M median 0.954 half-width68 0.153 (n=53050); P median of valid A<0.1 window events 0.987
+   w5: P>0.9 candidates m_avg/M median 0.947 half-width68 0.160 (n=52616); P median of valid A<0.1 window events 0.987
+   w10: P>0.9 candidates m_avg/M median 0.933 half-width68 0.174 (n=50016); P median of valid A<0.1 window events 0.986
+   ch50: P>0.9 candidates m_avg/M median 0.941 half-width68 0.157 (n=60872); P median of valid A<0.1 window events 0.992
+   ch85: P>0.9 candidates m_avg/M median 0.953 half-width68 0.164 (n=51024); P median of valid A<0.1 window events 0.984
+   udb: P>0.9 candidates m_avg/M median 0.953 half-width68 0.154 (n=53080); P median of valid A<0.1 window events 0.987

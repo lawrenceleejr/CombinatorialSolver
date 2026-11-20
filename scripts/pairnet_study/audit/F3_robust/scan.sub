@@ -1,0 +1,18 @@
+executable     = /scratch/llee/pairnet/audit/F3_robust/job.sh
+arguments      = $(name)
+transfer_input_files = /scratch/llee/pairnet/stage/gen_env.tar.gz, /scratch/llee/pairnet/stage/pyonnx.tar.gz, /home/llee/CombinatorialSolver/models/pairnet_gated_12jet_win5_lowmass_boost_r14A.onnx, /home/llee/CombinatorialSolver/models/pairnet_gated_12jet_win5_lowmass_boost_r14A.json, /scratch/llee/pairnet/audit/F3_robust/lib.py, /scratch/llee/pairnet/audit/F3_robust/scan.py, /scratch/llee/pairnet/audit/F3_robust/variants.txt, /scratch/llee/pairnet/audit/F3_robust/cache/chunks/$(name).npz
+transfer_output_files = $(name)_scan.npz
+transfer_output_remaps = "$(name)_scan.npz = /scratch/llee/pairnet/audit/F3_robust/out/scan/$(name)_scan.npz"
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+output         = /scratch/llee/pairnet/audit/F3_robust/logs/condor/$(name).out
+error          = /scratch/llee/pairnet/audit/F3_robust/logs/condor/$(name).err
+log            = /scratch/llee/pairnet/audit/F3_robust/logs/condor/scan.log
++SingularityImage = "/cvmfs/singularity.opensciencegrid.org/htc/rocky:9"
++JobBatchName = "F3scan"
+request_cpus   = 1
+request_memory = 3GB
+request_disk   = 3GB
+max_retries    = 3
+periodic_release = (NumJobStarts < 4) && ((time() - EnteredCurrentStatus) > 300)
+queue name from /scratch/llee/pairnet/audit/F3_robust/chunks.txt
