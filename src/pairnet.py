@@ -152,6 +152,7 @@ class PairNet(nn.Module):
         gate_interp: bool = False,
         mass_head: bool = False,
         massless: bool = False,
+        interp_attn: int = 0,
     ):
         super().__init__()
         self.massless = massless  # ignore the jet masses (no quark/gluon handle)
@@ -217,6 +218,11 @@ class PairNet(nn.Module):
             nn.Linear(d_model + self.n_gk, d_model), nn.GELU(), nn.Linear(d_model, d_model)
         )
         self.rest_mlp = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU())
+        # optional attention across the interpretations of an event before the final score, so that
+        # alternatives are compared directly rather than only through the softmax
+        self.interp_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(d_model, nhead, dim_ff, dropout, activation="gelu", batch_first=True,
+                                       norm_first=True) for _ in range(interp_attn)])
         self.score_mlp = nn.Sequential(
             nn.Linear(3 * d_model + self.n_ik, 2 * d_model),
             nn.GELU(),
@@ -321,6 +327,8 @@ class PairNet(nn.Module):
             ik = e1.new_zeros(B, self.n_assign, 0)
         hr = self.rest_mlp(er)
         hid = self.score_mlp[:-1](torch.cat([h1 + h2, h1 * h2, hr, ik], -1))  # (B, A, d)
+        for layer in self.interp_layers:
+            hid = layer(hid, src_key_padding_mask=~valid)
         s = self.score_mlp[-1](hid).squeeze(-1)
         s = s.masked_fill(~valid, -1e4)
 
@@ -439,9 +447,18 @@ def _unit_mean(f, sel):
     return torch.where(sel, f / f[sel].mean().clamp(min=1e-9), f)
 
 
+def distance_corr(x, y):
+    """Distance correlation (squared) of two 1-D samples (DisCo, arXiv:2001.05310)."""
+    a = (x.unsqueeze(0) - x.unsqueeze(1)).abs()
+    b = (y.unsqueeze(0) - y.unsqueeze(1)).abs()
+    A = a - a.mean(0, keepdim=True) - a.mean(1, keepdim=True) + a.mean()
+    Bm = b - b.mean(0, keepdim=True) - b.mean(1, keepdim=True) + b.mean()
+    return (A * Bm).mean() / ((A * A).mean() * (Bm * Bm).mean()).sqrt().clamp(min=1e-12)
+
+
 def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pmass=None, w_mass=1.0,
                w_sym=0.0, w_qcd_asym=0.0, w_win=0.0, w_qcd_pass=0.0, asym_cut=0.1, window=(0.85, 1.1),
-               ev_w=None, gate_wp_qcd=1.0, gate_wp_sig_fail=1.0, gate_focal=0.0):
+               ev_w=None, gate_wp_qcd=1.0, gate_wp_sig_fail=1.0, gate_focal=0.0, w_decor=0.0):
     """Loss for the gated model.
 
     target: (B,) exact-truth index for reconstructable signal, or the
@@ -466,6 +483,9 @@ def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pma
     gate_wp_sig_fail factor on the gate BCE of signal whose chosen pairing fails the selection
                     (asymmetry < asym_cut and m_avg in window * M);
     gate_focal      g > 0: gate BCE of QCD weighted by (0.1 + P(signal))^g (hard negatives).
+    w_decor         > 0 adds the distance correlation, on QCD, between the gate logit and log m_avg of the
+                    chosen pairing (in GeV, not differentiated), so that a cut on P does not reshape the
+                    QCD m_avg spectrum (no sculpting).
     """
     logp = out["logits"]
     B = logp.shape[0]
@@ -505,6 +525,12 @@ def gated_loss(out, target, is_sig, w_proxy=0.5, w_gate=1.0, bkg_weight=1.0, pma
         gw = gw * f
     lgate = F.binary_cross_entropy_with_logits(out["gate_logit"], is_sig.float(), weight=gw)
     loss = lmix + w_gate * lgate
+    if w_decor > 0 and bkg.sum() > 8:
+        with torch.no_grad():
+            A_ = out["m1"].shape[1]
+            best = logp[:, :A_].argmax(-1, keepdim=True)
+            mb = 0.5 * (out["m1"].gather(1, best) + out["m2"].gather(1, best)).squeeze(1) * out["ht"]
+        loss = loss + w_decor * distance_corr(out["gate_logit"][bkg], torch.log(mb[bkg].clamp(min=1.0)))
     if "log_m_over_ht" in out and pmass is not None and is_sig.any():
         # L1 (median) regression of log(M/HT) on signal events
         tgt_m = torch.log(pmass.clamp(min=1.0) / out["ht"].clamp(min=1e-6))
@@ -544,12 +570,12 @@ def load_checkpoint(path):
     sizes = tuple((int(x[0]), int(x[1])) for x in a["sizes"].split(",")) if a.get("sizes") else None
     net = PairNet(
         n_jets=a["n_jets"], k=a["k"], d_model=a["d_model"], nhead=a["heads"],
-        num_layers=a["layers"], dim_ff=2 * a["d_model"], dropout=0.0,
+        num_layers=a["layers"], dim_ff=a.get("ff_mult", 2) * a["d_model"], dropout=0.0,
         use_pair_bias=not a["no_pair_bias"], use_group_kin=not a["no_group_kin"],
         use_null=not a["no_null"], sizes=sizes, gated=a.get("gated", False),
         bg_beta=a.get("bg_beta", 1.0), n_assign=a.get("n_assign"),
         gate_interp=a.get("gate_interp", False), mass_head=a.get("mass_head", False),
-        massless=a.get("massless", False),
+        massless=a.get("massless", False), interp_attn=a.get("interp_attn", 0),
     )
     net.load_state_dict(ck["state"])
     net.eval()

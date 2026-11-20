@@ -70,7 +70,8 @@ def batch_loss(net, b, args, nominal=False):
     o = {k: (v.float() if torch.is_tensor(v) and v.is_floating_point() else v) for k, v in o.items()}
     if args.gated:
         var = {} if nominal else dict(ev_w=b.get("lw"), gate_wp_qcd=args.gate_wp_qcd,
-                                      gate_wp_sig_fail=args.gate_wp_sig_fail, gate_focal=args.gate_focal)
+                                      gate_wp_sig_fail=args.gate_wp_sig_fail, gate_focal=args.gate_focal,
+                                      w_decor=args.w_decor)
         return gated_loss(o, b["target"], b["is_signal"], w_proxy=args.w_proxy,
                           bkg_weight=args.bkg_weight, pmass=b["pmass"], w_mass=args.w_mass,
                           w_sym=args.w_sym, w_qcd_asym=args.w_qcd_asym,
@@ -289,6 +290,14 @@ def main():
     ap.add_argument("--sig", nargs="*", default=[])
     ap.add_argument("--train-npz", default=None, help="training arrays (cache file) instead of --sig/--bkg")
     ap.add_argument("--train-n", type=int, default=None, help="use the first N events of --train-npz")
+    ap.add_argument("--train-frac", type=float, default=None,
+                    help="random fraction of the training events (fixed seed; data-scaling tests)")
+    ap.add_argument("--eta-shift", type=float, default=0.0,
+                    help="training only: shift all jet eta of an event by U(-s, s), kept inside |eta| < --eta-max "
+                         "(a longitudinal boost; jet ordering and pairing targets are unchanged)")
+    ap.add_argument("--eta-max", type=float, default=3.0)
+    ap.add_argument("--w-decor", type=float, default=0.0,
+                    help="weight of the QCD distance correlation between P(signal) and log m_avg (no sculpting)")
     ap.add_argument("--val-npz", default=None)
     ap.add_argument("--test-npz", default=None)
     ap.add_argument("--extra-eval", nargs="*", default=[],
@@ -353,6 +362,9 @@ def main():
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--ff-mult", type=int, default=2, help="feed-forward width = ff_mult * d_model")
+    ap.add_argument("--interp-attn", type=int, default=0,
+                    help="transformer layers across the interpretations before the final score")
     ap.add_argument("--no-pair-bias", action="store_true")
     ap.add_argument("--no-group-kin", action="store_true")
     ap.add_argument("--no-null", action="store_true")
@@ -386,6 +398,10 @@ def main():
         data = dict(np.load(args.train_npz))
         if args.train_n:
             data = {k: v[: args.train_n] for k, v in data.items()}
+        if args.train_frac:
+            n = len(data["pt"])
+            pick = np.sort(np.random.default_rng(777).choice(n, int(args.train_frac * n), replace=False))
+            data = {k: v[pick] for k, v in data.items()}
         va = dict(np.load(args.val_npz)) if args.val_npz else None
         te = dict(np.load(args.test_npz)) if args.test_npz else None
     else:
@@ -413,7 +429,8 @@ def main():
 
     net = PairNet(
         n_jets=args.n_jets, k=args.k, d_model=args.d_model, nhead=args.heads,
-        num_layers=args.layers, dim_ff=2 * args.d_model, dropout=args.dropout,
+        num_layers=args.layers, dim_ff=args.ff_mult * args.d_model, dropout=args.dropout,
+        interp_attn=args.interp_attn,
         use_pair_bias=not args.no_pair_bias, use_group_kin=not args.no_group_kin,
         use_null=not args.no_null, sizes=sizes, gated=args.gated, bg_beta=args.bg_beta,
         n_assign=args.n_assign, gate_interp=args.gate_interp, mass_head=args.mass_head,
@@ -464,6 +481,13 @@ def main():
                 scale = 1 + maug[0] * (2 * torch.rand(n[0], 1, device=dev) - 1)
                 width = maug[1] + (maug[2] - maug[1]) * torch.rand(n[0], 1, device=dev)
                 b["m"] = (b["m"] * scale * (1 + width * torch.randn(n, device=dev))).clamp(min=0)
+            if args.eta_shift:
+                msk = b["mask"]
+                big = torch.full_like(b["eta"], 1e9)
+                lo = (-args.eta_max - torch.where(msk, b["eta"], big).min(1).values).clamp(min=-args.eta_shift, max=0)
+                hi = (args.eta_max - torch.where(msk, b["eta"], -big).max(1).values).clamp(min=0, max=args.eta_shift)
+                d = lo + (hi - lo) * torch.rand_like(lo)
+                b["eta"] = (b["eta"] + d.unsqueeze(1)) * msk
             with autocast(dev, args.amp):
                 loss = batch_loss(net, b, args)
             opt.zero_grad(set_to_none=True)
